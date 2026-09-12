@@ -1,0 +1,20 @@
+#!/bin/zsh
+set -euo pipefail
+SCRIPT_DIR="${0:A:h}"
+TOOL_SOURCE="$SCRIPT_DIR/pdd_safe_cleanup.py"
+MAINTENANCE_ROOT="$HOME/Library/Application Support/PDDAutoReplyMaintenance"
+TOOL="$MAINTENANCE_ROOT/pdd_safe_cleanup.py"
+AGENT="$HOME/Library/LaunchAgents/com.scy.pdd-auto-reply.safe-cleanup.plist"
+mkdir -p "$MAINTENANCE_ROOT"
+/usr/bin/ditto "$TOOL_SOURCE" "$TOOL"
+chmod 755 "$TOOL"
+mkdir -p "${AGENT:h}"
+/usr/bin/plutil -create xml1 "$AGENT"
+/usr/bin/plutil -insert Label -string com.scy.pdd-auto-reply.safe-cleanup "$AGENT"
+/usr/bin/plutil -insert ProgramArguments -json "[\"/usr/bin/python3\",\"$TOOL\"]" "$AGENT"
+/usr/bin/plutil -insert StartCalendarInterval -json '{"Hour":3,"Minute":20}' "$AGENT"
+/usr/bin/plutil -insert RunAtLoad -bool true "$AGENT"
+/bin/launchctl bootout "gui/$UID" "$AGENT" 2>/dev/null || true
+/bin/launchctl bootstrap "gui/$UID" "$AGENT"
+print "已安装每日安全清理任务：$AGENT"
+read -k 1 "?按任意键关闭…"

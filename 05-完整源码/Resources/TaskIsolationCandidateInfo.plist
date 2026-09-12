@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleDevelopmentRegion</key>
+    <string>zh_CN</string>
+    <key>CFBundleDisplayName</key>
+    <string>pinduodou_automation</string>
+    <key>CFBundleExecutable</key>
+    <string>PDDTaskIsolationCandidate</string>
+    <key>CFBundleIconFile</key>
+    <string>PDDLatest.icns</string>
+    <key>CFBundleIdentifier</key>
+    <string>com.scy.pdd-auto-reply.task-isolation-candidate</string>
+    <key>CFBundleInfoDictionaryVersion</key>
+    <string>6.0</string>
+    <key>CFBundleName</key>
+    <string>pinduodou_automation</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleShortVersionString</key>
+    <string>1.0</string>
+    <key>CFBundleVersion</key>
+    <string>1</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>14.0</string>
+    <key>NSScreenCaptureUsageDescription</key>
+    <string>用于读取拼多多聊天窗口并在 AX 消息尚未刷新时进行本地 OCR 补读。&#10;Used to read the Pinduoduo chat window and perform local OCR when AX messages have not refreshed.</string>
+    <key>NSSpeechRecognitionUsageDescription</key>
+    <string>用于把客户视频中的语音转成文字，帮助客服理解问题；拒绝后仍可继续处理视频画面和文字消息。&#10;Used to transcribe customer videos; video frames and text messages still work if permission is denied.</string>
+    <key>NSHighResolutionCapable</key>
+    <true/>
+    <key>NSPrincipalClass</key>
+    <string>NSApplication</string>
+</dict>
+</plist>

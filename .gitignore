@@ -1,0 +1,48 @@
+# macOS metadata
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Installed and generated application packages
+installed-app-backups/
+01-安装/
+02-正式程序/
+*.app/
+*.dmg
+
+# Build products from the nested Swift source project
+05-完整源码/.build/
+05-完整源码/.build-*/
+05-完整源码/.swiftpm/
+05-完整源码/outputs/
+05-完整源码/DerivedData/
+05-完整源码/**/xcuserdata/
+05-完整源码/**/*.xcuserstate
+
+# Large bundled runtime payloads; distribute separately or with Git LFS
+05-完整源码/Resources/KnowledgeBase/
+05-完整源码/Resources/SenseVoice/
+05-完整源码/Resources/V2Knowledge/
+05-完整源码/Resources/WebOCR/
+
+# Local scratch work
+05-完整源码/work/
+05-完整源码/tmp/
+05-完整源码/output/
+
+# Local IDE and environment files
+.idea/
+.vscode/
+**/__pycache__/
+**/*.py[cod]
+**/.pytest_cache/
+**/.venv/
+**/venv/
+.env
+.env.*
+!.env.example
+*.log
+*.pid
+*.profraw
+*.profdata
+.coverage

@@ -1,0 +1,27 @@
+{
+  "type": "object",
+  "properties": {
+    "action": {
+      "type": "string",
+      "enum": ["reply", "reply_then_transfer"]
+    },
+    "reply_text": {
+      "type": "string",
+      "minLength": 1
+    },
+    "transfer_reason": {
+      "type": "string",
+      "enum": [
+        "customer_explicitly_requested_human",
+        "explicit_return_refund",
+        "remote_assistance",
+        "refund_operation",
+        "logistics_lookup",
+        "troubleshooting_exhausted",
+        "none"
+      ]
+    }
+  },
+  "required": ["action", "reply_text", "transfer_reason"],
+  "additionalProperties": false
+}

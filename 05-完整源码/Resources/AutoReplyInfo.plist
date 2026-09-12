@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleDevelopmentRegion</key>
+    <string>zh_CN</string>
+    <key>CFBundleDisplayName</key>
+    <string>拼多多全自动客服</string>
+    <key>CFBundleExecutable</key>
+    <string>PDDAutoReply</string>
+    <key>CFBundleIdentifier</key>
+    <string>com.scy.pdd-auto-reply</string>
+    <key>CFBundleInfoDictionaryVersion</key>
+    <string>6.0</string>
+    <key>CFBundleName</key>
+    <string>拼多多全自动客服</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleShortVersionString</key>
+    <string>1.0</string>
+    <key>CFBundleVersion</key>
+    <string>1</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>14.0</string>
+    <key>NSScreenCaptureUsageDescription</key>
+    <string>用于在拼多多 AX 消息尚未刷新时，本地 OCR 补读当前聊天窗口。</string>
+    <key>NSSpeechRecognitionUsageDescription</key>
+    <string>用于把客户视频中的语音转成文字，帮助客服理解问题；拒绝后仍可继续处理视频画面和文字消息。</string>
+    <key>NSHighResolutionCapable</key>
+    <true/>
+    <key>NSPrincipalClass</key>
+    <string>NSApplication</string>
+</dict>
+</plist>
