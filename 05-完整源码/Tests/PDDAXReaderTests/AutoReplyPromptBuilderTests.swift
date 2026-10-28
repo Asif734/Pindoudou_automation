@@ -2,6 +2,40 @@ import XCTest
 @testable import PDDAXReader
 
 final class AutoReplyPromptBuilderTests: XCTestCase {
+    func testPromptKeepsGreetingSeparateFromHistoricalIssuesAndUsesStoreIdentity() throws {
+        let prompt = try AutoReplyPromptBuilder.build(capture: makePromptCapture())
+        XCTAssertTrue(prompt.contains("你是 Grozziie（格志）店铺的客服助手"))
+        XCTAssertTrue(prompt.contains("本轮目标批次如果只有问候"))
+        XCTAssertTrue(prompt.contains("禁止附加历史中的产品"))
+        XCTAssertTrue(prompt.contains("customer service assistant for the Grozziie store"))
+        XCTAssertFalse(prompt.contains("应如实使用“自动客服助手"))
+    }
+
+    func testInitialAndResumedRepliesFollowCustomerLanguageInsteadOfKnowledgeLanguage() throws {
+        let history = [
+            message("old", .customer, .text, "打印机连不上"),
+            message("service", .service, .text, "请检查蓝牙"),
+            message("new", .customer, .text, "How do I connect this printer to my Mac?")
+        ]
+        let timeline = try AutoReplyTimeline.make(messages: history)
+        let capture = AutoReplyCapture(
+            uid: "GZC-000001", fullHistory: history,
+            batch: try timeline.freeze(after: .empty), customerCursor: timeline.cursor,
+            unexpectedServiceMessageIDs: []
+        )
+        let submission = try HistoryContinuation.plan(capture: capture, after: nil)
+        for prompt in [
+            try AutoReplyPromptBuilder.buildInitial(capture: capture, submission: submission),
+            try AutoReplyPromptBuilder.buildContinuation(capture: capture, submission: submission)
+        ] {
+            XCTAssertTrue(prompt.contains("English questions in English"))
+            XCTAssertTrue(prompt.contains("last customer question with an identifiable language"))
+            XCTAssertTrue(prompt.contains("not a bilingual translation"))
+            XCTAssertTrue(prompt.contains("How do I connect this printer to my Mac?"))
+            XCTAssertFalse(prompt.contains("中文文字回复"))
+        }
+    }
+
     func testPromptSeparatesFullHistoryFromFrozenTargetAndAllowsImageAttachments() throws {
         let capture = try makePromptCapture()
 
@@ -37,13 +71,13 @@ final class AutoReplyPromptBuilderTests: XCTestCase {
 
         let prompt = try AutoReplyPromptBuilder.build(capture: capture)
 
-        XCTAssertTrue(prompt.contains("<untrusted_retrieved_knowledge>"))
-        XCTAssertTrue(prompt.contains("V2 知识库检索已经完成"))
-        XCTAssertTrue(prompt.contains("不得运行命令"))
-        XCTAssertTrue(prompt.contains("不得运行命令、读取 Skill、搜索文件、打开知识库文件或重新检索"))
+        XCTAssertTrue(prompt.contains("<local_knowledge_access>"))
+        XCTAssertTrue(prompt.contains("Codex 直接读取本地知识库"))
+        XCTAssertFalse(prompt.contains("不得运行命令"))
+        XCTAssertFalse(prompt.contains("不得运行命令、读取 Skill、搜索文件、打开知识库文件或重新检索"))
         XCTAssertFalse(prompt.contains("回答前请充分检索"))
         XCTAssertTrue(prompt.contains("原文：http://cloud.video.taobao.com/example.mp4"))
-        XCTAssertTrue(prompt.contains("</untrusted_retrieved_knowledge>"))
+        XCTAssertTrue(prompt.contains("</local_knowledge_access>"))
         XCTAssertTrue(prompt.contains("HTTP 或 HTTPS"))
         XCTAssertTrue(prompt.contains("target_customer_batch"))
         XCTAssertTrue(prompt.contains("chat_image_attachments"))
@@ -58,7 +92,7 @@ final class AutoReplyPromptBuilderTests: XCTestCase {
         XCTAssertTrue(prompt.contains("不要求客户重新描述或重复提问"))
         XCTAssertFalse(prompt.contains("只回复“亲亲，我这边没太听懂呢～”"))
         XCTAssertTrue(prompt.contains("reply_then_transfer"))
-        XCTAssertTrue(prompt.contains("客户明确要求人工客服"))
+        XCTAssertTrue(prompt.contains("human_request"))
         XCTAssertTrue(prompt.contains("已有信息 → 文字排查 → 照片 → 必要时才是视频"))
         XCTAssertFalse(prompt.contains("30个汉字"))
         XCTAssertFalse(prompt.contains("60个汉字"))

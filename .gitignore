@@ -45,4 +45,22 @@ installed-app-backups/
 *.pid
 *.profraw
 *.profdata
+05-完整源码/.runtime/
+05-完整源码/.knowledge-venv/
+05-完整源码/.knowledge-model/
+05-完整源码/.knowledge-hf-cache/
 .coverage
+
+# Local customer-service databases and their original media (distributed separately)
+/格志京东客服知识库-*/
+/格志中国市场客服完整知识库-*/
+
+# Runtime installation archives; retain notices and checksum manifests
+/05-完整源码/Resources/ThirdParty/PythonRuntime/*.tar.gz
+/05-完整源码/Resources/ThirdParty/PythonRuntime/*.tar.xz
+/05-完整源码/Resources/ThirdParty/PythonRuntime/*.zip
+
+# Local runtime records and diagnostic exports
+/:memory:.ses
+*.crash
+*.trace

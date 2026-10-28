@@ -75,6 +75,11 @@ enum PDDWindowForegroundActivation {
 @MainActor
 protocol PDDOCRCapturing: AnyObject {
     func capture() async throws -> PDDOCRFrame
+    func captureFullWindow() async throws -> PDDOCRFrame
+}
+
+extension PDDOCRCapturing {
+    func captureFullWindow() async throws -> PDDOCRFrame { try await capture() }
 }
 
 @MainActor
@@ -86,6 +91,14 @@ final class PDDWindowOCRCapture: PDDOCRCapturing {
     }
 
     func capture() async throws -> PDDOCRFrame {
+        try await capture(cropChat: true)
+    }
+
+    func captureFullWindow() async throws -> PDDOCRFrame {
+        try await capture(cropChat: false)
+    }
+
+    private func capture(cropChat: Bool) async throws -> PDDOCRFrame {
         guard CGPreflightScreenCaptureAccess() || CGRequestScreenCaptureAccess() else {
             throw PDDOCRError.screenRecordingPermission
         }
@@ -111,10 +124,23 @@ final class PDDWindowOCRCapture: PDDOCRCapturing {
                 configuration: configuration
             )
         } catch { throw PDDOCRError.capture(error.localizedDescription) }
+        // Unread-dot detection needs the full window, not the chat body. Avoid
+        // any chat-panel traversal on that frequent scanning path.
+        if !cropChat {
+            return PDDOCRFrame(image: full, fullWindowImage: full, windowFrame: window.frame)
+        }
+        let root = PDDReadOnlyAXElement(element: workbench)
+        let frameTask = Task.detached(priority: .utility) { PDDChatPanelFrameSearch.find(root: root) }
+        let chatPanelFrame = await withTaskCancellationHandler {
+            await frameTask.value
+        } onCancel: {
+            frameTask.cancel()
+        }
+        try Task.checkCancellation()
         guard let crop = PDDOCRCropGeometry.pixelCrop(
             imageSize: CGSize(width: full.width, height: full.height),
             windowFrame: window.frame,
-            chatPanelFrame: findChatPanelFrame(in: workbench)
+            chatPanelFrame: chatPanelFrame
         ), let image = full.cropping(to: crop) else {
             throw PDDOCRError.capture("聊天区域裁剪无效")
         }
@@ -124,6 +150,7 @@ final class PDDWindowOCRCapture: PDDOCRCapturing {
     private func activateWorkbench(application: NSRunningApplication) async throws -> AXUIElement {
         guard let bundleURL = application.bundleURL else { throw PDDOCRError.windowNotFound }
         let appElement = AXUIElementCreateApplication(application.processIdentifier)
+        AXUIElementSetMessagingTimeout(appElement, 0.5)
         let windows = copyElements(kAXWindowsAttribute as String, from: appElement)
         guard let workbench = windows.first(where: {
             copyString(kAXTitleAttribute as String, from: $0)?.contains("拼多多商家工作台") == true
@@ -151,22 +178,6 @@ final class PDDWindowOCRCapture: PDDOCRCapturing {
             }
         )
         return workbench
-    }
-
-    private func findChatPanelFrame(in root: AXUIElement, depth: Int = 0) -> CGRect? {
-        guard depth <= 40 else { return nil }
-        let classes = copyStrings("AXDOMClassList", from: root)
-        if classes.contains(where: {
-            let value = $0.lowercased()
-            return value.contains("middle-panel") || value.contains("chat-panel")
-        }), let frame = copyFrame(from: root), frame.width > 0, frame.height > 0 {
-            return frame
-        }
-        for child in copyElements("AXChildrenInNavigationOrder", from: root)
-            + copyElements(kAXChildrenAttribute as String, from: root) {
-            if let frame = findChatPanelFrame(in: child, depth: depth + 1) { return frame }
-        }
-        return nil
     }
 
     private func copyFrame(from element: AXUIElement) -> CGRect? {

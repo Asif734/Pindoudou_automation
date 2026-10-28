@@ -9,10 +9,10 @@ enum ReaderTab: Hashable {
 
 @MainActor
 final class ReaderViewModel: ObservableObject {
-    @Published var fullAXOutput = "在拼多多中打开一个用户，然后点击“读取、解析并生成建议”。"
-    @Published var parsedChatOutput = "尚未解析聊天。"
-    @Published var replyOutput = "尚未生成建议。"
-    @Published var status = "准备就绪"
+    @Published var fullAXOutput = BilingualText.lines("在拼多多中打开一个用户，然后点击“读取、解析并生成建议”。", "Open a customer in Pinduoduo, then click Read, parse, and suggest.")
+    @Published var parsedChatOutput = BilingualText.lines("尚未解析聊天。", "Chat has not been parsed yet.")
+    @Published var replyOutput = BilingualText.lines("尚未生成建议。", "No suggestion generated yet.")
+    @Published var status = BilingualText.lines("准备就绪", "Ready")
     @Published var isReading = false
     @Published var selectedTab: ReaderTab = .fullAX
 
@@ -39,14 +39,14 @@ final class ReaderViewModel: ObservableObject {
 
     func refreshPermissionStatus() {
         status = permissionCheck()
-            ? "辅助功能权限已开启"
-            : "需要辅助功能权限"
+            ? BilingualText.lines("辅助功能权限已开启", "Accessibility permission granted")
+            : BilingualText.lines("需要辅助功能权限", "Accessibility permission required")
     }
 
     func readParseAndSuggest() {
         guard !isReading else { return }
         guard permissionPrompt() else {
-            status = "请在系统设置的“隐私与安全性 → 辅助功能”中允许本程序，然后再点读取。"
+            status = BilingualText.lines("请在系统设置的“隐私与安全性 → 辅助功能”中允许本程序，然后再点读取。", "Allow this app in System Settings → Privacy & Security → Accessibility, then read again.")
             return
         }
         Task { await performRead() }
@@ -55,7 +55,7 @@ final class ReaderViewModel: ObservableObject {
     func performRead() async {
         guard !isReading else { return }
         isReading = true
-        status = "正在读取、保存并解析当前用户 AX…"
+        status = BilingualText.lines("正在读取、保存并解析当前用户 AX…", "Reading, saving, and parsing the current customer AX tree…")
         defer { isReading = false }
 
         do {
@@ -64,7 +64,7 @@ final class ReaderViewModel: ObservableObject {
             parsedChatOutput = result.parsedChatOutput
             replyOutput = result.replyOutput
             selectedTab = .reply
-            status = "完成 \(result.uid)：共 \(result.historyCount) 条历史；AX 已保存到 \(result.savedAXURL.path)"
+            status = BilingualText.lines("完成 \(result.uid)：共 \(result.historyCount) 条历史；AX 已保存到 \(result.savedAXURL.path)", "Completed \(result.uid): \(result.historyCount) history messages; AX saved to \(result.savedAXURL.path)")
         } catch let error as ReaderWorkflowError {
             if let capturedAX = error.fullAXOutput {
                 fullAXOutput = capturedAX

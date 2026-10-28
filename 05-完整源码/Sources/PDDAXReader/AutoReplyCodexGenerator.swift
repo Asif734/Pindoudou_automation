@@ -41,7 +41,7 @@ struct AutoReplyCodexGenerator: AutoReplyGenerating, Sendable {
             rootDirectory: FileManager.default.homeDirectoryForCurrentUser
                 .appendingPathComponent("Desktop/拼多多AX记录/自动回复", isDirectory: true)
         ),
-        evidencePreparer: any KnowledgeEvidencePreparing = FallbackKnowledgeEvidencePreparer(),
+        evidencePreparer: any KnowledgeEvidencePreparing = DirectLocalKnowledge(),
         loginStatusProvider: (any CodexLoginStatusProviding)? = nil,
         timeout: TimeInterval = 180,
         now: @escaping @Sendable () -> Date = { Date() }
@@ -71,7 +71,9 @@ struct AutoReplyCodexGenerator: AutoReplyGenerating, Sendable {
         var retriedAfterContinuationFailure = false
         if let binding = try sessionRegistry.activeBinding(uid: capture.uid, now: now()) {
             let legacyCheckpoint = binding.historyCheckpoint?.requiresFullHistoryContinuation == true
-            let compatible = !binding.contaminated
+            let directKnowledgeCompatible = evidence.mode != .directLocal
+                || (binding.knowledgeSHA256 == knowledgeSHA256 && binding.promptSHA256 == promptSHA256)
+            let compatible = directKnowledgeCompatible && !binding.contaminated
                 && binding.turnCount < 40
                 && binding.submittedBytes < 4_000_000
                 && (legacyCheckpoint
@@ -97,7 +99,7 @@ struct AutoReplyCodexGenerator: AutoReplyGenerating, Sendable {
                         )
                         try sessionRegistry.save(.init(
                             uid: capture.uid,
-                            threadID: binding.threadID,
+                            threadID: turn.startedThreadID ?? binding.threadID,
                             lastUsedAt: now(),
                             historyCheckpoint: submission.checkpoint,
                             promptSHA256: promptSHA256,
@@ -108,7 +110,7 @@ struct AutoReplyCodexGenerator: AutoReplyGenerating, Sendable {
                         ))
                         return CodexReplyResult(
                             reply: turn.reply,
-                            threadID: binding.threadID,
+                            threadID: turn.startedThreadID ?? binding.threadID,
                             diagnostic: diagnostic(evidence: evidence, turn: turn),
                             action: turn.action,
                             transferReason: turn.transferReason
@@ -176,20 +178,36 @@ struct AutoReplyCodexGenerator: AutoReplyGenerating, Sendable {
     }
 
     private struct TurnResult {
-        let reply: String
-        let action: CodexReplyAction
-        let transferReason: CodexTransferReason
+        var answerFound = true
+        var semanticEvidence: KnowledgeEvidence? = nil
+        var reply: String
+        var action: CodexReplyAction
+        var transferReason: CodexTransferReason
+        var requestKind: CustomerRequestKind? = nil
+        var issueHasNoSolution = false
+        var clarificationReply: String? = nil
+        var handoffReply: String? = nil
         let startedThreadID: String?
         let durationMilliseconds: Int
         let events: [CodexExecutionEvent]
         let contaminated: Bool
     }
     private struct ReplyDocument: Decodable {
+        let answerFound: Bool?
+        let requestKind: CustomerRequestKind?
+        let issueHasNoSolution: Bool?
+        let clarificationReply: String?
+        let handoffReply: String?
         let action: CodexReplyAction
         let replyText: String
         let transferReason: CodexTransferReason
 
         private enum CodingKeys: String, CodingKey {
+            case answerFound = "answer_found"
+            case requestKind = "request_kind"
+            case issueHasNoSolution = "issue_has_no_solution"
+            case clarificationReply = "clarification_reply"
+            case handoffReply = "handoff_reply"
             case action
             case replyText = "reply_text"
             case transferReason = "transfer_reason"
@@ -197,6 +215,37 @@ struct AutoReplyCodexGenerator: AutoReplyGenerating, Sendable {
     }
 
     private func runTurn(
+        capture: AutoReplyCapture,
+        submission: HistorySubmission,
+        sessionID: String?,
+        continuation: Bool
+    ) async throws -> TurnResult {
+        var turn = try await runSingleTurn(capture: capture, submission: submission,
+                                           sessionID: sessionID, continuation: continuation)
+        if let kind = turn.requestKind {
+            let decision = try await CustomerTransferPolicyStore.shared.decide(
+                root: sessionRegistry.rootDirectory, uid: capture.uid,
+                messageIDs: capture.batch?.events.map(\.messageID) ?? [], kind: kind,
+                answerFound: turn.answerFound, issueHasNoSolution: turn.issueHasNoSolution,
+                proposedAction: turn.action, proposedReason: turn.transferReason, now: now())
+            let needsClarification = decision.action == .reply
+                && (kind == .humanRequest || kind == .refundReturn)
+            let selectedReply = decision.action == .replyThenTransfer ? turn.handoffReply
+                : needsClarification || turn.action == .replyThenTransfer ? turn.clarificationReply : turn.reply
+            guard let selectedReply, !selectedReply.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                throw AutoReplyCodexGeneratorError.invalidReply("缺少转人工或澄清话术")
+            }
+            turn.reply = selectedReply.trimmingCharacters(in: .whitespacesAndNewlines)
+            turn.action = decision.action
+            turn.transferReason = decision.reason
+        }
+        guard turn.reply.range(of: #"\bAI\b"#, options: [.regularExpression, .caseInsensitive]) == nil else {
+            throw AutoReplyCodexGeneratorError.invalidReply("Customer-facing identity wording is not allowed")
+        }
+        return turn
+    }
+
+    private func runSingleTurn(
         capture: AutoReplyCapture,
         submission: HistorySubmission,
         sessionID: String?,
@@ -235,18 +284,22 @@ struct AutoReplyCodexGenerator: AutoReplyGenerating, Sendable {
         let schemaURL = temporary.appendingPathComponent("reply.schema.json")
         let resultURL = temporary.appendingPathComponent("result.json")
         let schema = """
-        {"type":"object","properties":{"action":{"type":"string","enum":["reply","reply_then_transfer"]},"reply_text":{"type":"string","minLength":1},"transfer_reason":{"type":"string","enum":["customer_explicitly_requested_human","explicit_return_refund","remote_assistance","refund_operation","logistics_lookup","troubleshooting_exhausted","none"]}},"required":["action","reply_text","transfer_reason"],"additionalProperties":false}
+        {"type":"object","properties":{"answer_found":{"type":"boolean"},"action":{"type":"string","enum":["reply","reply_then_transfer"]},"reply_text":{"type":"string","minLength":1},"transfer_reason":{"type":"string","enum":["customer_explicitly_requested_human","explicit_return_refund","remote_assistance","refund_operation","logistics_lookup","troubleshooting_exhausted","none"]},"request_kind":{"type":"string","enum":["other","human_request","refund_return","technical"]},"issue_has_no_solution":{"type":"boolean"},"clarification_reply":{"type":"string","minLength":1},"handoff_reply":{"type":"string","minLength":1}},"required":["answer_found","action","reply_text","transfer_reason","request_kind","issue_has_no_solution","clarification_reply","handoff_reply"],"additionalProperties":false}
         """
         try Data(schema.utf8).write(to: schemaURL, options: .atomic)
         let arguments = CodexInvocation.arguments(
             sessionID: sessionID,
             schemaURL: schemaURL,
             resultURL: resultURL,
-            imageURLs: imageURLs + videoFrameURLs
+            imageURLs: imageURLs + videoFrameURLs,
+            workingDirectoryURL: DirectLocalKnowledge.configuredURL
         )
-        let prompt = continuation
+        let policyContext = try await CustomerTransferPolicyStore.shared.context(
+            root: sessionRegistry.rootDirectory, uid: capture.uid, now: now())
+        let basePrompt = continuation
             ? try AutoReplyPromptBuilder.buildContinuation(capture: capture, submission: submission)
             : try AutoReplyPromptBuilder.buildInitial(capture: capture, submission: submission)
+        let prompt = basePrompt + "\n<application_transfer_state>\n" + policyContext + "\n</application_transfer_state>"
         let stream = AutoReplyCLIStream()
         return try await withCheckedThrowingContinuation { checked in
             let handoff = CodexTurnHandoff<TurnResult>(checked)
@@ -260,6 +313,7 @@ struct AutoReplyCodexGenerator: AutoReplyGenerating, Sendable {
                         onStandardOutput: { chunk in
                             guard let candidate = stream.consume(chunk) else { return }
                             handoff.offer(TurnResult(
+                                answerFound: candidate.answerFound,
                                 reply: candidate.reply,
                                 action: candidate.action,
                                 transferReason: candidate.transferReason,
@@ -336,9 +390,14 @@ struct AutoReplyCodexGenerator: AutoReplyGenerating, Sendable {
         let reply = document.replyText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !reply.isEmpty else { throw AutoReplyCodexGeneratorError.invalidReply("reply_text 为空") }
         return TurnResult(
+            answerFound: document.answerFound ?? true,
             reply: reply,
             action: document.action,
             transferReason: document.transferReason,
+            requestKind: document.requestKind,
+            issueHasNoSolution: document.issueHasNoSolution ?? false,
+            clarificationReply: document.clarificationReply,
+            handoffReply: document.handoffReply,
             startedThreadID: startedThreadID,
             durationMilliseconds: max(0, Int(now().timeIntervalSince(startedAt) * 1_000)),
             events: events,
@@ -359,7 +418,7 @@ struct AutoReplyCodexGenerator: AutoReplyGenerating, Sendable {
         turn: TurnResult
     ) -> AutoReplyGenerationDiagnostic {
         AutoReplyGenerationDiagnostic(
-            knowledge: evidence.diagnostic,
+            knowledge: (turn.semanticEvidence ?? evidence).diagnostic,
             codexDurationMilliseconds: turn.durationMilliseconds,
             events: turn.events
         )

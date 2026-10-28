@@ -103,7 +103,9 @@ final class PDDAXConversationDriver: PDDConversationOpening {
     func discover() async throws -> [AutoReplyDiscovery] {
         var tree = try backend.readSemanticTree()
 
-        if let row = try await unreadEvidence.unreadRows(in: tree).first {
+        let transferRows = PDDAXIncomingTransfer.pendingRows(in: tree)
+        let unreadRows = try await unreadEvidence.unreadRows(in: tree)
+        if let row = transferRows.first ?? unreadRows.first {
             try backend.performPress(row.rowID)
             try await Task.sleep(nanoseconds: 80_000_000)
             tree = try backend.readSemanticTree()
@@ -455,7 +457,12 @@ final class PDDAXConversationDriver: PDDConversationOpening {
         knownServiceIDsByUID[uid, default: []].formUnion(serviceIDs)
 
         let batch: FrozenCustomerBatch?
-        if !wasBaselined && cursor == .empty {
+        let incomingCustomerIDs = PDDAXIncomingTransfer.customerIDsForUnansweredHandoff(in: openedTree.rootSnapshot)
+        if let handoffCursor = try PDDAXIncomingTransfer.recoveryCursor(in: merged, customerIDs: incomingCustomerIDs) {
+            baselinedUIDs.insert(uid)
+            batch = try timeline.freeze(after: handoffCursor)
+            ocrDiagnostic += "；检测到转入本账号的系统转接行，恢复转接前客户请求（不把原客服问候当作已解决）"
+        } else if !wasBaselined && cursor == .empty {
             baselinedUIDs.insert(uid)
             if unreadUIDs.remove(uid) != nil {
                 let lastServiceIndex = merged.lastIndex { $0.sender == .service }

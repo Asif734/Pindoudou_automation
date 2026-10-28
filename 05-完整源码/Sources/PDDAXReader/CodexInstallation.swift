@@ -34,6 +34,17 @@ enum CodexInstallation {
                     .appendingPathComponent(pathExecutableName)
             })
         }
+        // Finder-launched apps do not inherit VS Code's PATH. Discover the
+        // installed extension CLI as a fallback so the Applications copy works.
+        let extensions = fileManager.homeDirectoryForCurrentUser
+            .appendingPathComponent(".vscode/extensions", isDirectory: true)
+        let installed = (try? fileManager.contentsOfDirectory(
+            at: extensions, includingPropertiesForKeys: nil
+        )) ?? []
+        candidates.append(contentsOf: installed
+            .filter { $0.lastPathComponent.hasPrefix("openai.chatgpt-") }
+            .sorted { $0.lastPathComponent.compare($1.lastPathComponent, options: .numeric) == .orderedDescending }
+            .map { $0.appendingPathComponent("bin/macos-aarch64/codex") })
         return candidates.first(where: { fileManager.isExecutableFile(atPath: $0.path) })
     }
 }

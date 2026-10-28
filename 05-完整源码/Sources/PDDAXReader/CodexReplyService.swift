@@ -118,7 +118,8 @@ struct CodexReplyService: Sendable {
             arguments: CodexInvocation.arguments(
                 sessionID: sessionID,
                 schemaURL: schemaURL,
-                resultURL: resultURL
+                resultURL: resultURL,
+                workingDirectoryURL: DirectLocalKnowledge.configuredURL
             ),
             stdin: CustomerReplyPromptBuilder.build(uid: uid, history: history),
             timeout: timeout

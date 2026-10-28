@@ -55,6 +55,7 @@ final class SingleAXParseWorkflowTests: XCTestCase {
         XCTAssertTrue(report.formatted.contains("时间："))
         XCTAssertFalse(report.formatted.contains("AX 未提供"))
         XCTAssertTrue(report.formatted.contains("客户：刚到的客户消息"))
+        XCTAssertTrue(report.formatted.contains("Customer: 刚到的客户消息"))
         XCTAssertFalse(report.formatted.contains("稍后的客服回复"))
         XCTAssertFalse(report.formatted.contains("节点数"))
         XCTAssertFalse(report.formatted.contains("消息 ID"))

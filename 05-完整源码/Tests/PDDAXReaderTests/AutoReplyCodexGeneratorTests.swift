@@ -2,6 +2,99 @@ import XCTest
 @testable import PDDAXReader
 
 final class AutoReplyCodexGeneratorTests: XCTestCase {
+    func testProhibitedIdentityTermIsBlockedBeforeDelivery() async throws {
+        let root = temporaryRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let generator = AutoReplyCodexGenerator(
+            executableURL: URL(fileURLWithPath: "/bin/echo"),
+            runner: DocumentCodexRunner(document: ["action": "reply", "reply_text": "I am an ai assistant.", "transfer_reason": "none"]),
+            sessionRegistry: CodexSessionRegistry(rootDirectory: root),
+            evidencePreparer: FallbackKnowledgeEvidencePreparer())
+        do {
+            _ = try await generator.generate(try capture(uid: "GZC-000001"))
+            XCTFail("Prohibited customer wording must not reach delivery")
+        } catch let error as AutoReplyCodexGeneratorError {
+            guard case .invalidReply = error else { return XCTFail("Unexpected error: \(error)") }
+        }
+    }
+
+    func testCodexIntentControlsFirstAndSecondRequestWithoutTextMatching() async throws {
+        let root = temporaryRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let generator = AutoReplyCodexGenerator(
+            executableURL: URL(fileURLWithPath: "/bin/echo"),
+            runner: DocumentCodexRunner(document: [
+                "request_kind": "human_request", "action": "reply_then_transfer",
+                "reply_text": "Transfer draft", "transfer_reason": "customer_explicitly_requested_human",
+                "clarification_reply": "What would you like help with?",
+                "handoff_reply": "I’ll connect you with a colleague."
+            ]), sessionRegistry: CodexSessionRegistry(rootDirectory: root),
+            evidencePreparer: FallbackKnowledgeEvidencePreparer())
+        let firstCapture = try capture(uid: "GZC-000001")
+        let first = try await generator.generate(firstCapture)
+        XCTAssertEqual(first.action, .reply)
+        XCTAssertEqual(first.reply, "What would you like help with?")
+        let duplicate = try await generator.generate(firstCapture)
+        XCTAssertEqual(duplicate.action, .reply)
+        var history = firstCapture.fullHistory
+        history.append(PDDChatMessage(id: "B", sender: .customer, content: "Please let a colleague take over.",
+            displayTime: "10:01", kind: .text, capturedAt: Date()))
+        let timeline = try AutoReplyTimeline.make(messages: history)
+        let second = try await generator.generate(AutoReplyCapture(uid: firstCapture.uid, fullHistory: history,
+            batch: timeline.freeze(after: firstCapture.customerCursor), customerCursor: timeline.cursor,
+            unexpectedServiceMessageIDs: []))
+        XCTAssertEqual(second.action, .replyThenTransfer)
+        XCTAssertEqual(second.reply, "I’ll connect you with a colleague.")
+    }
+
+    func testDirectKnowledgeUsesOnlyLocalFolderAndInvalidatesWhenDocumentChanges() async throws {
+        let root = temporaryRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(at: root.appendingPathComponent("handover"), withIntermediateDirectories: true)
+        try Data("rules".utf8).write(to: root.appendingPathComponent("jd_customer_service_rules.md"))
+        try Data("{}".utf8).write(to: root.appendingPathComponent("handover/capabilities.json"))
+        let provider = DirectLocalKnowledge(folderURL: root)
+        let input = try capture(uid: "GZC-000001")
+        let first = await provider.prepare(capture: input)
+        XCTAssertEqual(first.mode, .directLocal)
+        XCTAssertTrue(first.documents.isEmpty)
+        XCTAssertTrue(first.context.contains(root.path))
+        XCTAssertFalse(provider.supportsSemanticRetry)
+        try Data("changed rules".utf8).write(to: root.appendingPathComponent("jd_customer_service_rules.md"))
+        let changed = await provider.prepare(capture: input)
+        XCTAssertNotEqual(first.diagnostic.knowledgeBaseSHA256, changed.diagnostic.knowledgeBaseSHA256)
+        let unavailable = await DirectLocalKnowledge(folderURL: root.appendingPathComponent("missing")).prepare(capture: input)
+        XCTAssertEqual(unavailable.mode, .unavailable)
+        XCTAssertNotNil(unavailable.diagnostic.error)
+    }
+
+    func testMissingAnswerDoesNotRunSecondInspectionEvenWhenPreparerSupportsIt() async throws {
+        let root = temporaryRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let runner = AutoReplyFakeCodexRunner(responses: [
+            .init(exitCode: 0,
+                  stdout: "{\"type\":\"thread.started\",\"thread_id\":\"first\"}\n{\"type\":\"turn.completed\"}\n",
+                  reply: "FIRST_DRAFT_DO_NOT_SEND", answerFound: false),
+            .init(exitCode: 0,
+                  stdout: "{\"type\":\"thread.started\",\"thread_id\":\"second\"}\n{\"type\":\"turn.completed\"}\n",
+                  reply: "Still cannot confirm", answerFound: false)
+        ])
+        let preparer = SemanticRetryEvidencePreparer()
+        let generator = AutoReplyCodexGenerator(
+            executableURL: URL(fileURLWithPath: "/bin/echo"), runner: runner,
+            sessionRegistry: CodexSessionRegistry(rootDirectory: root), evidencePreparer: preparer
+        )
+        let result = try await generator.generate(try capture(uid: "GZC-000001"))
+        let calls = await runner.recorded
+        XCTAssertEqual(calls.count, 1)
+        XCTAssertEqual(result.reply, "FIRST_DRAFT_DO_NOT_SEND")
+        XCTAssertEqual(result.threadID, "first")
+        XCTAssertTrue(calls[0].stdin.contains("FIRST_EVIDENCE"))
+        let retryCount = await preparer.semanticCount
+        XCTAssertEqual(retryCount, 0)
+
+    }
+
     func testGeneratedOutputSchemaSatisfiesCodexConstTypeContract() async throws {
         let root = temporaryRoot()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -10,7 +103,8 @@ final class AutoReplyCodexGeneratorTests: XCTestCase {
         let generator = AutoReplyCodexGenerator(
             executableURL: URL(fileURLWithPath: "/bin/echo"),
             runner: runner,
-            sessionRegistry: CodexSessionRegistry(rootDirectory: root)
+            sessionRegistry: CodexSessionRegistry(rootDirectory: root),
+            evidencePreparer: FallbackKnowledgeEvidencePreparer()
         )
 
         let result = try await generator.generate(try capture(uid: "GZC-000001"))
@@ -29,7 +123,8 @@ final class AutoReplyCodexGeneratorTests: XCTestCase {
                 "reply_text": "好的，我帮您转人工处理～",
                 "transfer_reason": "customer_explicitly_requested_human"
             ]),
-            sessionRegistry: CodexSessionRegistry(rootDirectory: root)
+            sessionRegistry: CodexSessionRegistry(rootDirectory: root),
+            evidencePreparer: FallbackKnowledgeEvidencePreparer()
         )
 
         let result = try await generator.generate(
@@ -52,7 +147,8 @@ final class AutoReplyCodexGeneratorTests: XCTestCase {
                 "reply_text": "物流一般三到五天",
                 "transfer_reason": "logistics_lookup"
             ]),
-            sessionRegistry: CodexSessionRegistry(rootDirectory: root)
+            sessionRegistry: CodexSessionRegistry(rootDirectory: root),
+            evidencePreparer: FallbackKnowledgeEvidencePreparer()
         )
 
         do {
@@ -91,6 +187,7 @@ final class AutoReplyCodexGeneratorTests: XCTestCase {
             executableURL: URL(fileURLWithPath: "/bin/echo"),
             runner: runner,
             sessionRegistry: registry,
+            evidencePreparer: FallbackKnowledgeEvidencePreparer(),
             now: { now }
         )
 
@@ -127,6 +224,7 @@ final class AutoReplyCodexGeneratorTests: XCTestCase {
             executableURL: URL(fileURLWithPath: "/bin/echo"),
             runner: runner,
             sessionRegistry: registry,
+            evidencePreparer: FallbackKnowledgeEvidencePreparer(),
             now: { now }
         )
 
@@ -177,6 +275,7 @@ final class AutoReplyCodexGeneratorTests: XCTestCase {
             executableURL: URL(fileURLWithPath: "/bin/echo"),
             runner: runner,
             sessionRegistry: CodexSessionRegistry(rootDirectory: root),
+            evidencePreparer: FallbackKnowledgeEvidencePreparer(),
             now: { now }
         )
 
@@ -212,7 +311,8 @@ final class AutoReplyCodexGeneratorTests: XCTestCase {
         let generator = AutoReplyCodexGenerator(
             executableURL: URL(fileURLWithPath: "/bin/echo"),
             runner: runner,
-            sessionRegistry: CodexSessionRegistry(rootDirectory: root)
+            sessionRegistry: CodexSessionRegistry(rootDirectory: root),
+            evidencePreparer: FallbackKnowledgeEvidencePreparer()
         )
 
         let result = try await generator.generate(try capture(uid: "GZC-000001"))
@@ -225,7 +325,8 @@ final class AutoReplyCodexGeneratorTests: XCTestCase {
         let generator = AutoReplyCodexGenerator(
             executableURL: URL(fileURLWithPath: "/bin/echo"),
             runner: EarlyStreamingCodexRunner(),
-            sessionRegistry: CodexSessionRegistry(rootDirectory: root)
+            sessionRegistry: CodexSessionRegistry(rootDirectory: root),
+            evidencePreparer: FallbackKnowledgeEvidencePreparer()
         )
         let started = Date()
 
@@ -264,9 +365,9 @@ final class AutoReplyCodexGeneratorTests: XCTestCase {
         let invocation = await runner.recorded[0]
 
         XCTAssertTrue(invocation.stdin.contains("M880可信原文"))
-        XCTAssertTrue(invocation.stdin.contains("<untrusted_retrieved_knowledge>"))
+        XCTAssertTrue(invocation.stdin.contains("<local_knowledge_access>"))
         XCTAssertFalse(invocation.arguments.contains("--image"), "纯文本任务不应附加图片")
-        XCTAssertTrue(invocation.arguments.contains("--disable"))
+        XCTAssertTrue(invocation.arguments.contains("--enable"))
         XCTAssertTrue(invocation.arguments.contains("shell_tool"))
         XCTAssertEqual(result.diagnostic?.knowledge, evidence.diagnostic)
     }
@@ -289,7 +390,8 @@ final class AutoReplyCodexGeneratorTests: XCTestCase {
         let generator = AutoReplyCodexGenerator(
             executableURL: URL(fileURLWithPath: "/bin/echo"),
             runner: runner,
-            sessionRegistry: CodexSessionRegistry(rootDirectory: root)
+            sessionRegistry: CodexSessionRegistry(rootDirectory: root),
+            evidencePreparer: FallbackKnowledgeEvidencePreparer()
         )
         var capture = try capture(uid: "GZC-000001")
         capture.imageAttachments = [
@@ -324,7 +426,8 @@ final class AutoReplyCodexGeneratorTests: XCTestCase {
         ])
         let generator = AutoReplyCodexGenerator(
             executableURL: URL(fileURLWithPath: "/bin/echo"), runner: runner,
-            sessionRegistry: CodexSessionRegistry(rootDirectory: root)
+            sessionRegistry: CodexSessionRegistry(rootDirectory: root),
+            evidencePreparer: FallbackKnowledgeEvidencePreparer()
         )
         var value = try capture(uid: "GZC-000001")
         value.videoAttachments = [AutoReplyVideoAttachment(
@@ -449,7 +552,7 @@ private actor SchemaValidatingCodexRunner: CodexProcessRunning {
         let properties = try XCTUnwrap(schema["properties"] as? [String: Any])
         let action = try XCTUnwrap(properties["action"] as? [String: Any])
         let transferReason = try XCTUnwrap(properties["transfer_reason"] as? [String: Any])
-        guard Set(properties.keys) == Set(["action", "reply_text", "transfer_reason"]),
+        guard Set(properties.keys) == Set(["answer_found", "action", "reply_text", "transfer_reason", "request_kind", "issue_has_no_solution", "clarification_reply", "handoff_reply"]),
               action["enum"] as? [String] == ["reply", "reply_then_transfer"],
               transferReason["enum"] as? [String] == [
                 "customer_explicitly_requested_human", "explicit_return_refund",
@@ -497,12 +600,14 @@ private struct DocumentCodexRunner: CodexProcessRunning {
 }
 
 private struct AutoReplyFakeCodexResponse: Sendable {
+    let answerFound: Bool
     let exitCode: Int32
     let stdout: String
     let reply: String
     let stderr: String
 
-    init(exitCode: Int32, stdout: String, reply: String, stderr: String = "") {
+    init(exitCode: Int32, stdout: String, reply: String, stderr: String = "", answerFound: Bool = true) {
+        self.answerFound = answerFound
         self.exitCode = exitCode
         self.stdout = stdout
         self.reply = reply
@@ -528,6 +633,7 @@ private actor AutoReplyFakeCodexRunner: CodexProcessRunning {
         let response = responses.removeFirst()
         if let index = arguments.firstIndex(of: "-o") {
             let data = try JSONSerialization.data(withJSONObject: [
+                "answer_found": response.answerFound,
                 "action": "reply",
                 "reply_text": response.reply,
                 "transfer_reason": "none"
@@ -550,4 +656,18 @@ private struct FixedEvidencePreparer: KnowledgeEvidencePreparing {
 private struct FixedLoginChecker: CodexLoginChecking {
     let status: CodexLoginStatus
     func check(executable: URL) async throws -> CodexLoginStatus { status }
+}
+
+private actor SemanticRetryEvidencePreparer: KnowledgeEvidencePreparing {
+    nonisolated var supportsSemanticRetry: Bool { true }
+    private(set) var semanticCount = 0
+    func prepare(capture: AutoReplyCapture) async -> KnowledgeEvidence { evidence("FIRST_EVIDENCE", "folder-hybrid") }
+    func prepareSemantic(capture: AutoReplyCapture) async -> KnowledgeEvidence {
+        semanticCount += 1
+        return evidence("SEMANTIC_EVIDENCE", "folder-semantic")
+    }
+    private func evidence(_ text: String, _ version: String) -> KnowledgeEvidence {
+        KnowledgeEvidence(mode: .v2Top12, version: version, documents: [text], context: text,
+                          diagnostic: .emptyFallback)
+    }
 }

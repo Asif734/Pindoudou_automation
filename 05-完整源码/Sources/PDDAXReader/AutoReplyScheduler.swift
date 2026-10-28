@@ -616,6 +616,26 @@ final class AutoReplyScheduler: ObservableObject {
         switch result {
         case .transferred(let agentLabel):
             state.transferTasks[index].state = .completed
+            // Close all work already observed for this customer. Returning to this
+            // profile cannot revive an old pending generation or handoff request.
+            let closedIDs = Set(state.jobs.filter { $0.uid == task.uid }
+                .flatMap { $0.capture.fullHistory.filter { $0.sender == .customer }.map(\.id) })
+            for jobIndex in state.jobs.indices where state.jobs[jobIndex].uid == task.uid {
+                if [.discovered, .capturing, .queued, .generating, .ready].contains(state.jobs[jobIndex].state) {
+                    state.jobs[jobIndex].state = .quarantined
+                    state.jobs[jobIndex].lastError = "Closed after successful human handoff"
+                }
+                state.jobs[jobIndex].pendingSupplement = nil
+                state.jobs[jobIndex].supplementCapturePending = false
+            }
+            state.pendingCaptureRequests.removeAll { $0.uid == task.uid }
+            state.pendingVideoBatches.removeAll { $0.uid == task.uid }
+            state.deferredVideoTransferEvents.removeAll { $0.uid == task.uid }
+            syncJobs()
+            try persist()
+            try await CustomerTransferPolicyStore.shared.completeHandoff(
+                root: store.rootDirectory, uid: task.uid, messageIDs: closedIDs)
+            try CodexSessionRegistry(rootDirectory: store.rootDirectory).invalidate(uid: task.uid)
             appendEvent(
                 uid: task.uid, kind: "transfer-completed",
                 detail: "已无原因直接转移给：\(agentLabel)"
@@ -950,7 +970,9 @@ final class AutoReplyScheduler: ObservableObject {
         let normalizedCapture = normalizeObservation(rawCapture, uid: uid)
         let capture: AutoReplyCapture
         if request.kind == .ordinary {
-            let covered = coveredMessageIDs(uid: uid)
+            let closed = try await CustomerTransferPolicyStore.shared.closedMessageIDs(
+                root: store.rootDirectory, uid: uid)
+            let covered = coveredMessageIDs(uid: uid).union(closed)
             guard let filtered = captureByRemovingMessages(
                 normalizedCapture, messageIDs: covered
             ) else {

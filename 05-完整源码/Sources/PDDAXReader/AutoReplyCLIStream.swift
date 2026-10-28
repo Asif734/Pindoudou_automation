@@ -1,6 +1,7 @@
 import Foundation
 
 struct StreamingReplyCandidate: Sendable {
+    var answerFound = true
     let reply: String
     let action: CodexReplyAction
     let transferReason: CodexTransferReason
@@ -19,6 +20,7 @@ final class AutoReplyCLIStream: @unchecked Sendable {
     private var candidate: String?
     private var candidateAction: CodexReplyAction?
     private var candidateTransferReason: CodexTransferReason?
+    private var candidateAnswerFound = true
     private var runningItems = Set<String>()
     private var threadID: String?
     private var events: [CodexExecutionEvent] = []
@@ -105,6 +107,7 @@ final class AutoReplyCLIStream: @unchecked Sendable {
                   let reply = object["reply_text"] as? String,
                   !reply.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
             candidate = reply.trimmingCharacters(in: .whitespacesAndNewlines)
+            candidateAnswerFound = object["answer_found"] as? Bool ?? true
             candidateAction = action
             candidateTransferReason = transferReason
         case "turn.completed":
@@ -112,6 +115,7 @@ final class AutoReplyCLIStream: @unchecked Sendable {
             guard started, eligible, runningItems.isEmpty, let candidate,
                   let candidateAction, let candidateTransferReason else { return nil }
             return StreamingReplyCandidate(
+                answerFound: candidateAnswerFound,
                 reply: candidate, action: candidateAction,
                 transferReason: candidateTransferReason,
                 threadID: threadID, events: events

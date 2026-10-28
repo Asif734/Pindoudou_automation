@@ -43,15 +43,37 @@ struct ReaderWorkflowDependencies: @unchecked Sendable {
         let stableReader = StableAXTreeReader(readOnce: { try reader.read() })
         let axStore = PerUserAXStore(rootDirectory: rootDirectory)
         let chatStore = PerUserChatStore(rootDirectory: rootDirectory)
-        let replyService = CodexReplyService(
-            sessionRegistry: CodexSessionRegistry(rootDirectory: rootDirectory)
-        )
         return ReaderWorkflowDependencies(
             readAX: { try stableReader.read() },
             saveAX: { uid, contents in try axStore.save(uid: uid, contents: contents) },
             parseChat: { root, capturedAt in PDDChatParser.parse(root: root, capturedAt: capturedAt) },
             mergeHistory: { uid, messages in try chatStore.merge(uid: uid, messages: messages) },
-            generateReply: { uid, history in try await replyService.generate(uid: uid, history: history) }
+            generateReply: { uid, history in
+                let localKnowledge = DirectLocalKnowledge()
+                try localKnowledge.validate()
+                guard let executable = CodexInstallation.resolve() else {
+                    throw AutoReplyRuntimeCreationError.codexUnavailable
+                }
+                let generator = AutoReplyCodexGenerator(
+                    executableURL: executable,
+                    sessionRegistry: CodexSessionRegistry(rootDirectory: rootDirectory),
+                    evidencePreparer: localKnowledge
+                )
+                do {
+                    let timeline = try AutoReplyTimeline.make(messages: history)
+                    let answeredHistory = history.lastIndex(where: { $0.sender == .service })
+                        .map { Array(history.prefix(through: $0)) } ?? []
+                    let answeredCursor = try AutoReplyTimeline.make(messages: answeredHistory).cursor
+                    let capture = AutoReplyCapture(
+                        uid: uid, fullHistory: history, batch: try timeline.freeze(after: answeredCursor),
+                        customerCursor: timeline.cursor, unexpectedServiceMessageIDs: []
+                    )
+                    let result = try await generator.generate(capture)
+                    return result
+                } catch {
+                    throw error
+                }
+            }
         )
     }
 }
@@ -111,9 +133,9 @@ struct ReaderWorkflow: Sendable {
                 throw ReaderWorkflowError(stage: .codex, detail: error.localizedDescription, fullAXOutput: fullAXOutput)
             }
         } else if latestMessage?.sender == .service {
-            replyOutput = "当前无需回复：最后一条有效消息来自客服。"
+            replyOutput = BilingualText.lines("当前无需回复：最后一条有效消息来自客服。", "No reply needed: the last valid message is from customer service.")
         } else {
-            replyOutput = "当前无需回复：没有解析到有效聊天消息。"
+            replyOutput = BilingualText.lines("当前无需回复：没有解析到有效聊天消息。", "No reply needed: no valid chat messages were parsed.")
         }
 
         return ReaderWorkflowResult(
@@ -129,11 +151,17 @@ struct ReaderWorkflow: Sendable {
     private func formatFullAX(result: AXReadResult, uid: String, capturedAt: Date) -> String {
         """
         拼多多用户 AX 完整读取结果
+        Pinduoduo customer AX tree report
         用户：\(uid)
+        User: \(uid)
         应用：\(result.applicationName)
+        Application: \(result.applicationName)
         节点数：\(result.nodeCount)
+        Nodes: \(result.nodeCount)
         耗时：\(String(format: "%.3f", result.elapsedSeconds)) 秒
+        Elapsed: \(String(format: "%.3f", result.elapsedSeconds)) seconds
         读取时间：\(capturedAt.formatted(date: .numeric, time: .standard))
+        Captured at: \(capturedAt.formatted(date: .numeric, time: .standard))
 
         \(AXDumpFormatter.format(root: result.root))
         """
@@ -145,18 +173,22 @@ struct ReaderWorkflow: Sendable {
         diagnostics: [String]
     ) -> String {
         var lines = [
-            "用户：\(uid)",
-            "历史消息：\(merged.history.count) 条，本次新增：\(merged.insertedCount) 条",
+            BilingualText.lines("用户：\(uid)", "User: \(uid)"),
+            BilingualText.lines("历史消息：\(merged.history.count) 条，本次新增：\(merged.insertedCount) 条", "History: \(merged.history.count) messages; newly added: \(merged.insertedCount)"),
             ""
         ]
         for message in merged.history {
             let sender = message.sender == .customer ? "客户" : "客服"
             let time = message.displayTime.map { "[\($0)] " } ?? ""
-            lines.append("\(time)\(sender)：\(message.content)  〈\(message.kind.rawValue)〉")
+            let englishSender = message.sender == .customer ? "Customer" : "Service"
+            lines.append(BilingualText.lines(
+                "\(time)\(sender)：\(message.content)  〈\(message.kind.rawValue)〉",
+                "\(time)\(englishSender): \(message.content)  〈\(message.kind.rawValue)〉"
+            ))
         }
         if !diagnostics.isEmpty {
             lines.append("")
-            lines.append("解析诊断：")
+            lines.append(BilingualText.lines("解析诊断：", "Parse diagnostics:"))
             lines.append(contentsOf: diagnostics)
         }
         return lines.joined(separator: "\n")

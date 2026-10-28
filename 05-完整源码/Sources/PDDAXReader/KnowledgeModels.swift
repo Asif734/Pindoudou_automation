@@ -1,6 +1,9 @@
 import Foundation
 
 enum KnowledgeRetrievalMode: String, Codable, Equatable, Sendable {
+    case directLocal = "direct-local"
+    case folderHybrid = "folder-hybrid"
+    case semanticOnly = "folder-semantic"
     case v2Top12 = "v2-top12"
     case fullZipFallback = "full-zip-fallback"
     case unavailable = "unavailable"
@@ -29,6 +32,8 @@ struct KnowledgeRetrievalDiagnostic: Codable, Equatable, Sendable {
     let contextSHA256: String?
     let durationMilliseconds: Int
     let error: String?
+    var queries: [String]? = nil
+    var queryPlannerIssue: String? = nil
 
     static let emptyFallback = KnowledgeRetrievalDiagnostic(
         mode: .unavailable,

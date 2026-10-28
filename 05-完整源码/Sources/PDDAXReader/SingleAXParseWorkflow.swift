@@ -14,16 +14,17 @@ struct SingleAXParseReport: Equatable {
     }
 
     var formatted: String {
-        var lines = ["用户：\(uid)"]
+        var lines = [BilingualText.lines("用户：\(uid)", "User: \(uid)")]
         if let latestMessage {
             let time = latestMessage.displayTime ?? capturedAt.formatted(
                 .dateTime.year().month().day().hour().minute().second()
             )
-            lines.append("时间：\(time)")
-            lines.append("客户：\(latestMessage.content)")
+            lines.append(BilingualText.lines("时间：\(time)", "Time: \(time)"))
+            lines.append(BilingualText.lines("客户：\(latestMessage.content)", "Customer: \(latestMessage.content)"))
         } else {
-            lines.append("时间：\(capturedAt.formatted(.dateTime.year().month().day().hour().minute().second()))")
-            lines.append("客户：本次 AX 没有解析到客户消息")
+            let time = capturedAt.formatted(.dateTime.year().month().day().hour().minute().second())
+            lines.append(BilingualText.lines("时间：\(time)", "Time: \(time)"))
+            lines.append(BilingualText.lines("客户：本次 AX 没有解析到客户消息", "Customer: no customer message was parsed in this AX snapshot"))
         }
         return lines.joined(separator: "\n")
     }

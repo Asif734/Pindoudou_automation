@@ -1,9 +1,15 @@
 {
   "type": "object",
   "properties": {
+    "answer_found": {
+      "type": "boolean"
+    },
     "action": {
       "type": "string",
-      "enum": ["reply", "reply_then_transfer"]
+      "enum": [
+        "reply",
+        "reply_then_transfer"
+      ]
     },
     "reply_text": {
       "type": "string",
@@ -20,8 +26,37 @@
         "troubleshooting_exhausted",
         "none"
       ]
+    },
+    "request_kind": {
+      "type": "string",
+      "enum": [
+        "other",
+        "human_request",
+        "refund_return",
+        "technical"
+      ]
+    },
+    "issue_has_no_solution": {
+      "type": "boolean"
+    },
+    "clarification_reply": {
+      "type": "string",
+      "minLength": 1
+    },
+    "handoff_reply": {
+      "type": "string",
+      "minLength": 1
     }
   },
-  "required": ["action", "reply_text", "transfer_reason"],
+  "required": [
+    "answer_found",
+    "action",
+    "reply_text",
+    "transfer_reason",
+    "request_kind",
+    "issue_has_no_solution",
+    "clarification_reply",
+    "handoff_reply"
+  ],
   "additionalProperties": false
 }

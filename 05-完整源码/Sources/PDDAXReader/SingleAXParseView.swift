@@ -8,7 +8,7 @@ struct SingleAXParseView: View {
             HStack(spacing: 10) {
                 Button(action: model.readOnceAndParse) {
                     Label(
-                        model.isReading ? "正在读取一次…" : "单次读取 AX 并 Parse",
+                        model.isReading ? BilingualText.lines("正在读取一次…", "Reading snapshot…") : BilingualText.lines("单次读取 AX 并 Parse", "Read and parse one AX snapshot"),
                         systemImage: "scope"
                     )
                 }

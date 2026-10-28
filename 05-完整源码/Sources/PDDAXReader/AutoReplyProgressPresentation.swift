@@ -85,6 +85,12 @@ enum AutoReplyProgressPresentation {
     static func knowledgeSummary(_ diagnostic: KnowledgeRetrievalDiagnostic) -> String {
         let base: String
         switch diagnostic.mode {
+        case .directLocal:
+            base = BilingualText.lines("Codex 直接读取本地知识库", "Codex reads the local knowledge folder directly")
+        case .folderHybrid:
+            base = BilingualText.lines("主要目录混合检索 · \(diagnostic.selectedDocuments.count)份资料 · \(diagnostic.durationMilliseconds)ms", "Primary-folder hybrid search · \(diagnostic.selectedDocuments.count) documents · \(diagnostic.durationMilliseconds)ms")
+        case .semanticOnly:
+            base = BilingualText.lines("第二次独立纯语义检索 · \(diagnostic.selectedDocuments.count)份资料 · \(diagnostic.durationMilliseconds)ms", "Standalone semantic-only retry · \(diagnostic.selectedDocuments.count) documents · \(diagnostic.durationMilliseconds)ms")
         case .v2Top12:
             base = BilingualText.lines("V2 Top-12 · \(diagnostic.selectedDocuments.count)份资料 · \(diagnostic.durationMilliseconds)ms", "V2 Top-12 · \(diagnostic.selectedDocuments.count) documents · \(diagnostic.durationMilliseconds)ms")
         case .fullZipFallback:

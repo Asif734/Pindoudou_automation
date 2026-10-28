@@ -18,7 +18,7 @@ struct CodexInvocation: Equatable, Sendable {
         workingDirectoryURL: URL? = nil,
         imageURLs: [URL] = []
     ) {
-        var arguments = ["-a", "never", "--disable", "shell_tool", "exec"]
+        var arguments = ["-a", "never", "--enable", "shell_tool", "exec"]
         if case .resume = mode { arguments.append("resume") }
         arguments.append(contentsOf: [
             "--json",
@@ -26,9 +26,10 @@ struct CodexInvocation: Equatable, Sendable {
             "--ignore-rules",
             "-m", Self.model,
             "-c", "model_reasoning_effort=\"\(Self.reasoningEffort)\"",
-            "--skip-git-repo-check"
+            "--skip-git-repo-check",
+            "-c", "web_search=\"disabled\""
         ])
-        if let workingDirectoryURL {
+        if case .create = mode, let workingDirectoryURL {
             arguments.append(contentsOf: ["-C", workingDirectoryURL.path])
         }
         if case .create = mode {
@@ -50,12 +51,14 @@ struct CodexInvocation: Equatable, Sendable {
         sessionID: String?,
         schemaURL: URL,
         resultURL: URL,
-        imageURLs: [URL] = []
+        imageURLs: [URL] = [],
+        workingDirectoryURL: URL? = nil
     ) -> [String] {
         CodexInvocation(
             mode: sessionID.map(CodexTurnMode.resume(sessionID:)) ?? .create,
             schemaURL: schemaURL,
             resultURL: resultURL,
+            workingDirectoryURL: workingDirectoryURL,
             imageURLs: imageURLs
         ).arguments
     }

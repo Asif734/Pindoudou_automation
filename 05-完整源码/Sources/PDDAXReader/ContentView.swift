@@ -8,7 +8,7 @@ struct ContentView: View {
             HStack(spacing: 10) {
                 Button(action: model.readParseAndSuggest) {
                     Label(
-                        model.isReading ? "正在处理…" : "读取、解析并生成建议",
+                        model.isReading ? BilingualText.lines("正在处理…", "Processing…") : BilingualText.lines("读取、解析并生成建议", "Read, parse, and suggest"),
                         systemImage: model.isReading ? "hourglass" : "accessibility"
                     )
                 }
@@ -30,15 +30,15 @@ struct ContentView: View {
 
             TabView(selection: $model.selectedTab) {
                 panel(contents: model.fullAXOutput)
-                    .tabItem { Label("完整 AX", systemImage: "list.bullet.rectangle") }
+                    .tabItem { Label(BilingualText.lines("完整 AX", "Full AX tree"), systemImage: "list.bullet.rectangle") }
                     .tag(ReaderTab.fullAX)
 
                 panel(contents: model.parsedChatOutput)
-                    .tabItem { Label("解析聊天", systemImage: "bubble.left.and.bubble.right") }
+                    .tabItem { Label(BilingualText.lines("解析聊天", "Parsed chat"), systemImage: "bubble.left.and.bubble.right") }
                     .tag(ReaderTab.parsedChat)
 
                 panel(contents: model.replyOutput)
-                    .tabItem { Label("Codex 建议回复", systemImage: "sparkles") }
+                    .tabItem { Label(BilingualText.lines("Codex 建议回复", "Codex suggested reply"), systemImage: "sparkles") }
                     .tag(ReaderTab.reply)
             }
         }

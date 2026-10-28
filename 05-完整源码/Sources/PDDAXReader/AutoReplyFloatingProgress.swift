@@ -5,17 +5,17 @@ import SwiftUI
 final class AutoReplyFloatingProgressPanel: NSPanel {
     init() {
         super.init(
-            contentRect: NSRect(x: 0, y: 0, width: 480, height: 620),
+            contentRect: NSRect(x: 0, y: 0, width: 520, height: 620),
             styleMask: [.titled, .closable, .resizable, .nonactivatingPanel],
             backing: .buffered,
             defer: false
         )
-        title = "pinduodou_automation · 实时进度 / Live progress"
+        title = "实时进度 / Live progress"
         level = .floating
         hidesOnDeactivate = false
         isReleasedWhenClosed = false
         collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
-        minSize = NSSize(width: 420, height: 190)
+        minSize = NSSize(width: 480, height: 280)
         isMovable = true
         isMovableByWindowBackground = true
         ignoresMouseEvents = false
@@ -56,6 +56,10 @@ final class AutoReplyProgressPanelController: NSObject, ObservableObject, NSWind
                let frame = NSScreen.main?.visibleFrame {
                 window.setFrameOrigin(NSPoint(x: frame.maxX - 500, y: frame.maxY - 650))
             }
+            var frame = window.frame
+            frame.size.width = max(frame.size.width, window.minSize.width)
+            frame.size.height = max(frame.size.height, window.minSize.height)
+            window.setFrame(frame, display: false)
             panel = window
         }
         updateInteraction()
@@ -69,7 +73,7 @@ final class AutoReplyProgressPanelController: NSObject, ObservableObject, NSWind
         layout.collapsed.toggle()
         guard let panel else { return }
         var frame = panel.frame
-        let height: CGFloat = layout.collapsed ? 210 : 620
+        let height: CGFloat = layout.collapsed ? 300 : 620
         frame.origin.y += frame.height - height
         frame.size.height = height
         panel.setFrame(frame, display: true, animate: false)
@@ -111,68 +115,71 @@ private struct AutoReplyProgressPanelView: View {
 
     var body: some View {
         TimelineView(.periodic(from: .now, by: 0.25)) { context in
+            ScrollView {
             VStack(alignment: .leading, spacing: 10) {
                 HStack {
                     Circle()
                         .fill(model.isRunning ? Color.blue : Color.gray)
                         .frame(width: 8, height: 8)
-                    Text(BilingualText.lines("全链路进度", "End-to-end progress")).font(.headline)
+                    BilingualProgressText(BilingualText.lines("全链路进度", "End-to-end progress")).font(.headline)
                     Spacer()
-                    Text("CLI \(model.liveGenerationCount)")
+                    BilingualProgressText(BilingualText.lines("Codex 任务 \(model.liveGenerationCount)", "Codex tasks \(model.liveGenerationCount)"))
                         .font(.caption.monospacedDigit())
                 }
 
-                Text(headline).font(.system(size: 13, weight: .medium)).lineLimit(3)
+                BilingualProgressText(headline).font(.system(size: 13, weight: .medium))
                 if let progress {
                     ProgressView(value: progress).tint(.blue)
                 } else if model.isRunning {
                     ProgressView().controlSize(.small)
                 }
-                Text(BilingualText.lines("本阶段 \(elapsed(context.date)) 秒 · 可拖动、缩放和关闭", "Current stage: \(elapsed(context.date)) seconds · draggable, resizable, and closable"))
+                BilingualProgressText(BilingualText.lines("本阶段 \(elapsed(context.date)) 秒 · 可拖动、缩放和关闭", "Current stage: \(elapsed(context.date)) seconds · draggable, resizable, and closable"))
                     .font(.system(size: 10)).foregroundStyle(.secondary)
 
                 if !layout.collapsed {
                     Divider()
                     if let wake = model.lastAXWakeAt {
                         let time = wake.formatted(date: .omitted, time: .standard)
-                        Text(BilingualText.lines("最近 AX 通知：\(time)", "Latest AX notification: \(time)"))
+                        BilingualProgressText(BilingualText.lines("最近 AX 通知：\(time)", "Latest AX notification: \(time)"))
                             .font(.caption.monospaced()).foregroundStyle(.secondary)
                     }
                     if let video = model.latestVideoStatus {
                         let stage = BilingualText.split(AutoReplyProgressPresentation.videoStageName(video.phase))
-                        Text(BilingualText.lines(
+                        BilingualProgressText(BilingualText.lines(
                             "最近视频记录 \(video.messageID) · \(stage.chinese)",
                             "Latest video \(video.messageID) · \(stage.english)"
                         ))
                             .font(.caption.monospaced()).foregroundStyle(.blue)
                     }
                     if let diagnostic = model.latestKnowledgeDiagnostic {
-                        Text(AutoReplyProgressPresentation.knowledgeSummary(diagnostic))
+                        BilingualProgressText(AutoReplyProgressPresentation.knowledgeSummary(diagnostic))
                             .font(.caption.monospaced()).foregroundStyle(.secondary)
                     }
                     if let snapshot = model.latestResourceSnapshot {
                         let memory = byteCount(snapshot.availableMemoryBytes)
-                        Text(BilingualText.lines("可用内存 \(memory) · 队列 \(snapshot.queueDepth) · CLI \(snapshot.activeCLI)", "Available memory \(memory) · queue \(snapshot.queueDepth) · CLI \(snapshot.activeCLI)"))
+                        BilingualProgressText(BilingualText.lines("可用内存 \(memory) · 队列 \(snapshot.queueDepth) · CLI \(snapshot.activeCLI)", "Available memory \(memory) · queue \(snapshot.queueDepth) · CLI \(snapshot.activeCLI)"))
                             .font(.caption.monospaced()).foregroundStyle(.secondary)
                     }
-                    ScrollView {
+                    Group {
                         LazyVStack(alignment: .leading, spacing: 8) {
                             ForEach(displayedJobs) { job in
                                 AutoReplyProgressJobCard(job: job)
                             }
                             if displayedJobs.isEmpty {
-                                Text(model.isRunning
+                                BilingualProgressText(model.isRunning
                                     ? BilingualText.lines("等待截图红点或 OCR 发现客户消息。", "Waiting for a screenshot red dot or OCR to find a customer message.")
                                     : BilingualText.lines("当前没有任务。", "There are currently no tasks."))
                                     .font(.caption).foregroundStyle(.secondary)
                             }
                         }
                     }
-                    Text(BilingualText.lines("只读显示 · 不会为了进度条额外扫描拼多多", "Read-only display · no extra Pinduoduo scans are performed for this progress view"))
+                    BilingualProgressText(BilingualText.lines("只读显示 · 不会为了进度条额外扫描拼多多", "Read-only display · no extra Pinduoduo scans are performed for this progress view"))
                         .font(.system(size: 10)).foregroundStyle(.secondary)
                 }
             }
             .padding(14)
+            .frame(maxWidth: .infinity, alignment: .topLeading)
+            }
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         }
         .background(Color(nsColor: .windowBackgroundColor))
@@ -196,6 +203,24 @@ private struct AutoReplyProgressPanelView: View {
     }
 }
 
+private struct BilingualProgressText: View {
+    let value: String
+
+    init(_ value: String) { self.value = value }
+
+    var body: some View {
+        let parts = BilingualText.split(value)
+        VStack(alignment: .leading, spacing: 2) {
+            Text(parts.chinese)
+            if parts.english != parts.chinese {
+                Text(parts.english)
+            }
+        }
+        .fixedSize(horizontal: false, vertical: true)
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
+
 private struct AutoReplyProgressJobCard: View {
     let job: AutoReplyJob
 
@@ -207,10 +232,10 @@ private struct AutoReplyProgressJobCard: View {
                     Spacer()
                     Text("#\(job.sequence)").font(.caption.monospacedDigit())
                 }
-                Text(AutoReplyProgressPresentation.jobStageName(job))
+                BilingualProgressText(AutoReplyProgressPresentation.jobStageName(job))
                     .font(.caption).foregroundStyle(color)
                 if let error = job.lastError {
-                    Text(BilingualText.lines("错误：\(error)", "Error: \(error)")).font(.system(size: 10)).foregroundStyle(.orange)
+                    BilingualProgressText(BilingualText.lines("错误：\(error)", "Error: \(error)")).font(.system(size: 10)).foregroundStyle(.orange)
                 }
             }
             .frame(maxWidth: .infinity, alignment: .leading)

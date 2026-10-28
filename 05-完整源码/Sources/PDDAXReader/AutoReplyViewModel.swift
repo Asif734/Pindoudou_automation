@@ -32,7 +32,7 @@ enum AutoReplyRuntimeCreationError: LocalizedError {
     var errorDescription: String? {
         switch self {
         case .codexUnavailable: return BilingualText.lines("未找到可执行的本机 Codex CLI", "No executable local Codex CLI was found")
-        case .knowledgeResourcesUnavailable: return BilingualText.lines("未找到完整的 V2 知识库运行资源", "Complete V2 knowledge-base runtime resources were not found")
+        case .knowledgeResourcesUnavailable: return BilingualText.lines("主要知识目录或检索运行资源不可用", "Primary knowledge folder or retrieval runtime is unavailable")
         case .senseVoiceResourcesUnavailable: return BilingualText.lines("未找到完整的 SenseVoiceSmall INT8 资源", "Complete SenseVoiceSmall INT8 resources were not found")
         case .codexPrewarmFailed: return BilingualText.lines("Codex CLI 启动检查未通过", "Codex CLI startup check failed")
         }
@@ -167,7 +167,30 @@ final class AutoReplyViewModel: ObservableObject {
         }
     }
 
+    func checkUnreadOnly() async {
+        guard !isRunning else { return }
+        status = BilingualText.lines("正在只读检查会话红点，不生成或发送回复…", "Checking unread markers only; no reply will be generated or sent…")
+        do {
+            let backend = LivePDDAXBackend()
+            let detector = PDDLiveUnreadEvidenceDetector(requireConversationRows: true)
+            let tree = try backend.readSemanticTree()
+            let unread = try await detector.unreadRows(in: tree)
+            if unread.isEmpty {
+                status = BilingualText.lines("会话列表已读取，未匹配到客户未读红点。未发送消息。", "Conversation list read successfully; no customer unread marker matched. No message sent.")
+            } else {
+                let names = unread.map(\.visibleLabel).joined(separator: ", ")
+                status = BilingualText.lines("检测到 \(unread.count) 个未读会话：\(names)。仅检查，未打开客户或发送消息。", "Detected \(unread.count) unread conversation(s): \(names). Check only; no customer opened or message sent.")
+            }
+        } catch {
+            status = BilingualText.lines("未读检查失败：\(error.localizedDescription)", "Unread check failed: \(error.localizedDescription)")
+        }
+    }
+
     func viewAppeared() {
+        if CommandLine.arguments.contains("--start-stopped") {
+            status = BilingualText.lines("已停止 · 请手动开始", "Stopped · press Start when ready")
+            return
+        }
         let persistedIntent = (try? runIntentStore.load()) ?? false
         if identity.startsAutomatically || persistedIntent {
             start()
@@ -395,20 +418,23 @@ final class AutoReplyViewModel: ObservableObject {
         let backend = LeaseValidatedPDDAXBackend(
             base: LivePDDAXBackend(), gate: leaseGate
         )
-        guard let knowledgeResources = KnowledgeResourceLocator.resolve() else {
-            throw AutoReplyRuntimeCreationError.knowledgeResourcesUnavailable
+        let localKnowledge = DirectLocalKnowledge()
+        try localKnowledge.validate()
+        let senseVoice = PDDSenseVoiceResourceLocator.resolve().flatMap { resources in
+            PythonRuntimeResolver.resolve(resourceRootURL: Bundle.main.resourceURL ?? URL(fileURLWithPath: FileManager.default.currentDirectoryPath).appendingPathComponent("Resources")).map { python in
+                PDDSenseVoiceFactory.make(resources: resources, pythonURL: python.executableURL,
+                    knowledgeSitePackagesURL: python.executableURL.deletingLastPathComponent())
+            }
         }
-        guard let senseVoiceResources = PDDSenseVoiceResourceLocator.resolve() else {
-            throw AutoReplyRuntimeCreationError.senseVoiceResourcesUnavailable
+        let speechTranscriber: any PDDVideoSpeechTranscribing
+        if let senseVoice {
+            speechTranscriber = PDDAppleThenFallbackVideoSpeechTranscriber(
+                primary: PDDAppleVideoSpeechTranscriber(), fallback: senseVoice
+            )
+        } else {
+            // Native speech can return no transcript; video frames remain usable.
+            speechTranscriber = PDDAppleVideoSpeechTranscriber()
         }
-        let senseVoice = PDDSenseVoiceFactory.make(
-            resources: senseVoiceResources,
-            pythonURL: knowledgeResources.pythonURL,
-            knowledgeSitePackagesURL: knowledgeResources.sitePackagesURL
-        )
-        let speechTranscriber = PDDAppleThenFallbackVideoSpeechTranscriber(
-            primary: PDDAppleVideoSpeechTranscriber(), fallback: senseVoice
-        )
         let videoArmer = PDDVideoTransferArmer(
             destinationRoot: videoRoot,
             registry: videoRegistry,
@@ -448,22 +474,9 @@ final class AutoReplyViewModel: ObservableObject {
         guard let codexURL = CodexInstallation.resolve() else {
             throw AutoReplyRuntimeCreationError.codexUnavailable
         }
-        let retriever = V2KnowledgeRetriever(
-            pythonURL: knowledgeResources.pythonURL,
-            scriptURL: knowledgeResources.scriptURL,
-            workerScriptURL: knowledgeResources.workerScriptURL,
-            sitePackagesURL: knowledgeResources.sitePackagesURL,
-            seedCacheURL: knowledgeResources.seedCacheURL,
-            writableCacheURL: knowledgeResources.writableCacheURL,
-            knowledgeBaseSHA256: knowledgeResources.knowledgeBaseSHA256
-        )
-        let evidencePreparer = KnowledgeEvidenceService(
-            retriever: retriever,
-            versioner: KnowledgeBaseVersioner(),
-            knowledgeBaseURL: knowledgeResources.knowledgeBaseURL
-        )
         let codexEnvironment = try CodexHomeManager(dataRoot: root).prepare()
         let codexRunner = CodexProcessRunner(environment: codexEnvironment.values)
+        let evidencePreparer = localKnowledge
         let scheduler = try AutoReplyScheduler(
             driver: driver,
             generator: AutoReplyCodexGenerator(
@@ -564,12 +577,8 @@ final class AutoReplyViewModel: ObservableObject {
         }
         let prewarmer = PDDStartupPrewarmer(
             warmOCR: { try await ocrEngine.prewarm() },
-            warmKnowledge: {
-                _ = try await retriever.prepare(
-                    knowledgeBaseURLs: [knowledgeResources.knowledgeBaseURL]
-                )
-            },
-            warmSenseVoice: { try await senseVoice.prepare() },
+            warmKnowledge: { try localKnowledge.validate() },
+            warmSenseVoice: { if let senseVoice { try await senseVoice.prepare() } },
             checkCodex: {
                 guard await CodexCompatibilityProbe().check(executableURL: codexURL) == .ready else {
                     throw AutoReplyRuntimeCreationError.codexPrewarmFailed

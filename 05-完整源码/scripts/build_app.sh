@@ -11,6 +11,11 @@ SIGNING_IDENTITY="$($PROJECT_ROOT/scripts/select_codesign_identity.sh)"
 PYTHON_RUNTIME_NAME="cpython-3.12.14+20260825-aarch64-apple-darwin-install_only_stripped.tar.gz"
 PYTHON_RUNTIME_SHA256="8b0f1fa71eab7ca644e482c631807a1116fa848491051cd1c8d9429491de63a6"
 PYTHON_RUNTIME_ROOT="$PROJECT_ROOT/Resources/ThirdParty/PythonRuntime"
+SWIFT_BUILD_ARGS=()
+SWIFT_UI_PLUGIN_ROOT="/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/usr/lib/swift/host/plugins"
+if [[ -f "$SWIFT_UI_PLUGIN_ROOT/libSwiftUIMacros.dylib" ]]; then
+    SWIFT_BUILD_ARGS=(--build-system native -Xswiftc -plugin-path -Xswiftc "$SWIFT_UI_PLUGIN_ROOT")
+fi
 
 sign_and_verify() {
     local app_path="$1"
@@ -27,9 +32,18 @@ sign_and_verify() {
 
 copy_auto_reply_resources() {
     local destination_app="$1"
-    ditto "$PROJECT_ROOT/Resources/WebOCR" "$destination_app/Contents/Resources/WebOCR"
-    ditto "$PROJECT_ROOT/Resources/SenseVoice" "$destination_app/Contents/Resources/SenseVoice"
+    ditto "$PROJECT_ROOT/Resources/FolderKnowledge" "$destination_app/Contents/Resources/FolderKnowledge"
+    for optional_resource in WebOCR SenseVoice; do
+        if [[ -d "$PROJECT_ROOT/Resources/$optional_resource" ]]; then
+            ditto "$PROJECT_ROOT/Resources/$optional_resource" "$destination_app/Contents/Resources/$optional_resource"
+        else
+            print "$optional_resource not bundled; using native macOS fallback."
+        fi
+    done
     for resource in CustomerService V2Knowledge KnowledgeBase; do
+        if [[ "$resource" != "CustomerService" && -f "$PROJECT_ROOT/Resources/FolderKnowledge/config.json" ]]; then
+            continue
+        fi
         local source_path="$PROJECT_ROOT/Resources/$resource"
         local destination_path="$destination_app/Contents/Resources/$resource"
         case "$destination_path" in
@@ -46,8 +60,10 @@ copy_auto_reply_resources() {
     mkdir -p "$destination_app/Contents/Resources/ThirdPartyNotices"
     cp "$PYTHON_RUNTIME_ROOT/NOTICE.md" \
         "$destination_app/Contents/Resources/ThirdPartyNotices/PythonRuntime.md"
-    cp "$PROJECT_ROOT/Resources/SenseVoice/NOTICE.md" \
-        "$destination_app/Contents/Resources/ThirdPartyNotices/SenseVoice.md"
+    if [[ -f "$PROJECT_ROOT/Resources/SenseVoice/NOTICE.md" ]]; then
+        cp "$PROJECT_ROOT/Resources/SenseVoice/NOTICE.md" \
+            "$destination_app/Contents/Resources/ThirdPartyNotices/SenseVoice.md"
+    fi
 }
 
 if [[ "${1:-}" == "--task-isolation-candidate" ]]; then
@@ -56,8 +72,8 @@ if [[ "${1:-}" == "--task-isolation-candidate" ]]; then
         *) print -u2 "拒绝替换意外路径：$CANDIDATE_APP_PATH"; exit 1 ;;
     esac
     cd "$PROJECT_ROOT"
-    swift build -c release --product PDDAXReader
-    BIN_DIR="$(swift build -c release --show-bin-path)"
+    swift build "${SWIFT_BUILD_ARGS[@]}" -c release --product PDDAXReader
+    BIN_DIR="$(swift build "${SWIFT_BUILD_ARGS[@]}" -c release --show-bin-path)"
     if [[ -e "$CANDIDATE_APP_PATH" ]]; then
         BACKUP_ROOT="$PROJECT_ROOT/outputs/backups/$(date +%Y%m%d-%H%M%S)"
         mkdir -p "$BACKUP_ROOT"
@@ -69,8 +85,8 @@ if [[ "${1:-}" == "--task-isolation-candidate" ]]; then
     cp "$PROJECT_ROOT/Resources/AppIcon/PDDLatest.icns" \
         "$CANDIDATE_APP_PATH/Contents/Resources/PDDLatest.icns"
     copy_auto_reply_resources "$CANDIDATE_APP_PATH"
-    cmp "$PROJECT_ROOT/Resources/V2Knowledge/serve_top12.py" \
-        "$CANDIDATE_APP_PATH/Contents/Resources/V2Knowledge/serve_top12.py"
+    cmp "$PROJECT_ROOT/Resources/FolderKnowledge/serve_folder.py" \
+        "$CANDIDATE_APP_PATH/Contents/Resources/FolderKnowledge/serve_folder.py"
     chmod 755 "$CANDIDATE_APP_PATH/Contents/MacOS/PDDTaskIsolationCandidate"
     sign_and_verify "$CANDIDATE_APP_PATH"
     print "$CANDIDATE_APP_PATH"
@@ -96,14 +112,18 @@ case "$AUTO_REPLY_APP_PATH" in
 esac
 
 cd "$PROJECT_ROOT"
-swift build -c release --product PDDAXReader
-BIN_DIR="$(swift build -c release --show-bin-path)"
+swift build "${SWIFT_BUILD_ARGS[@]}" -c release --product PDDAXReader
+BIN_DIR="$(swift build "${SWIFT_BUILD_ARGS[@]}" -c release --show-bin-path)"
 
 rm -rf -- "$APP_PATH"
 mkdir -p "$APP_PATH/Contents/MacOS" "$APP_PATH/Contents/Resources"
 cp "$BIN_DIR/PDDAXReader" "$APP_PATH/Contents/MacOS/PDDAXReader"
 cp "$PROJECT_ROOT/Resources/Info.plist" "$APP_PATH/Contents/Info.plist"
-ditto "$PROJECT_ROOT/Resources/WebOCR" "$APP_PATH/Contents/Resources/WebOCR"
+if [[ -d "$PROJECT_ROOT/Resources/WebOCR" ]]; then
+    ditto "$PROJECT_ROOT/Resources/WebOCR" "$APP_PATH/Contents/Resources/WebOCR"
+fi
+ditto "$PROJECT_ROOT/Resources/FolderKnowledge" "$APP_PATH/Contents/Resources/FolderKnowledge"
+ditto "$PROJECT_ROOT/Resources/CustomerService" "$APP_PATH/Contents/Resources/CustomerService"
 chmod 755 "$APP_PATH/Contents/MacOS/PDDAXReader"
 
 sign_and_verify "$APP_PATH"
@@ -112,7 +132,9 @@ rm -rf -- "$PROBE_APP_PATH"
 mkdir -p "$PROBE_APP_PATH/Contents/MacOS" "$PROBE_APP_PATH/Contents/Resources"
 cp "$BIN_DIR/PDDAXReader" "$PROBE_APP_PATH/Contents/MacOS/PDDAXSingleParseProbe"
 cp "$PROJECT_ROOT/Resources/SingleParseInfo.plist" "$PROBE_APP_PATH/Contents/Info.plist"
-ditto "$PROJECT_ROOT/Resources/WebOCR" "$PROBE_APP_PATH/Contents/Resources/WebOCR"
+if [[ -d "$PROJECT_ROOT/Resources/WebOCR" ]]; then
+    ditto "$PROJECT_ROOT/Resources/WebOCR" "$PROBE_APP_PATH/Contents/Resources/WebOCR"
+fi
 chmod 755 "$PROBE_APP_PATH/Contents/MacOS/PDDAXSingleParseProbe"
 sign_and_verify "$PROBE_APP_PATH"
 
@@ -123,12 +145,17 @@ cp "$PROJECT_ROOT/Resources/AutoReplyInfo.plist" "$AUTO_REPLY_APP_PATH/Contents/
 copy_auto_reply_resources "$AUTO_REPLY_APP_PATH"
 cmp "$PROJECT_ROOT/Resources/CustomerService/customer-reply-prompt.md" \
     "$AUTO_REPLY_APP_PATH/Contents/Resources/CustomerService/customer-reply-prompt.md"
+if [[ -f "$PROJECT_ROOT/Resources/FolderKnowledge/config.json" ]]; then
+    cmp "$PROJECT_ROOT/Resources/FolderKnowledge/serve_folder.py" \
+        "$AUTO_REPLY_APP_PATH/Contents/Resources/FolderKnowledge/serve_folder.py"
+else
 cmp "$PROJECT_ROOT/Resources/V2Knowledge/retrieve_top12.py" \
     "$AUTO_REPLY_APP_PATH/Contents/Resources/V2Knowledge/retrieve_top12.py"
 cmp "$PROJECT_ROOT/Resources/V2Knowledge/serve_top12.py" \
     "$AUTO_REPLY_APP_PATH/Contents/Resources/V2Knowledge/serve_top12.py"
 cmp "$PROJECT_ROOT/Resources/KnowledgeBase/Grozziie-China-KB-2026-08-24.zip" \
     "$AUTO_REPLY_APP_PATH/Contents/Resources/KnowledgeBase/Grozziie-China-KB-2026-08-24.zip"
+fi
 chmod 755 "$AUTO_REPLY_APP_PATH/Contents/MacOS/PDDAutoReply"
 sign_and_verify "$AUTO_REPLY_APP_PATH"
 

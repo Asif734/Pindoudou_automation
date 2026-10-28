@@ -1,6 +1,7 @@
 import AppKit
 import Foundation
 import WebKit
+import Vision
 
 enum PDDOCRError: LocalizedError {
     case screenRecordingPermission
@@ -84,6 +85,9 @@ final class PDDPaddleOCREngine: NSObject, PDDOCRRecognizing, WKNavigationDelegat
     }
 
     func recognize(_ image: CGImage) async throws -> [PDDOCRLine] {
+        if !Self.hasWebOCRResources {
+            return try await Self.recognizeWithVision(image)
+        }
         try await ensureReady()
         guard let data = NSBitmapImageRep(cgImage: image).representation(using: .png, properties: [:]) else {
             throw PDDOCRError.engine("截图无法编码为 PNG")
@@ -103,7 +107,41 @@ final class PDDPaddleOCREngine: NSObject, PDDOCRRecognizing, WKNavigationDelegat
     }
 
     func prewarm() async throws {
+        if !Self.hasWebOCRResources {
+            _ = try VNRecognizeTextRequest().supportedRecognitionLanguages()
+            return
+        }
         try await ensureReady()
+    }
+
+    static var hasWebOCRResources: Bool {
+        FileManager.default.fileExists(atPath: PDDOCRResourceRoot.resolve().appendingPathComponent("index.html").path)
+    }
+
+    private static func recognizeWithVision(_ image: CGImage) async throws -> [PDDOCRLine] {
+        let lines = try await Task.detached(priority: .userInitiated) {
+            let request = VNRecognizeTextRequest()
+            request.recognitionLevel = .accurate
+            request.recognitionLanguages = ["zh-Hans", "zh-Hant", "en-US"]
+            request.usesLanguageCorrection = true
+            try VNImageRequestHandler(cgImage: image).perform([request])
+            let width = CGFloat(image.width)
+            let height = CGFloat(image.height)
+            return (request.results ?? []).compactMap { observation -> PDDOCRLine? in
+                guard let candidate = observation.topCandidates(1).first else { return nil }
+                let box = observation.boundingBox
+                // Vision uses normalized bottom-left coordinates; the existing
+                // chat parser expects pixels measured from the top-left.
+                return PDDOCRLine(text: candidate.string,
+                                  box: CGRect(x: box.minX * width, y: (1 - box.maxY) * height,
+                                              width: box.width * width, height: box.height * height),
+                                  confidence: Double(candidate.confidence))
+            }.sorted { lhs, rhs in
+                lhs.box.minY == rhs.box.minY ? lhs.box.minX < rhs.box.minX : lhs.box.minY < rhs.box.minY
+            }
+        }.value
+        try Task.checkCancellation()
+        return lines
     }
 
     private func ensureReady() async throws {

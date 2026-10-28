@@ -1102,6 +1102,23 @@ final class PDDAXConversationDriverTests: XCTestCase {
         XCTAssertFalse(capture.ocrDiagnostic?.contains("操作超时：video") == true)
     }
 
+    func testIncomingTransferRecoversRequestEvenAfterBaselineAdvancedPastGreeting() async throws {
+        let uid = "GZC-000001"
+        let content = [customer("100"), customer("101"), service("102")]
+        let web = AXNodeSnapshot(role: "AXWebArea", attributes: [("AXTitle", "小硕")], children:
+            content + [AXNodeSnapshot(role: "AXStaticText", attributes: [
+                ("AXValue", "花儿 将该会话转移给 小硕，并留言：催发货")])])
+        let opened = openedChatTree(uid: uid)
+        let tree = PDDAXSemanticTree(rootSnapshot: AXNodeSnapshot(role: "AXWindow",
+            attributes: [("AXValue", uid)], children: [web]), nodes: opened.nodes)
+        let driver = makeDriver(backend: FakePDDAXBackend(trees: [tree]), unread: FakePDDUnreadEvidence(rows: []))
+        driver.restoreConversationCaptureState(baselinedUIDs: [uid], knownServiceMessageIDsByUID: [:])
+        let oldCursor = try AutoReplyTimeline.make(messages: PDDChatParser.parse(root: web).messages).cursor
+        let captured = try await driver.capture(uid: uid, after: oldCursor)
+        XCTAssertEqual(captured.batch?.events.map(\.messageID), ["middlePanel_list_100", "middlePanel_list_101"])
+        XCTAssertTrue(captured.ocrDiagnostic?.contains("检测到转入本账号") == true)
+    }
+
     private func makeDriver(
         backend: FakePDDAXBackend,
         allowedUIDs: Set<String>? = ["GZC-000001"],

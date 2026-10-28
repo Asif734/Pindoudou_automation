@@ -19,32 +19,44 @@ struct AutoReplyView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            HStack {
-                Button(model.isRunning ? BilingualText.lines("停止", "Stop") : BilingualText.lines("开始", "Start")) {
+            HStack(spacing: 10) {
+                Button {
                     model.isRunning ? model.stop() : model.start()
+                } label: {
+                    toolbarLabel(model.isRunning ? "停止" : "开始", model.isRunning ? "Stop" : "Start")
                 }
                 .buttonStyle(.borderedProminent)
                 .disabled(!model.isRunning && !model.canStart)
 
-                Button(BilingualText.lines("收起／展开进度浮窗", "Collapse / expand progress")) { progressPanel.toggleCollapsed() }
+                Button { progressPanel.toggleCollapsed() } label: {
+                    toolbarLabel("收起／展开进度浮窗", "Collapse / expand progress")
+                }
 
-                Button(BilingualText.lines("打开本地记录", "Open local records")) { model.openRecordsDirectory() }
+                Button { model.openRecordsDirectory() } label: {
+                    toolbarLabel("打开本地记录", "Open local records")
+                }
 
-                Button(BilingualText.lines("打开权限设置", "Open permission settings")) { model.openRequiredPermissionSettings() }
+                Button { model.openRequiredPermissionSettings() } label: {
+                    toolbarLabel("打开权限设置", "Open permission settings")
+                }
 
                 Toggle(BilingualText.lines("干运行（不发送）", "Dry run (do not send)"), isOn: Binding(
                     get: { model.isDryRun },
                     set: { model.setDryRun($0) }
                 ))
                 .disabled(model.isRunning)
+                .fixedSize()
+
+                Spacer(minLength: 0)
+            }
 
                 Text(BilingualText.lines(
                     "范围：截图红点触发 · AX 权威读取正文 · AX 失效才用尾部 OCR · AX 点击和发送",
                     "Scope: screenshot red-dot trigger · AX authoritative text · tail OCR only if AX fails · AX click and send"
                 ))
                     .foregroundStyle(.secondary)
-                Spacer()
-            }
+                    .font(.caption)
+                    .fixedSize(horizontal: false, vertical: true)
 
             Text(model.status)
                 .font(.headline)
@@ -67,12 +79,20 @@ struct AutoReplyView: View {
             GroupBox(BilingualText.lines("运行环境与健康状态", "Environment and health")) {
                 VStack(alignment: .leading, spacing: 4) {
                     HStack {
-                        Button(BilingualText.lines("兼容性检查", "Compatibility check")) {
+                        Button {
                             Task { await model.runCompatibilityCheck() }
+                        } label: {
+                            toolbarLabel("兼容性检查", "Compatibility check")
                         }
                         if model.compatibilityReport != nil {
-                            Button(BilingualText.lines("导出脱敏报告", "Export redacted report")) { model.saveCompatibilityReport() }
+                            Button { model.saveCompatibilityReport() } label: {
+                                toolbarLabel("导出脱敏报告", "Export redacted report")
+                            }
                         }
+                        Button { Task { await model.checkUnreadOnly() } } label: {
+                            toolbarLabel("只检查未读", "Check unread only")
+                        }
+                        .disabled(model.isRunning)
                     }
                     if let report = model.compatibilityReport {
                         Text(report.summary)
@@ -94,7 +114,7 @@ struct AutoReplyView: View {
                             Text(BilingualText.lines("知识库 SHA-256：\(sha)", "Knowledge-base SHA-256: \(sha)"))
                         }
                     } else {
-                        Text(BilingualText.lines("知识：等待首次客户消息后执行 V2 Top-12", "Knowledge: V2 Top-12 will run after the first customer message"))
+                        Text(BilingualText.lines("知识：Codex 直接只读阅读本地数据库", "Knowledge: Codex reads the local database directly"))
                     }
                     if let snapshot = model.latestResourceSnapshot {
                         let memory = ByteCountFormatter.string(fromByteCount: Int64(clamping: snapshot.availableMemoryBytes), countStyle: .memory)
@@ -175,5 +195,14 @@ struct AutoReplyView: View {
         .onDisappear {
             model.viewDisappeared()
         }
+    }
+
+    private func toolbarLabel(_ chinese: String, _ english: String) -> some View {
+        VStack(spacing: 2) {
+            Text(chinese)
+            Text(english).font(.caption)
+        }
+        .fixedSize(horizontal: true, vertical: true)
+        .padding(.vertical, 3)
     }
 }

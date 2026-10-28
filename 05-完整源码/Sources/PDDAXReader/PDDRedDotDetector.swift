@@ -138,15 +138,25 @@ protocol PDDUnreadEvidenceDetecting: AnyObject {
 @MainActor
 final class PDDLiveUnreadEvidenceDetector: PDDUnreadEvidenceDetecting {
     private let capture: any PDDOCRCapturing
+    private let requireConversationRows: Bool
 
-    init(capture: (any PDDOCRCapturing)? = nil) {
+    init(capture: (any PDDOCRCapturing)? = nil,
+         requireConversationRows: Bool = false) {
         self.capture = capture ?? PDDWindowOCRCapture()
+        self.requireConversationRows = requireConversationRows
     }
 
     func unreadRows(in tree: PDDAXSemanticTree) async throws -> [PDDConversationRow<AXElementToken>] {
+        // Preserve the original Git version's discovery snapshot and AX tokens.
+        // Re-reading the backend here can discard valid rows and remap tokens.
         let rows = try PDDAXControlSelection.conversationRows(in: tree.nodes)
-        guard !rows.isEmpty else { return [] }
-        let frame = try await capture.capture()
+        guard !rows.isEmpty else {
+            if requireConversationRows { throw PDDUnreadDetectionError.conversationRowsUnavailable }
+            return []
+        }
+        // The pixel algorithm uses fullWindowImage; chat-region OCR cropping is
+        // unnecessary here and previously caused the confirmed traversal hang.
+        let frame = try await capture.captureFullWindow()
         guard let pixels = PDDPixelImage(cgImage: frame.fullWindowImage) else {
             throw PDDOCRError.capture("无法读取红点截图像素")
         }
@@ -155,5 +165,16 @@ final class PDDLiveUnreadEvidenceDetector: PDDUnreadEvidenceDetecting {
             window: frame.windowFrame,
             rows: rows
         ).map { rows[$0] }
+    }
+}
+
+enum PDDUnreadDetectionError: LocalizedError {
+    case conversationRowsUnavailable
+
+    var errorDescription: String? {
+        BilingualText.lines(
+            "无法读取拼多多会话列表，尚不能判断红点；请打开聊天页并刷新。未打开或回复任何客户。",
+            "Pinduoduo's conversation list is unavailable through Accessibility; unread status is unknown. Open the Chat page and refresh. No customer was opened or replied to."
+        )
     }
 }

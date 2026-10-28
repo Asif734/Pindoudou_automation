@@ -56,6 +56,7 @@ final class ReaderWorkflowTests: XCTestCase {
         XCTAssertEqual(result.uid, "GZC-000001")
         XCTAssertTrue(result.fullAXOutput.contains("GZC-000001"))
         XCTAssertTrue(result.parsedChatOutput.contains("客户：客户问题"))
+        XCTAssertTrue(result.parsedChatOutput.contains("Customer: 客户问题"))
         XCTAssertEqual(result.replyOutput, "检查建议")
     }
 
@@ -116,7 +117,10 @@ final class ReaderWorkflowTests: XCTestCase {
 
         let result = try await ReaderWorkflow(dependencies: dependencies).run()
 
-        XCTAssertEqual(result.replyOutput, "当前无需回复：最后一条有效消息来自客服。")
+        XCTAssertEqual(result.replyOutput, BilingualText.lines(
+            "当前无需回复：最后一条有效消息来自客服。",
+            "No reply needed: the last valid message is from customer service."
+        ))
         XCTAssertTrue(recorder.events.isEmpty)
     }
 

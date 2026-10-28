@@ -47,17 +47,12 @@ enum PDDCompatibilityChecker {
             status: pdd == nil ? .fail : .pass,
             detail: pdd == nil ? BilingualText.lines("拼多多商家工作台未运行", "Pinduoduo Merchant Workbench is not running") : BilingualText.lines("拼多多商家工作台已运行", "Pinduoduo Merchant Workbench is running")
         ))
-        if let resources = KnowledgeResourceLocator.resolve() {
-            let bundled = resources.pythonURL.path.contains("/Contents/Resources/PythonRuntime/")
-            items.append(.init(
-                kind: .python,
-                status: .pass,
-                detail: bundled ? BilingualText.lines("内置 Python 3.12 可用", "Bundled Python 3.12 is available") : BilingualText.lines("系统 Python 3.12 可用（内置运行时未选中）", "System Python 3.12 is available (bundled runtime not selected)")
-            ))
-            items.append(.init(kind: .knowledge, status: .pass, detail: BilingualText.lines("V2 知识库资源完整", "V2 knowledge-base resources are complete")))
-        } else {
-            items.append(.init(kind: .python, status: .fail, detail: BilingualText.lines("没有可用的 arm64 Python 3.12", "No usable arm64 Python 3.12 was found")))
-            items.append(.init(kind: .knowledge, status: .fail, detail: BilingualText.lines("V2 知识库运行资源不完整", "V2 knowledge-base runtime resources are incomplete")))
+        do {
+            try DirectLocalKnowledge().validate()
+            items.append(.init(kind: .knowledge, status: .pass, detail:
+                BilingualText.lines("本地知识目录可直接读取", "Local knowledge folder is ready for direct reading")))
+        } catch {
+            items.append(.init(kind: .knowledge, status: .fail, detail: error.localizedDescription))
         }
         let codexURL = CodexInstallation.resolve()
         items.append(await codexProbe.check(executableURL: codexURL).compatibilityItem)

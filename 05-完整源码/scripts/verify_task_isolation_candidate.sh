@@ -19,21 +19,20 @@ test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleDisplayName' "$PLIST")" = \
 
 for resource in \
     "CustomerService/customer-reply-prompt.md" \
-    "SenseVoice/serve_sensevoice.py" \
-    "SenseVoice/model/model.int8.onnx" \
-    "SenseVoice/model/tokens.txt" \
-    "SenseVoice/site-packages/sherpa_onnx/lib/_sherpa_onnx.cpython-312-darwin.so" \
-    "V2Knowledge/retrieve_top12.py" \
-    "KnowledgeBase/Grozziie-China-KB-2026-08-24.zip"; do
+    "PythonRuntime/python/bin/python3"; do
     test -e "$APP/Contents/Resources/$resource"
 done
+if [[ -d "$PROJECT_ROOT/Resources/SenseVoice" ]]; then
+    for resource in "serve_sensevoice.py" "model/model.int8.onnx" "model/tokens.txt"; do
+        test -e "$APP/Contents/Resources/SenseVoice/$resource"
+    done
+fi
 
 cmp "$PROJECT_ROOT/Resources/CustomerService/customer-reply-prompt.md" \
     "$APP/Contents/Resources/CustomerService/customer-reply-prompt.md"
-cmp "$PROJECT_ROOT/Resources/V2Knowledge/retrieve_top12.py" \
-    "$APP/Contents/Resources/V2Knowledge/retrieve_top12.py"
-cmp "$PROJECT_ROOT/Resources/KnowledgeBase/Grozziie-China-KB-2026-08-24.zip" \
-    "$APP/Contents/Resources/KnowledgeBase/Grozziie-China-KB-2026-08-24.zip"
+for resource in "FolderKnowledge/config.json" "FolderKnowledge/serve_folder.py"; do
+    cmp "$PROJECT_ROOT/Resources/$resource" "$APP/Contents/Resources/$resource"
+done
 
 codesign --verify --deep --strict "$APP"
 print "候选版验证通过：$APP"
