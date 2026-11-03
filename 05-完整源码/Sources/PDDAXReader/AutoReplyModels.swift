@@ -186,12 +186,15 @@ struct AutoReplyJob: Codable, Equatable, Sendable, Identifiable {
     var state: AutoReplyJobState
     let capture: AutoReplyCapture
     var reply: String?
+    var outgoingImages: [DatasetReplyImage] = []
     var generationDiagnostic: AutoReplyGenerationDiagnostic? = nil
     var deliveryOutcome: AutoReplyDeliveryOutcome?
     var confirmedServiceMessageID: String?
     var retries: Int
     var nextAttemptAt: Date?
     var lastError: String?
+    var customerMissingSince: Date? = nil
+    var omittedAt: Date? = nil
     var customerRevision: Int
     var revision: AutoReplyRevision
     var stageAttempt: Int
@@ -229,7 +232,9 @@ struct AutoReplyJob: Codable, Equatable, Sendable, Identifiable {
         supplementCapturePending: Bool = false,
         imageCaptureAttempted: Bool = false,
         replyAction: CodexReplyAction = .reply,
-        transferReason: CodexTransferReason = .none
+        transferReason: CodexTransferReason = .none,
+        customerMissingSince: Date? = nil,
+        omittedAt: Date? = nil
     ) {
         self.id = id
         self.uid = uid
@@ -257,15 +262,18 @@ struct AutoReplyJob: Codable, Equatable, Sendable, Identifiable {
         self.imageCaptureAttempted = imageCaptureAttempted
         self.replyAction = replyAction
         self.transferReason = transferReason
+        self.customerMissingSince = customerMissingSince
+        self.omittedAt = omittedAt
     }
 
     private enum CodingKeys: String, CodingKey {
-        case id, uid, sequence, state, capture, reply, generationDiagnostic
+        case id, uid, sequence, state, capture, reply, generationDiagnostic, outgoingImages
         case deliveryOutcome, confirmedServiceMessageID, retries, nextAttemptAt, lastError
         case customerRevision, stageAttempt, imageAttachments, videoAttachments, durableAttemptOperationID
         case sendWasInvoked, revision, pendingSupplement, supplementCapturePending
         case imageCaptureAttempted
         case replyAction, transferReason
+        case customerMissingSince, omittedAt
     }
 
     init(from decoder: Decoder) throws {
@@ -276,6 +284,7 @@ struct AutoReplyJob: Codable, Equatable, Sendable, Identifiable {
         state = try container.decode(AutoReplyJobState.self, forKey: .state)
         capture = try container.decode(AutoReplyCapture.self, forKey: .capture)
         reply = try container.decodeIfPresent(String.self, forKey: .reply)
+        outgoingImages = try container.decodeIfPresent([DatasetReplyImage].self, forKey: .outgoingImages) ?? []
         generationDiagnostic = try container.decodeIfPresent(
             AutoReplyGenerationDiagnostic.self, forKey: .generationDiagnostic
         )
@@ -288,6 +297,8 @@ struct AutoReplyJob: Codable, Equatable, Sendable, Identifiable {
         retries = try container.decodeIfPresent(Int.self, forKey: .retries) ?? 0
         nextAttemptAt = try container.decodeIfPresent(Date.self, forKey: .nextAttemptAt)
         lastError = try container.decodeIfPresent(String.self, forKey: .lastError)
+        customerMissingSince = try container.decodeIfPresent(Date.self, forKey: .customerMissingSince)
+        omittedAt = try container.decodeIfPresent(Date.self, forKey: .omittedAt)
         customerRevision = try container.decodeIfPresent(Int.self, forKey: .customerRevision) ?? 1
         revision = try container.decodeIfPresent(AutoReplyRevision.self, forKey: .revision)
             ?? AutoReplyRevision.derived(from: capture, legacyOrdinal: customerRevision)
@@ -360,6 +371,7 @@ struct AutoReplyCaptureRequest: Codable, Equatable, Sendable, Identifiable {
     let tailAttempt: Int?
     let sourceJobID: UUID?
     let videoMessageID: String?
+    var nextAttemptAt: Date?
 
     init(
         id: UUID = UUID(),
@@ -368,7 +380,8 @@ struct AutoReplyCaptureRequest: Codable, Equatable, Sendable, Identifiable {
         baseCursor: AutoReplyCursor,
         tailAttempt: Int? = nil,
         sourceJobID: UUID? = nil,
-        videoMessageID: String? = nil
+        videoMessageID: String? = nil,
+        nextAttemptAt: Date? = nil
     ) {
         self.id = id
         self.uid = uid
@@ -377,6 +390,7 @@ struct AutoReplyCaptureRequest: Codable, Equatable, Sendable, Identifiable {
         self.tailAttempt = tailAttempt
         self.sourceJobID = sourceJobID
         self.videoMessageID = videoMessageID
+        self.nextAttemptAt = nextAttemptAt
     }
 }
 
@@ -558,8 +572,13 @@ extension AutoReplyPersistentState {
     ) -> AutoReplyCapture? {
         guard let batch = capture.batch else { return capture }
         let analyzed = analyzedVideoIdentities(uid: uid)
-        guard !analyzed.isEmpty else { return capture }
+        let covered = Set(jobs.filter {
+            $0.uid == uid && ([.queued, .generating, .ready, .sending].contains($0.state)
+                || ($0.state == .completed && $0.deliveryOutcome != .notSent))
+        }.flatMap { $0.capture.batch?.events.map(\.messageID) ?? [] })
+        guard !analyzed.isEmpty || !covered.isEmpty else { return capture }
         let retained = batch.events.filter { event in
+            if covered.contains(event.messageID) { return false }
             guard event.kind == .video else { return true }
             return !analyzed.contains(Self.normalizedVideoIdentity(event.messageID))
         }
@@ -601,10 +620,10 @@ extension AutoReplyPersistentState {
     /// durable supplement into the next queued revision. An in-flight supplement
     /// request remains bound to the terminal source job and is promoted when it lands.
     @discardableResult
-    mutating func advanceSourceAndPromoteSupplement(at index: Int) -> Bool {
+    mutating func advanceSourceAndPromoteSupplement(at index: Int, advanceCursor: Bool = true) -> Bool {
         guard jobs.indices.contains(index) else { return false }
         let source = jobs[index]
-        if let end = source.capture.batch?.endCursor,
+        if advanceCursor, let end = source.capture.batch?.endCursor,
            end.count > (answeredCursors[source.uid]?.count ?? 0) {
             answeredCursors[source.uid] = end
         }

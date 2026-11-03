@@ -66,6 +66,7 @@ struct PDDOrdinaryTransferAction<ID: Hashable>: Equatable {
     let controlID: ID
     let agentLabel: String
     let frame: CGRect
+    var routingLabels: [String] = []
 }
 
 enum PDDAXSelectionError: Error, Equatable, LocalizedError {

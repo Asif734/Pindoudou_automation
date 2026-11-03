@@ -1,5 +1,5 @@
 {
-  "primary_data_folder": "/Users/m1air/vscode/Pindoudou_automation/格志京东客服知识库-2026-10-04",
+  "primary_data_folder": "/Users/tht_developers/Vscode-Asif/Pindoudou_automation/格志京东客服知识库-2026-10-04",
   "python_path": "/Users/m1air/vscode/Pindoudou_automation/05-完整源码/.knowledge-venv/bin/python3",
   "model_path": "/Users/m1air/vscode/Pindoudou_automation/05-完整源码/.knowledge-model",
   "model_id": "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",

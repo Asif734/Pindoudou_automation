@@ -1,5 +1,9 @@
 import Foundation
 
+enum PDDUIOperationContext {
+    @TaskLocal static var lease: UIOperationLease?
+}
+
 final class PDDUIOperationLeaseGate: @unchecked Sendable {
     private let lock = NSLock()
     private var current: UIOperationLease?
@@ -15,6 +19,10 @@ final class PDDUIOperationLeaseGate: @unchecked Sendable {
         let lease = current
         lock.unlock()
         guard let lease else { throw UIOperationLeaseError.revoked }
+        if let owner = PDDUIOperationContext.lease {
+            guard owner == lease else { throw UIOperationLeaseError.revoked }
+            try owner.validate()
+        }
         try lease.validate()
     }
 

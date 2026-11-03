@@ -50,21 +50,26 @@ enum BoundedProcess {
         softDeadline: Duration,
         hardDeadline: Duration
     ) async -> BoundedProcessResult {
-        await withCheckedContinuation { continuation in
-            DispatchQueue.global(qos: .userInitiated).async {
-                continuation.resume(returning: runSynchronously(
-                    configuration,
-                    softDeadline: softDeadline,
-                    hardDeadline: max(hardDeadline, softDeadline)
-                ))
+        let cancelled = ProcessLockedFlag()
+        return await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                DispatchQueue.global(qos: .userInitiated).async {
+                    continuation.resume(returning: runSynchronously(
+                        configuration,
+                        softDeadline: softDeadline,
+                        hardDeadline: max(hardDeadline, softDeadline),
+                        cancelled: cancelled
+                    ))
+                }
             }
-        }
+        } onCancel: { cancelled.value = true }
     }
 
     private static func runSynchronously(
         _ configuration: Configuration,
         softDeadline: Duration,
-        hardDeadline: Duration
+        hardDeadline: Duration,
+        cancelled: ProcessLockedFlag
     ) -> BoundedProcessResult {
         let clock = ContinuousClock()
         let start = clock.now
@@ -79,6 +84,7 @@ enum BoundedProcess {
             closePipe(&stdoutPipe); closePipe(&stderrPipe); closePipe(&stdinPipe)
             return launchFailure(errno, "pipe", start: start, clock: clock)
         }
+        _ = fcntl(stdinPipe[1], F_SETNOSIGPIPE, 1)
 
         var actions: posix_spawn_file_actions_t?
         var attributes: posix_spawnattr_t?
@@ -139,7 +145,7 @@ enum BoundedProcess {
         let output = ProcessLockedData()
         let error = ProcessLockedData()
         let processFinished = ProcessLockedFlag()
-        setNonBlocking(stdoutPipe[0]); setNonBlocking(stderrPipe[0])
+        setNonBlocking(stdoutPipe[0]); setNonBlocking(stderrPipe[0]); setNonBlocking(stdinPipe[1])
         ioGroup.enter()
         DispatchQueue.global(qos: .utility).async {
             readAll(from: stdoutPipe[0], processFinished: processFinished) { chunk in
@@ -155,19 +161,26 @@ enum BoundedProcess {
         }
         ioGroup.enter()
         DispatchQueue.global(qos: .utility).async {
+            var inputDelivered = true
             if let input = configuration.standardInput {
-                input.withUnsafeBytes { raw in
-                    guard var base = raw.baseAddress else { return }
+                inputDelivered = input.withUnsafeBytes { raw in
+                    guard var base = raw.baseAddress else { return true }
                     var remaining = raw.count
                     while remaining > 0 {
+                        if cancelled.value || processFinished.value || clock.now >= hardAt { break }
                         let count = Darwin.write(stdinPipe[1], base, remaining)
                         if count > 0 { remaining -= count; base = base.advanced(by: count) }
+                        else if errno == EAGAIN || errno == EWOULDBLOCK {
+                            var state = pollfd(fd: stdinPipe[1], events: Int16(POLLOUT | POLLHUP), revents: 0)
+                            _ = poll(&state, 1, 50)
+                        }
                         else if errno != EINTR { break }
                     }
+                    return remaining == 0
                 }
             }
             closeDescriptor(stdinPipe[1])
-            configuration.onStandardInputClosed?()
+            if inputDelivered { configuration.onStandardInputClosed?() }
             ioGroup.leave()
         }
 
@@ -180,7 +193,7 @@ enum BoundedProcess {
             if waited == -1 && errno != EINTR { break }
             let now = clock.now
             if now >= softAt { softExceeded = true }
-            if now >= hardAt {
+            if now >= hardAt || cancelled.value {
                 hitHardDeadline = true
                 terminateGroup(pid)
                 let graceEnd = now.advanced(by: .milliseconds(150))

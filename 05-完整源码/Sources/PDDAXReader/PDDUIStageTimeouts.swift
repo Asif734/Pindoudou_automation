@@ -33,6 +33,7 @@ struct PDDUIStageTimeouts: Sendable {
     }
 
     func innerSeconds(forOperationNamed name: String) -> TimeInterval {
+        if name == "send-images" { return 90 }
         let stage: PDDUIStage
         switch name {
         case "discover": stage = .discovery
@@ -49,6 +50,7 @@ struct PDDUIStageTimeouts: Sendable {
         case "discover": return outerFuseSeconds(for: .discovery)
         case "capture", "supplement": return outerFuseSeconds(for: .capture)
         case "send": return outerFuseSeconds(for: .send)
+        case "send-images": return 105
         default: return outerFuseSeconds(for: .ocr)
         }
     }

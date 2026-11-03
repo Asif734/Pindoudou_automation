@@ -2,6 +2,7 @@ import Foundation
 
 @MainActor
 protocol PDDLiveConversationDriving: AnyObject {
+    func visibleConversationsSnapshot() -> [PDDConversationLocator]?
     func discover() async throws -> [AutoReplyDiscovery]
     func capture(uid: String, after cursor: AutoReplyCursor) async throws -> AutoReplyCapture
     func capture(
@@ -29,6 +30,7 @@ protocol PDDLiveConversationDriving: AnyObject {
 }
 
 extension PDDLiveConversationDriving {
+    func visibleConversationsSnapshot() -> [PDDConversationLocator]? { nil }
     func capture(
         uid: String, after cursor: AutoReplyCursor, includeImages: Bool,
         onlyVideoMessageID: String?, lease: UIOperationLease
@@ -41,6 +43,8 @@ extension PDDAXConversationDriver: PDDLiveConversationDriving {}
 
 @MainActor
 protocol PDDLiveReplySending: AnyObject {
+    func send(uid: String, text: String, outgoingImages: [DatasetReplyImage], deliveryID: UUID,
+              expectedCustomerCursor: AutoReplyCursor, expectedCustomerMessageIDs: Set<String>, lease: UIOperationLease?) async throws -> AutoReplyDeliveryResult
     func send(
         uid: String,
         text: String,
@@ -55,6 +59,12 @@ protocol PDDLiveReplySending: AnyObject {
 }
 
 extension PDDLiveReplySending {
+    func send(uid: String, text: String, outgoingImages: [DatasetReplyImage], deliveryID: UUID,
+              expectedCustomerCursor: AutoReplyCursor, expectedCustomerMessageIDs: Set<String>, lease: UIOperationLease?) async throws -> AutoReplyDeliveryResult {
+        guard outgoingImages.isEmpty else { return .failedBeforeSend("发送器不支持图片") }
+        return try await send(uid: uid, text: text, expectedCustomerCursor: expectedCustomerCursor,
+            expectedCustomerMessageIDs: expectedCustomerMessageIDs)
+    }
     func send(
         uid: String,
         text: String,
@@ -71,6 +81,17 @@ extension PDDAXReplySender: PDDLiveReplySending {}
 
 @MainActor
 final class PDDLiveAutoReplyDriver: AutoReplyAutomationDriver {
+    func visibleConversationsSnapshot() -> [PDDConversationLocator]? {
+        conversationDriver.visibleConversationsSnapshot()
+    }
+    func send(uid: String, text: String, outgoingImages: [DatasetReplyImage], deliveryID: UUID,
+              expectedCustomerCursor: AutoReplyCursor, expectedCustomerMessageIDs: Set<String>,
+              lease: UIOperationLease) async throws -> AutoReplyDeliveryResult {
+        try await withLease(lease) {
+            try await sender.send(uid: uid, text: text, outgoingImages: outgoingImages, deliveryID: deliveryID,
+                expectedCustomerCursor: expectedCustomerCursor, expectedCustomerMessageIDs: expectedCustomerMessageIDs, lease: lease)
+        }
+    }
     private let conversationDriver: any PDDLiveConversationDriving
     private let sender: any PDDLiveReplySending
     private let transferer: (any PDDLiveConversationTransferring)?
@@ -244,8 +265,10 @@ final class PDDLiveAutoReplyDriver: AutoReplyAutomationDriver {
     ) async throws -> Value {
         try lease.validate()
         leaseGate?.activate(lease)
-        let result = try await operation()
-        try lease.validate()
-        return result
+        return try await PDDUIOperationContext.$lease.withValue(lease) {
+            let result = try await operation()
+            try lease.validate()
+            return result
+        }
     }
 }

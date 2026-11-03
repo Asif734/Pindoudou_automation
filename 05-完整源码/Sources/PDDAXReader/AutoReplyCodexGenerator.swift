@@ -33,6 +33,7 @@ struct AutoReplyCodexGenerator: AutoReplyGenerating, Sendable {
     let loginStatusProvider: (any CodexLoginStatusProviding)?
     let timeout: TimeInterval
     let now: @Sendable () -> Date
+    let outgoingImageDatasetRoot: URL
 
     init(
         executableURL: URL = URL(fileURLWithPath: "/Applications/ChatGPT.app/Contents/Resources/codex"),
@@ -44,7 +45,8 @@ struct AutoReplyCodexGenerator: AutoReplyGenerating, Sendable {
         evidencePreparer: any KnowledgeEvidencePreparing = DirectLocalKnowledge(),
         loginStatusProvider: (any CodexLoginStatusProviding)? = nil,
         timeout: TimeInterval = 180,
-        now: @escaping @Sendable () -> Date = { Date() }
+        now: @escaping @Sendable () -> Date = { Date() },
+        outgoingImageDatasetRoot: URL = DirectLocalKnowledge.configuredURL
     ) {
         self.executableURL = executableURL
         self.runner = runner
@@ -53,10 +55,14 @@ struct AutoReplyCodexGenerator: AutoReplyGenerating, Sendable {
         self.loginStatusProvider = loginStatusProvider
         self.timeout = timeout
         self.now = now
+        self.outgoingImageDatasetRoot = outgoingImageDatasetRoot
     }
 
     func generate(_ capture: AutoReplyCapture) async throws -> CodexReplyResult {
+        AutomationStepLog.record(root: sessionRegistry.rootDirectory, uid: capture.uid,
+            step: "generation-started", detail: "incoming_handoff=\(capture.batch?.incomingHandoffKey != nil)")
         guard capture.batch != nil else { throw AutoReplyCodexGeneratorError.missingBatch }
+        try CustomerMessageReceipts(root: sessionRegistry.rootDirectory).capture(capture)
         if let loginStatusProvider {
             guard try await loginStatusProvider.status(executable: executableURL, now: now()) == .chatGPT else {
                 throw AutoReplyCodexGeneratorError.chatGPTLoginRequired
@@ -113,7 +119,8 @@ struct AutoReplyCodexGenerator: AutoReplyGenerating, Sendable {
                             threadID: turn.startedThreadID ?? binding.threadID,
                             diagnostic: diagnostic(evidence: evidence, turn: turn),
                             action: turn.action,
-                            transferReason: turn.transferReason
+                            transferReason: turn.transferReason,
+                            outgoingImages: turn.outgoingImages
                         )
                     } catch is CancellationError {
                         throw CancellationError()
@@ -173,12 +180,16 @@ struct AutoReplyCodexGenerator: AutoReplyGenerating, Sendable {
             threadID: threadID,
             diagnostic: diagnostic(evidence: evidence, turn: turn),
             action: turn.action,
-            transferReason: turn.transferReason
+            transferReason: turn.transferReason,
+            outgoingImages: turn.outgoingImages
         )
     }
 
     private struct TurnResult {
+        var submissionID: UUID? = nil
         var answerFound = true
+        var imagePaths: [String] = []
+        var outgoingImages: [DatasetReplyImage] = []
         var semanticEvidence: KnowledgeEvidence? = nil
         var reply: String
         var action: CodexReplyAction
@@ -194,6 +205,7 @@ struct AutoReplyCodexGenerator: AutoReplyGenerating, Sendable {
     }
     private struct ReplyDocument: Decodable {
         let answerFound: Bool?
+        let imagePaths: [String]?
         let requestKind: CustomerRequestKind?
         let issueHasNoSolution: Bool?
         let clarificationReply: String?
@@ -204,6 +216,7 @@ struct AutoReplyCodexGenerator: AutoReplyGenerating, Sendable {
 
         private enum CodingKeys: String, CodingKey {
             case answerFound = "answer_found"
+            case imagePaths = "image_paths"
             case requestKind = "request_kind"
             case issueHasNoSolution = "issue_has_no_solution"
             case clarificationReply = "clarification_reply"
@@ -222,7 +235,16 @@ struct AutoReplyCodexGenerator: AutoReplyGenerating, Sendable {
     ) async throws -> TurnResult {
         var turn = try await runSingleTurn(capture: capture, submission: submission,
                                            sessionID: sessionID, continuation: continuation)
-        if let kind = turn.requestKind {
+        if capture.batch?.incomingHandoffKey != nil {
+            // The platform event requests a continuation reply, never a new transfer.
+            if turn.action == .replyThenTransfer, let clarification = turn.clarificationReply {
+                turn.reply = clarification
+            }
+            turn.action = .reply
+            turn.transferReason = .none
+            AutomationStepLog.record(root: sessionRegistry.rootDirectory, uid: capture.uid,
+                step: "incoming-handoff-reply-policy", detail: "reply-only; historical requests not counted")
+        } else if let kind = turn.requestKind {
             let decision = try await CustomerTransferPolicyStore.shared.decide(
                 root: sessionRegistry.rootDirectory, uid: capture.uid,
                 messageIDs: capture.batch?.events.map(\.messageID) ?? [], kind: kind,
@@ -239,9 +261,26 @@ struct AutoReplyCodexGenerator: AutoReplyGenerating, Sendable {
             turn.action = decision.action
             turn.transferReason = decision.reason
         }
-        guard turn.reply.range(of: #"\bAI\b"#, options: [.regularExpression, .caseInsensitive]) == nil else {
-            throw AutoReplyCodexGeneratorError.invalidReply("Customer-facing identity wording is not allowed")
+        if let violation = CustomerFacingReplyPolicy.violation(in: turn.reply) {
+            AutomationStepLog.record(root: sessionRegistry.rootDirectory, uid: capture.uid,
+                step: "reply-policy-rejected", detail: violation)
+            throw AutoReplyCodexGeneratorError.invalidReply(
+                "Customer-facing identity or handoff wording is not allowed: \(violation)"
+            )
         }
+        if turn.action == .reply, !turn.imagePaths.isEmpty {
+            turn.outgoingImages = try DatasetReplyImageResolver(
+                datasetRoot: outgoingImageDatasetRoot, outputRoot: sessionRegistry.rootDirectory
+            ).resolve(turn.imagePaths)
+            AutomationStepLog.record(root: sessionRegistry.rootDirectory, uid: capture.uid,
+                step: "reply-images-prepared", detail: turn.outgoingImages.map {
+                    "\($0.datasetRelativePath) sha256=\($0.sha256) bytes=\($0.byteCount)"
+                }.joined(separator: "; "))
+        }
+        try CustomerMessageReceipts(root: sessionRegistry.rootDirectory)
+            .completed(capture, submissionID: turn.submissionID, at: now())
+        AutomationStepLog.record(root: sessionRegistry.rootDirectory, uid: capture.uid,
+            step: "generation-completed", detail: "action=\(turn.action.rawValue) reason=\(turn.transferReason.rawValue)")
         return turn
     }
 
@@ -283,10 +322,15 @@ struct AutoReplyCodexGenerator: AutoReplyGenerating, Sendable {
         try FileManager.default.createDirectory(at: temporary, withIntermediateDirectories: true)
         let schemaURL = temporary.appendingPathComponent("reply.schema.json")
         let resultURL = temporary.appendingPathComponent("result.json")
-        let schema = """
+        let textSchema = """
         {"type":"object","properties":{"answer_found":{"type":"boolean"},"action":{"type":"string","enum":["reply","reply_then_transfer"]},"reply_text":{"type":"string","minLength":1},"transfer_reason":{"type":"string","enum":["customer_explicitly_requested_human","explicit_return_refund","remote_assistance","refund_operation","logistics_lookup","troubleshooting_exhausted","none"]},"request_kind":{"type":"string","enum":["other","human_request","refund_return","technical"]},"issue_has_no_solution":{"type":"boolean"},"clarification_reply":{"type":"string","minLength":1},"handoff_reply":{"type":"string","minLength":1}},"required":["answer_found","action","reply_text","transfer_reason","request_kind","issue_has_no_solution","clarification_reply","handoff_reply"],"additionalProperties":false}
         """
-        try Data(schema.utf8).write(to: schemaURL, options: .atomic)
+        var schema = try JSONSerialization.jsonObject(with: Data(textSchema.utf8)) as! [String: Any]
+        var properties = schema["properties"] as! [String: Any]
+        properties["image_paths"] = ["type": "array", "items": ["type": "string"], "maxItems": 3]
+        schema["properties"] = properties
+        schema["required"] = (schema["required"] as! [String]) + ["image_paths"]
+        try JSONSerialization.data(withJSONObject: schema, options: .sortedKeys).write(to: schemaURL, options: .atomic)
         let arguments = CodexInvocation.arguments(
             sessionID: sessionID,
             schemaURL: schemaURL,
@@ -300,50 +344,69 @@ struct AutoReplyCodexGenerator: AutoReplyGenerating, Sendable {
             ? try AutoReplyPromptBuilder.buildContinuation(capture: capture, submission: submission)
             : try AutoReplyPromptBuilder.buildInitial(capture: capture, submission: submission)
         let prompt = basePrompt + "\n<application_transfer_state>\n" + policyContext + "\n</application_transfer_state>"
+        let submissionID = UUID()
+        try CustomerMessageReceipts(root: sessionRegistry.rootDirectory).begin(capture, submissionID: submissionID)
         let stream = AutoReplyCLIStream()
-        return try await withCheckedThrowingContinuation { checked in
-            let handoff = CodexTurnHandoff<TurnResult>(checked)
-            Task.detached(priority: .userInitiated) {
-                do {
-                    let process = try await runner.runStreaming(
-                        executable: executableURL,
-                        arguments: arguments,
-                        stdin: prompt,
-                        timeout: timeout,
-                        onStandardOutput: { chunk in
-                            guard let candidate = stream.consume(chunk) else { return }
-                            handoff.offer(TurnResult(
-                                answerFound: candidate.answerFound,
-                                reply: candidate.reply,
-                                action: candidate.action,
-                                transferReason: candidate.transferReason,
-                                startedThreadID: candidate.threadID,
-                                durationMilliseconds: max(
-                                    0, Int(now().timeIntervalSince(startedAt) * 1_000)
-                                ),
-                                events: candidate.events,
-                                contaminated: Self.isContaminated(candidate.events)
-                            ))
-                        },
-                        onStandardInputClosed: { handoff.didWriteInput() }
-                    )
-                    stream.finish()
-                    let final = Result {
-                        try Self.decodeCompletedProcess(
-                            process,
-                            resultURL: resultURL,
-                            startedAt: startedAt,
-                            now: now
+        let cancellation = CodexTurnCancellation()
+        var turn: TurnResult = try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { checked in
+                let handoff = CodexTurnHandoff<TurnResult>(checked)
+                let task = Task.detached(priority: .userInitiated) {
+                    do {
+                        let process = try await runner.runStreaming(
+                            executable: executableURL,
+                            arguments: arguments,
+                            stdin: prompt,
+                            timeout: capture.batch?.incomingHandoffKey != nil ? min(timeout, 60) : timeout,
+                            onStandardOutput: { chunk in
+                                guard let candidate = stream.consume(chunk) else { return }
+                                handoff.offer(TurnResult(
+                                    answerFound: candidate.answerFound,
+                                    reply: candidate.reply,
+                                    action: candidate.action,
+                                    transferReason: candidate.transferReason,
+                                    startedThreadID: candidate.threadID,
+                                    durationMilliseconds: max(
+                                        0, Int(now().timeIntervalSince(startedAt) * 1_000)
+                                    ),
+                                    events: candidate.events,
+                                    contaminated: Self.isContaminated(candidate.events)
+                                ))
+                            },
+                            onStandardInputClosed: {
+                                do {
+                                    try CustomerMessageReceipts(root: sessionRegistry.rootDirectory)
+                                        .submitted(capture, prompt: prompt, submissionID: submissionID, at: now())
+                                    handoff.didWriteInput()
+                                } catch {
+                                    AutomationStepLog.record(root: sessionRegistry.rootDirectory, uid: capture.uid,
+                                        step: "codex-input-not-confirmed", detail: error.localizedDescription)
+                                    handoff.finish(.failure(error))
+                                }
+                            }
                         )
+                        stream.finish()
+                        let final = Result {
+                            try Self.decodeCompletedProcess(
+                                process,
+                                resultURL: resultURL,
+                                startedAt: startedAt,
+                                now: now
+                            )
+                        }
+                        try? FileManager.default.removeItem(at: temporary)
+                        handoff.finish(final)
+                    } catch {
+                        try? FileManager.default.removeItem(at: temporary)
+                        handoff.finish(.failure(error))
                     }
-                    try? FileManager.default.removeItem(at: temporary)
-                    handoff.finish(final)
-                } catch {
-                    try? FileManager.default.removeItem(at: temporary)
-                    handoff.finish(.failure(error))
                 }
+                cancellation.install(task) { handoff.finish(.failure(CancellationError())) }
             }
-        }
+        } onCancel: { cancellation.cancel() }
+        try Task.checkCancellation()
+        turn.submissionID = submissionID
+        return turn
     }
 
     private func validateLocalFile(_ url: URL) throws {
@@ -391,6 +454,7 @@ struct AutoReplyCodexGenerator: AutoReplyGenerating, Sendable {
         guard !reply.isEmpty else { throw AutoReplyCodexGeneratorError.invalidReply("reply_text 为空") }
         return TurnResult(
             answerFound: document.answerFound ?? true,
+            imagePaths: document.imagePaths ?? [],
             reply: reply,
             action: document.action,
             transferReason: document.transferReason,

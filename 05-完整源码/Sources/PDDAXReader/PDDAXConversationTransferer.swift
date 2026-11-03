@@ -32,11 +32,13 @@ final class PDDAXConversationTransferer: PDDLiveConversationTransferring {
     private let opener: any PDDConversationOpening
     private let clicker: any PDDTransferClicking
     private let sleep: @MainActor (TimeInterval) async throws -> Void
+    private let logRoot: URL?
 
     init(
         backend: any PDDAXBackend,
         opener: any PDDConversationOpening,
         clicker: any PDDTransferClicking,
+        logRoot: URL? = nil,
         sleep: @escaping @MainActor (TimeInterval) async throws -> Void = { seconds in
             try await Task.sleep(for: .seconds(seconds))
         }
@@ -45,11 +47,22 @@ final class PDDAXConversationTransferer: PDDLiveConversationTransferring {
         self.opener = opener
         self.clicker = clicker
         self.sleep = sleep
+        self.logRoot = logRoot
     }
 
     func transferToAnyHuman(
         uid: String, lease: UIOperationLease
     ) async throws -> AutoReplyTransferResult {
+        AutomationStepLog.record(root: logRoot, uid: uid, step: "transfer-open-started", detail: "target=after-sales")
+        do {
+            return try await transferToAfterSales(uid: uid, lease: lease)
+        } catch {
+            AutomationStepLog.record(root: logRoot, uid: uid, step: "transfer-error", detail: error.localizedDescription)
+            throw error
+        }
+    }
+
+    private func transferToAfterSales(uid: String, lease: UIOperationLease) async throws -> AutoReplyTransferResult {
         try lease.validate()
         var tree = try await opener.openAndResolve(uid: uid)
         try lease.validate()
@@ -63,28 +76,55 @@ final class PDDAXConversationTransferer: PDDLiveConversationTransferring {
             try clicker.click(at: CGPoint(x: trigger.frame.midX, y: trigger.frame.midY))
             tree = try await waitForDialog(lease: lease)
         }
+        AutomationStepLog.record(root: logRoot, uid: uid, step: "transfer-dialog-opened")
+        defer {
+            if (try? lease.validate()) != nil,
+               let current = try? backend.readSemanticTree(),
+               let close = PDDAXControlSelection.transferDialogCloseControl(in: current.nodes) {
+                do {
+                    if close.actionNames.contains("AXPress") { try backend.performPress(close.id) }
+                    else { try clicker.click(at: CGPoint(x: close.frame.midX, y: close.frame.midY)) }
+                    AutomationStepLog.record(root: logRoot, uid: uid, step: "transfer-dialog-dismissed",
+                        detail: "Remaining transfer dialog closed; other conversations continue")
+                } catch {
+                    AutomationStepLog.record(root: logRoot, uid: uid, step: "transfer-dialog-cleanup-failed", detail: error.localizedDescription)
+                }
+            }
+        }
 
-        var attemptedCount = 0
+        var attemptedLabels = Set<String>()
         while true {
             try lease.validate()
-            let actions = try PDDAXControlSelection.ordinaryTransferActions(in: tree.nodes)
-            guard attemptedCount < actions.count else {
-                return .failed("已尝试全部普通客服，均未确认转移成功")
+            let actions = try PDDAXControlSelection.afterSalesTransferActions(in: tree.nodes)
+            AutomationStepLog.record(root: logRoot, uid: uid, step: "transfer-after-sales-candidates",
+                detail: actions.map(\.agentLabel).joined(separator: ","))
+            guard let action = actions.first(where: { !attemptedLabels.contains($0.agentLabel) }) else {
+                let reason = actions.isEmpty ? "未找到标注售后/After-sales的接收客服，未转移给其他分组"
+                    : "已尝试全部售后客服，均未确认转移成功"
+                AutomationStepLog.record(root: logRoot, uid: uid, step: "transfer-failed", detail: reason)
+                return .failed(reason)
             }
-            let action = actions[attemptedCount]
-            attemptedCount += 1
+            attemptedLabels.insert(action.agentLabel)
             guard isUsable(action.frame) else {
+                AutomationStepLog.record(root: logRoot, uid: uid, step: "transfer-invalid-recipient-frame", detail: action.agentLabel)
                 continue
             }
 
+            AutomationStepLog.record(root: logRoot, uid: uid, step: "transfer-recipient-selected", detail: action.agentLabel)
             try clicker.click(at: CGPoint(x: action.frame.midX, y: action.frame.midY))
             try await sleep(0.15)
             try lease.validate()
+            AutomationStepLog.record(root: logRoot, uid: uid, step: "transfer-submit-started", detail: action.agentLabel)
             try await clicker.submitNoReasonTransfer(anchorFrame: action.frame)
 
-            let confirmation = try await waitForTransferResult(lease: lease)
+            let confirmation = try await waitForTransferResult(recipient: action.agentLabel, lease: lease)
             if confirmation.succeeded {
+                AutomationStepLog.record(root: logRoot, uid: uid, step: "transfer-confirmed", detail: action.agentLabel)
                 return .transferred(agentLabel: action.agentLabel)
+            }
+            AutomationStepLog.record(root: logRoot, uid: uid, step: "transfer-not-confirmed", detail: action.agentLabel)
+            if !PDDAXControlSelection.isTransferDialogVisible(in: confirmation.tree.nodes) {
+                return .failed("转移弹窗已关闭，但未确认接收客服为选定售后人员；停止进一步转移")
             }
             tree = confirmation.tree
         }
@@ -101,12 +141,14 @@ final class PDDAXConversationTransferer: PDDLiveConversationTransferring {
     }
 
     private func waitForTransferResult(
+        recipient: String,
         lease: UIOperationLease
     ) async throws -> (succeeded: Bool, tree: PDDAXSemanticTree) {
         var latest = try backend.readSemanticTree()
         for _ in 0..<10 {
             try lease.validate()
-            if !PDDAXControlSelection.isTransferDialogVisible(in: latest.nodes) {
+            if !PDDAXControlSelection.isTransferDialogVisible(in: latest.nodes),
+               PDDAXIncomingTransfer.latestTransferRecipient(in: latest.rootSnapshot) == recipient {
                 return (true, latest)
             }
             try await sleep(0.1)

@@ -3,6 +3,27 @@ import XCTest
 
 @MainActor
 final class PDDLiveAutoReplyDriverTests: XCTestCase {
+    func testConversationVisibilityInventoryReachesSchedulerDriver() {
+        let conversation = LiveConversationSpy()
+        conversation.visibleLocators = [.init(nickname: "visible")]
+        let driver = PDDLiveAutoReplyDriver(conversationDriver: conversation, sender: LiveSenderSpy())
+        XCTAssertEqual(driver.visibleConversationsSnapshot(), conversation.visibleLocators)
+    }
+    func testImagePayloadAndDeliveryIdentityReachSenderWithValidLease() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let image = try makeDatasetReplyImageFixture(root: root)
+        let sender = LiveSenderSpy()
+        let driver = PDDLiveAutoReplyDriver(conversationDriver: LiveConversationSpy(), sender: sender)
+        let id = UUID()
+        let lease = UIOperationLeaseRegistry().acquire(uid: "PDD-test")
+        let result = try await driver.send(uid: "PDD-test", text: "Sample", outgoingImages: [image], deliveryID: id,
+            expectedCustomerCursor: .empty, expectedCustomerMessageIDs: ["m1"], lease: lease)
+        XCTAssertEqual(result, .sent(serviceMessageID: "image-test"))
+        XCTAssertEqual(sender.images, [image])
+        XCTAssertEqual(sender.deliveryID, id)
+        XCTAssertEqual(sender.messageIDs, ["m1"])
+    }
     func testLeaseCaptureCallsCaptureSurface() async throws {
         let conversation = LiveConversationSpy()
         let driver = PDDLiveAutoReplyDriver(
@@ -50,6 +71,8 @@ final class PDDLiveAutoReplyDriverTests: XCTestCase {
 
 @MainActor
 private final class LiveConversationSpy: PDDLiveConversationDriving {
+    var visibleLocators: [PDDConversationLocator]?
+    func visibleConversationsSnapshot() -> [PDDConversationLocator]? { visibleLocators }
     var captureCalls = 0
     var preflightCalls = 0
 
@@ -99,6 +122,18 @@ private final class LiveConversationSpy: PDDLiveConversationDriving {
 
 @MainActor
 private final class LiveSenderSpy: PDDLiveReplySending {
+    var images: [DatasetReplyImage] = []
+    var deliveryID: UUID?
+    var messageIDs = Set<String>()
+    func send(uid: String, text: String, outgoingImages: [DatasetReplyImage], deliveryID: UUID,
+              expectedCustomerCursor: AutoReplyCursor, expectedCustomerMessageIDs: Set<String>,
+              lease: UIOperationLease?) async throws -> AutoReplyDeliveryResult {
+        try XCTUnwrap(lease).validate()
+        images = outgoingImages
+        self.deliveryID = deliveryID
+        messageIDs = expectedCustomerMessageIDs
+        return .sent(serviceMessageID: "image-test")
+    }
     func send(
         uid: String, text: String, expectedCustomerCursor: AutoReplyCursor
     ) async throws -> AutoReplyDeliveryResult {

@@ -63,6 +63,7 @@ func withOperationDeadline<Value: Sendable>(
     _ duration: Duration,
     stage: String,
     shouldDeferTimeout: @escaping @Sendable () -> Bool = { false },
+    maximumDuration: Duration? = nil,
     operation: @escaping @MainActor @Sendable () async throws -> Value
 ) async throws -> Value {
     let race = OperationDeadlineRace<Value>()
@@ -80,10 +81,12 @@ func withOperationDeadline<Value: Sendable>(
             race.register(operationTask)
 
             let deadlineTask = Task {
+                let clock = ContinuousClock()
+                let hardEnd = clock.now.advanced(by: maximumDuration ?? duration * 2)
                 while true {
                     do {
-                        try await Task.sleep(for: duration)
-                        if shouldDeferTimeout() { continue }
+                        try await Task.sleep(for: min(duration, max(.zero, clock.now.duration(to: hardEnd))))
+                        if shouldDeferTimeout(), clock.now < hardEnd { continue }
                         race.resolve(.failure(OperationTimeout(stage: stage)))
                         return
                     } catch {

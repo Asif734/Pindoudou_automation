@@ -21,6 +21,7 @@ struct CodexReplyResult: Equatable, Sendable {
     var diagnostic: AutoReplyGenerationDiagnostic? = nil
     var action: CodexReplyAction = .reply
     var transferReason: CodexTransferReason = .none
+    var outgoingImages: [DatasetReplyImage] = []
 }
 
 enum CodexReplyServiceError: LocalizedError {

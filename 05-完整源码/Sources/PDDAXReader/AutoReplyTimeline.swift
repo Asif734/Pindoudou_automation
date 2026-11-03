@@ -20,6 +20,24 @@ struct FrozenCustomerBatch: Codable, Equatable, Sendable {
     let endCursor: AutoReplyCursor
     let events: [ActionableCustomerEvent]
     let targetCustomerJSONL: String
+
+    // Internal work marker only. It is never added to the customer's chat history.
+    static let incomingHandoffPrefix = "incoming-handoff:"
+    var incomingHandoffKey: String? {
+        events.first(where: { $0.messageID.hasPrefix(Self.incomingHandoffPrefix) })
+            .map { String($0.messageID.dropFirst(Self.incomingHandoffPrefix.count)) }
+    }
+
+    var customerMessageIDs: Set<String> {
+        Set(events.map(\.messageID).filter { !$0.hasPrefix(Self.incomingHandoffPrefix) })
+    }
+
+    static func incomingHandoff(key: String, cursor: AutoReplyCursor) -> Self {
+        Self(startCursor: cursor, endCursor: cursor, events: [
+            ActionableCustomerEvent(messageID: incomingHandoffPrefix + key,
+                                    kind: .text, content: "", displayTime: nil)
+        ], targetCustomerJSONL: "")
+    }
 }
 
 enum AutoReplyTimelineError: Error, Equatable {

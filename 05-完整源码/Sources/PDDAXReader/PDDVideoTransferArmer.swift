@@ -18,7 +18,7 @@ final class ArmedPDDVideoTransfer: @unchecked Sendable {
         _ = startTask()
     }
 
-    func startAndWaitUntilDownloadFinishes() async {
+    func startAndWaitUntilAddressCaptured() async {
         await startTask().value
     }
 
@@ -40,7 +40,7 @@ final class ArmedPDDVideoTransfer: @unchecked Sendable {
     }
 }
 
-private actor PDDVideoDownloadCompletion {
+private actor PDDVideoForegroundCompletion {
     private var completed = false
     private var waiters: [CheckedContinuation<Void, Never>] = []
 
@@ -136,7 +136,7 @@ struct PDDVideoForegroundCoordinator {
         guard confirmed else {
             throw lastOpenError ?? PDDCustomerVideoError.clickFailed
         }
-        await armed.startAndWaitUntilDownloadFinishes()
+        await armed.startAndWaitUntilAddressCaptured()
         do {
             try lease.validate()
         } catch {
@@ -227,7 +227,7 @@ final class PDDVideoTransferArmer: PDDVideoTransferArming {
         let analysisInbox = self.analysisInbox
         let stateStore = self.stateStore
         let speechTranscriber = self.speechTranscriber
-        let downloadCompletion = PDDVideoDownloadCompletion()
+        let foregroundCompletion = PDDVideoForegroundCompletion()
         let transferOperation: @Sendable () async -> Void = {
             await eventHandler(.init(
                 uid: uid, messageID: messageID, phase: .waitingForAddress
@@ -251,6 +251,9 @@ final class PDDVideoTransferArmer: PDDVideoTransferArming {
                 }
                 try Task.checkCancellation()
                 try await stateStore.transition(key: key, to: .addressCaptured)
+                // Only address capture needs the foreground preview. Download,
+                // validation and evidence processing continue independently.
+                await foregroundCompletion.finish()
                 try await stateStore.recordAttempt(key: key)
                 await eventHandler(.init(uid: uid, messageID: messageID, phase: .downloading))
                 try await stateStore.transition(key: key, to: .downloading)
@@ -279,7 +282,7 @@ final class PDDVideoTransferArmer: PDDVideoTransferArming {
                     key: key, to: .downloaded, fileName: stableURL.lastPathComponent
                 )
                 await eventHandler(.init(uid: uid, messageID: messageID, phase: .downloaded))
-                await downloadCompletion.finish()
+                await foregroundCompletion.finish()
                 guard try await analysisInbox.claim(receipt) else {
                     try? await stateStore.transition(key: key, to: .completed)
                     await eventHandler(.init(
@@ -307,24 +310,24 @@ final class PDDVideoTransferArmer: PDDVideoTransferArming {
                 ))
                 try await stateStore.transition(key: key, to: .readyForGeneration)
             } catch is CancellationError {
-                await downloadCompletion.finish()
+                await foregroundCompletion.finish()
                 return
             } catch {
                 await Self.handleFailure(
                     uid: uid, messageID: messageID, key: key, error: error,
                     stateStore: stateStore, eventHandler: eventHandler
                 )
-                await downloadCompletion.finish()
+                await foregroundCompletion.finish()
             }
         }
         return ArmedPDDVideoTransfer(
             onStart: {
                 Task {
                     let started = await registry.start(key: key, operation: transferOperation)
-                    if !started { await downloadCompletion.finish() }
+                    if !started { await foregroundCompletion.finish() }
                 }
             },
-            operation: { await downloadCompletion.wait() }
+            operation: { await foregroundCompletion.wait() }
         )
     }
 

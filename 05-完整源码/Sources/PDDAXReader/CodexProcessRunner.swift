@@ -106,6 +106,7 @@ struct CodexProcessRunner: CodexProcessRunning {
             softDeadline: .seconds(min(90, max(1, timeout))),
             hardDeadline: .seconds(max(1, timeout))
         )
+        try Task.checkCancellation()
         let exitCode: Int32
         switch result.termination {
         case .exited(let code): exitCode = code

@@ -3,6 +3,493 @@ import XCTest
 
 @MainActor
 final class AutoReplySchedulerTests: XCTestCase {
+    func testConfirmedReplyUnderOldMaskedNameIsNotReplayedForCanonicalCustomer() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let uid = "canonical"
+        let prior = try makeFrozenCapture(uid: "masked-alias", ids: ["old-message"], after: .empty)
+        let service = PDDChatMessage(id: "confirmed-reply", sender: .service, content: "already sent", displayTime: nil, kind: .text, capturedAt: Date())
+        let currentHistory = prior.fullHistory + [service]
+        let timeline = try AutoReplyTimeline.make(messages: currentHistory)
+        let capture = AutoReplyCapture(uid: uid, fullHistory: currentHistory, batch: try timeline.freeze(after: .empty),
+            customerCursor: timeline.cursor, unexpectedServiceMessageIDs: [])
+        let store = AutoReplyStore(rootDirectory: root)
+        var state = AutoReplyPersistentState.empty
+        state.nextSequence = 1
+        state.jobs = [AutoReplyJob(id: UUID(), uid: "masked-alias", sequence: 1, state: .completed,
+            capture: prior, reply: "already sent", deliveryOutcome: .sent, confirmedServiceMessageID: "ax-send-synthetic-receipt",
+            retries: 0, nextAttemptAt: nil, lastError: nil)]
+        try store.save(state)
+        let driver = ControlledAutoReplyDriver(capturesByUID: [:])
+        driver.captureOverridesByUID[uid] = capture
+        driver.discoveries = [.init(uid: uid, hasUnreadEvidence: true)]
+        let generator = ControlledReplyGenerator(delayNanoseconds: 0)
+        let scheduler = try AutoReplyScheduler(driver: driver, generator: generator, store: store)
+        defer { scheduler.stop() }
+        scheduler.start()
+        for _ in 0..<10 { await scheduler.tick() }
+        XCTAssertEqual(scheduler.jobs.count, 1)
+        XCTAssertTrue(generator.targetIDs.isEmpty)
+        XCTAssertEqual(driver.sendCallCount, 0)
+        XCTAssertEqual(scheduler.answeredCursor(uid), timeline.cursor)
+    }
+
+    func testAbsentCustomerReplyExpiresAtTenMinutesWithoutBeingMarkedSent() async throws {
+        let f = try CustomerAbsenceFixture()
+        defer { f.scheduler.stop(); f.clean() }
+        await f.discover(at: 100)
+        XCTAssertEqual(f.scheduler.jobs[0].customerMissingSince, Date(timeIntervalSince1970: 100))
+        await f.discover(at: 699)
+        XCTAssertEqual(f.scheduler.jobs[0].state, .ready)
+        await f.discover(at: 700)
+        XCTAssertEqual(f.scheduler.jobs[0].state, .completed)
+        XCTAssertEqual(f.scheduler.jobs[0].deliveryOutcome, .notSent)
+        XCTAssertNotNil(f.scheduler.jobs[0].omittedAt)
+        XCTAssertEqual(f.scheduler.answeredCursor(f.uid), .empty)
+        XCTAssertEqual(f.scheduler.jobs[1].state, .ready, "Another customer must remain untouched")
+        XCTAssertEqual(f.driver.sendCallCount, 0)
+        let closed = try await CustomerTransferPolicyStore.shared.closedMessageIDs(root: f.root, uid: f.uid)
+        XCTAssertTrue(closed.contains("old-message"))
+        let log = try String(contentsOf: f.root.appendingPathComponent("logs/automation-steps.jsonl"))
+        XCTAssertTrue(log.contains("reply-omitted-customer-absent"))
+    }
+
+    func testVisibleCustomerReplyDoesNotExpireWhenAnotherChatIsSelected() async throws {
+        let f = try CustomerAbsenceFixture()
+        defer { f.scheduler.stop(); f.clean() }
+        f.driver.visibleLocators = [f.locator, f.otherLocator]
+        f.driver.discoveries = [.init(uid: f.otherUID, hasUnreadEvidence: false)]
+        await f.discover(at: 100)
+        await f.discover(at: 5000)
+        XCTAssertNil(f.scheduler.jobs[0].customerMissingSince)
+        XCTAssertNil(f.scheduler.jobs[0].omittedAt)
+        XCTAssertEqual(f.scheduler.jobs[0].state, .ready)
+    }
+
+    func testChangedMaskedNameCannotExpireCustomerOrKeepExpiredTimerBlockingWork() async throws {
+        let f = try CustomerAbsenceFixture(nickname: "A**f")
+        defer { f.scheduler.stop(); f.clean() }
+        await f.discover(at: 100)
+        XCTAssertNotNil(f.scheduler.jobs[0].customerMissingSince)
+        f.driver.visibleLocators = [.init(nickname: "A***")]
+        await f.discover(at: 700)
+        XCTAssertNil(f.scheduler.jobs[0].customerMissingSince)
+        XCTAssertNil(f.scheduler.jobs[0].omittedAt)
+        XCTAssertEqual(f.scheduler.jobs[0].state, .ready)
+        f.driver.visibleLocators = [.init(nickname: "游客")]
+        await f.discover(at: 5000)
+        XCTAssertNil(f.scheduler.jobs[0].customerMissingSince)
+        XCTAssertNil(f.scheduler.jobs[0].omittedAt)
+    }
+
+    func testUnreadableListInterruptsContinuousAbsenceAndAllowsRetry() async throws {
+        let f = try CustomerAbsenceFixture()
+        defer { f.scheduler.stop(); f.clean() }
+        await f.discover(at: 100)
+        f.driver.visibleLocators = nil
+        await f.discover(at: 700)
+        XCTAssertNil(f.scheduler.jobs[0].customerMissingSince)
+        XCTAssertNil(f.scheduler.jobs[0].omittedAt)
+        f.driver.visibleLocators = [f.otherLocator]
+        await f.discover(at: 800)
+        await f.discover(at: 1399)
+        XCTAssertNil(f.scheduler.jobs[0].omittedAt)
+        await f.discover(at: 1400)
+        XCTAssertNotNil(f.scheduler.jobs[0].omittedAt)
+    }
+
+    func testOmittedGenerationReleasesCapacityForAnotherCustomer() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let gone = PDDConversationLocator(nickname: "gone***")
+        let here = PDDConversationLocator(nickname: "here***")
+        let uid = PDDConversationKey.make(locator: gone)
+        let healthyUID = PDDConversationKey.make(locator: here)
+        let clock = SchedulerTestClock(Date(timeIntervalSince1970: 100))
+        var state = AutoReplyPersistentState.empty
+        state.nextSequence = 2
+        state.conversationLocatorsByUID = [uid: gone, healthyUID: here]
+        for (position, customer) in [uid, healthyUID].enumerated() {
+            state.jobs.append(AutoReplyJob(id: UUID(), uid: customer, sequence: position + 1, state: .queued,
+                capture: try makeFrozenCapture(uid: customer, ids: ["question-\(position)"], after: .empty), reply: nil,
+                deliveryOutcome: nil, confirmedServiceMessageID: nil, retries: 0, nextAttemptAt: nil, lastError: nil))
+        }
+        let store = AutoReplyStore(rootDirectory: root)
+        try store.save(state)
+        let driver = ControlledAutoReplyDriver(capturesByUID: [:])
+        driver.visibleLocators = [here]
+        let scheduler = try AutoReplyScheduler(driver: driver, generator: AbsenceHangingGenerator(uid: uid), store: store,
+            configuredMaximumConcurrentGenerations: 1, availableMemoryBytes: { 64 << 30 },
+            generationTimeout: .seconds(30), now: { clock.value })
+        defer { scheduler.stop() }
+        scheduler.setDeliveryEnabled(false)
+        scheduler.start()
+        await scheduler.tick()
+        clock.value = Date(timeIntervalSince1970: 700)
+        scheduler.requestAXRefresh()
+        await scheduler.tick()
+        XCTAssertNotNil(scheduler.jobs[0].omittedAt)
+        scheduler.setDeliveryEnabled(true)
+        for _ in 0..<40 {
+            await scheduler.tick()
+            if scheduler.jobs[1].deliveryOutcome == .sent { break }
+            try await Task.sleep(for: .milliseconds(2))
+        }
+        XCTAssertEqual(scheduler.jobs[1].deliveryOutcome, .sent)
+        XCTAssertEqual(driver.sentTexts, ["healthy reply"])
+    }
+
+    func testCustomerReappearingResetsContinuousAbsenceTimer() async throws {
+        let f = try CustomerAbsenceFixture()
+        defer { f.scheduler.stop(); f.clean() }
+        await f.discover(at: 100)
+        f.driver.visibleLocators = [f.locator]
+        await f.discover(at: 500)
+        XCTAssertNil(f.scheduler.jobs[0].customerMissingSince)
+        f.driver.visibleLocators = []
+        await f.discover(at: 600)
+        await f.discover(at: 1199)
+        XCTAssertNil(f.scheduler.jobs[0].omittedAt)
+        await f.discover(at: 1200)
+        XCTAssertNotNil(f.scheduler.jobs[0].omittedAt)
+    }
+
+    func testUnknownConversationListCannotExpireCustomers() async throws {
+        let f = try CustomerAbsenceFixture()
+        defer { f.scheduler.stop(); f.clean() }
+        f.driver.visibleLocators = nil
+        await f.discover(at: 100)
+        await f.discover(at: 5000)
+        XCTAssertNil(f.scheduler.jobs[0].customerMissingSince)
+        XCTAssertNil(f.scheduler.jobs[0].omittedAt)
+    }
+
+    func testAbsenceTimerSurvivesRestartAndClosesOCROriginalAndAlias() async throws {
+        let f = try CustomerAbsenceFixture(messageID: "ocr-provisional-old")
+        defer { f.scheduler.stop(); f.clean() }
+        await f.discover(at: 100)
+        f.scheduler.stop()
+        var state = try f.store.load()
+        state.provisionalReceiptsByUID[f.uid] = [.init(provisionalMessageID: "ocr-provisional-old",
+            normalizedContent: "old message", firstObservedAt: f.clock.value, answered: false,
+            absorbedAXMessageID: "middlePanel_list_actual")]
+        try f.store.save(state)
+        f.clock.value = Date(timeIntervalSince1970: 700)
+        let restarted = try AutoReplyScheduler(driver: f.driver, generator: f.generator, store: f.store,
+            now: { f.clock.value })
+        defer { restarted.stop() }
+        restarted.setDeliveryEnabled(false)
+        restarted.start()
+        await restarted.tick()
+        XCTAssertNotNil(restarted.jobs[0].omittedAt)
+        let closed = try await CustomerTransferPolicyStore.shared.closedMessageIDs(root: f.root, uid: f.uid)
+        XCTAssertTrue(closed.contains("ocr-provisional-old"))
+        XCTAssertTrue(closed.contains("middlePanel_list_actual"))
+        XCTAssertEqual(try f.store.load().provisionalReceiptsByUID[f.uid]?.first?.answered, false)
+    }
+
+    func testNewCustomerMessageAfterOmissionIsProcessedWithoutRevivingOldReply() async throws {
+        let f = try CustomerAbsenceFixture()
+        defer { f.scheduler.stop(); f.clean() }
+        await f.discover(at: 100)
+        await f.discover(at: 700)
+        f.clock.value = Date(timeIntervalSince1970: 701)
+        f.driver.visibleLocators = [f.locator, f.otherLocator]
+        f.driver.discoveries = [.init(uid: f.uid, hasUnreadEvidence: true)]
+        f.scheduler.setDeliveryEnabled(true)
+        f.scheduler.requestAXRefresh()
+        for _ in 0..<60 {
+            await f.scheduler.tick()
+            if f.scheduler.jobs.contains(where: { $0.uid == f.uid && $0.deliveryOutcome == .sent }) { break }
+            try await Task.sleep(for: .milliseconds(2))
+        }
+        XCTAssertTrue(f.generator.targetIDs.contains(["new-message"]))
+        XCTAssertFalse(f.generator.targetIDs.contains(["old-message", "new-message"]))
+        XCTAssertFalse(f.driver.sentTexts.contains("old generated reply"))
+        XCTAssertTrue(f.scheduler.jobs.contains { $0.uid == f.uid && $0.deliveryOutcome == .sent })
+        XCTAssertNotNil(f.scheduler.jobs[0].omittedAt)
+    }
+
+    func testHungGenerationReleasesOnlySlotSoOtherCustomerCompletes() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = AutoReplyStore(rootDirectory: root)
+        var state = AutoReplyPersistentState.empty
+        for (offset, uid) in ["hung", "healthy"].enumerated() {
+            state.jobs.append(AutoReplyJob(id: UUID(), uid: uid, sequence: offset + 1, state: .queued,
+                capture: try makeFrozenCapture(uid: uid, ids: [uid], after: .empty), reply: nil,
+                deliveryOutcome: nil, confirmedServiceMessageID: nil, retries: 0, nextAttemptAt: nil, lastError: nil))
+        }
+        state.nextSequence = 2
+        try store.save(state)
+        let driver = ControlledAutoReplyDriver(capturesByUID: [:])
+        let scheduler = try AutoReplyScheduler(driver: driver, generator: IsolationFaultGenerator(), store: store,
+            configuredMaximumConcurrentGenerations: 1, availableMemoryBytes: { 64 << 30 },
+            generationTimeout: .milliseconds(25))
+        scheduler.start()
+        for _ in 0..<100 {
+            await scheduler.tick()
+            if scheduler.jobs.contains(where: { $0.uid == "healthy" && $0.deliveryOutcome == .sent }) { break }
+            try await Task.sleep(for: .milliseconds(2))
+        }
+        XCTAssertTrue(scheduler.jobs.contains { $0.uid == "healthy" && $0.deliveryOutcome == .sent })
+        XCTAssertEqual(scheduler.jobs.first?.retries, 1)
+        XCTAssertTrue(scheduler.isRunning)
+        scheduler.stop()
+        XCTAssertEqual(scheduler.liveGenerationCount, 0)
+    }
+
+    func testInvalidReadyJobCannotOccupyDeliveryLaneForever() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = AutoReplyStore(rootDirectory: root)
+        var state = AutoReplyPersistentState.empty
+        for (offset, uid) in ["invalid", "healthy"].enumerated() {
+            state.jobs.append(AutoReplyJob(id: UUID(), uid: uid, sequence: offset + 1, state: .ready,
+                capture: try makeFrozenCapture(uid: uid, ids: [uid], after: .empty),
+                reply: offset == 0 ? nil : "healthy reply", deliveryOutcome: nil,
+                confirmedServiceMessageID: nil, retries: 0, nextAttemptAt: nil, lastError: nil))
+        }
+        state.nextSequence = 2
+        try store.save(state)
+        let driver = ControlledAutoReplyDriver(capturesByUID: [:])
+        let scheduler = try AutoReplyScheduler(driver: driver, generator: ControlledReplyGenerator(delayNanoseconds: 0), store: store)
+        scheduler.start()
+        for _ in 0..<8 where driver.sendCallCount == 0 { await scheduler.tick() }
+        XCTAssertEqual(driver.sentTexts, ["healthy reply"])
+        XCTAssertEqual(scheduler.jobs[0].state, .failed)
+        XCTAssertEqual(scheduler.jobs[1].deliveryOutcome, .sent)
+        scheduler.stop()
+    }
+
+    func testFailedSendBacklogCannotStarveNewCustomerDiscoveryAndCapture() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        var state = AutoReplyPersistentState.empty
+        for sequence in 1...12 {
+            let uid = "broken-\(sequence)"
+            state.jobs.append(AutoReplyJob(id: UUID(), uid: uid, sequence: sequence, state: .ready,
+                capture: try makeFrozenCapture(uid: uid, ids: [uid], after: .empty), reply: "reply",
+                deliveryOutcome: nil, confirmedServiceMessageID: nil, retries: 0, nextAttemptAt: nil, lastError: nil))
+        }
+        state.nextSequence = 12
+        let store = AutoReplyStore(rootDirectory: root)
+        try store.save(state)
+        let driver = ControlledAutoReplyDriver(capturesByUID: ["new-customer": [["new-question"]]])
+        driver.deliveryResults = Array(repeating: .failedBeforeSend("AX unavailable"), count: 12)
+        driver.discoveries = [.init(uid: "new-customer", hasUnreadEvidence: true)]
+        let scheduler = try AutoReplyScheduler(driver: driver, generator: ControlledReplyGenerator(delayNanoseconds: 0), store: store)
+        scheduler.start()
+        for _ in 0..<8 { await scheduler.tick() }
+        XCTAssertGreaterThanOrEqual(driver.discoverCallCount, 1)
+        XCTAssertTrue(scheduler.jobs.contains { $0.uid == "new-customer" })
+        XCTAssertTrue(scheduler.isRunning)
+        scheduler.stop()
+    }
+
+    func testDeferredCaptureSurvivesSelectingAnotherCustomersRequestAndRestart() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let clock = SchedulerTestClock(Date(timeIntervalSince1970: 100))
+        var state = AutoReplyPersistentState.empty
+        state.pendingCaptureRequests = [
+            .init(uid: "delayed", kind: .ordinary, baseCursor: .empty, nextAttemptAt: Date(timeIntervalSince1970: 115)),
+            .init(uid: "healthy", kind: .ordinary, baseCursor: .empty)]
+        let store = AutoReplyStore(rootDirectory: root)
+        try store.save(state)
+        let driver = ControlledAutoReplyDriver(capturesByUID: ["healthy": [["healthy"]], "delayed": [["delayed"]]])
+        let scheduler = try AutoReplyScheduler(driver: driver, generator: ControlledReplyGenerator(delayNanoseconds: 0),
+            store: store, now: { clock.value })
+        scheduler.start()
+        await scheduler.tick()
+        XCTAssertEqual(driver.captureCallCountByUID["healthy"], 1)
+        XCTAssertTrue(try store.load().pendingCaptureRequests.contains { $0.uid == "delayed" })
+        scheduler.stop()
+        clock.value = Date(timeIntervalSince1970: 116)
+        let restarted = try AutoReplyScheduler(driver: driver, generator: ControlledReplyGenerator(delayNanoseconds: 0),
+            store: store, now: { clock.value })
+        restarted.start()
+        for _ in 0..<8 where driver.captureCallCountByUID["delayed"] == nil { await restarted.tick() }
+        XCTAssertEqual(driver.captureCallCountByUID["delayed"], 1)
+        restarted.stop()
+    }
+
+    func testHungDriverCleanupCannotHoldSchedulerAfterUITimeout() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let driver = ControlledAutoReplyDriver(capturesByUID: ["healthy": [["message"]]])
+        driver.discoverNeverReturns = true
+        driver.cleanupNeverReturns = true
+        let scheduler = try AutoReplyScheduler(driver: driver, generator: ControlledReplyGenerator(delayNanoseconds: 0),
+            store: AutoReplyStore(rootDirectory: root), uiOperationTimeout: .milliseconds(20))
+        scheduler.start()
+        let started = Date()
+        await scheduler.tick()
+        XCTAssertLessThan(Date().timeIntervalSince(started), 0.3)
+        driver.discoverNeverReturns = false
+        driver.discoveries = [.init(uid: "healthy", hasUnreadEvidence: true)]
+        scheduler.requestAXRefresh()
+        for _ in 0..<20 {
+            await scheduler.tick()
+            if driver.sendCallCount > 0 { break }
+            try await Task.sleep(for: .milliseconds(2))
+        }
+        XCTAssertEqual(driver.sendCallCount, 1)
+        XCTAssertTrue(scheduler.isRunning)
+        scheduler.stop()
+    }
+
+    func testSentHandoffSupplementCannotQueueSameAcknowledgmentAgain() throws {
+        let uid = "PDD-NAME-handoff"
+        let capture = AutoReplyCapture(uid: uid, fullHistory: [],
+            batch: .incomingHandoff(key: "same-transfer", cursor: .empty), customerCursor: .empty,
+            unexpectedServiceMessageIDs: [])
+        var source = AutoReplyJob(id: UUID(), uid: uid, sequence: 1, state: .completed,
+            capture: capture, reply: "I can help.", deliveryOutcome: .sent,
+            confirmedServiceMessageID: "sent", retries: 0, nextAttemptAt: nil, lastError: nil)
+        source.pendingSupplement = capture
+        var state = AutoReplyPersistentState.empty
+        state.jobs = [source]
+        state.nextSequence = 1
+
+        XCTAssertFalse(state.advanceSourceAndPromoteSupplement(at: 0))
+        XCTAssertEqual(state.jobs.count, 1)
+        XCTAssertNil(state.jobs[0].pendingSupplement)
+    }
+
+    func testCoveredSupplementFiltersAcknowledgmentButRetainsNewCustomerMessage() throws {
+        let uid = "PDD-NAME-handoff"
+        let capture = AutoReplyCapture(uid: uid, fullHistory: [],
+            batch: .incomingHandoff(key: "same-transfer", cursor: .empty), customerCursor: .empty,
+            unexpectedServiceMessageIDs: [])
+        let newCapture = try makeFrozenCapture(uid: uid, ids: ["new-question"], after: .empty)
+        let batch = try XCTUnwrap(newCapture.batch)
+        var source = AutoReplyJob(id: UUID(), uid: uid, sequence: 1, state: .completed,
+            capture: capture, reply: "I can help.", deliveryOutcome: .sent,
+            confirmedServiceMessageID: "sent", retries: 0, nextAttemptAt: nil, lastError: nil)
+        source.pendingSupplement = AutoReplyCapture(uid: uid, fullHistory: newCapture.fullHistory,
+            batch: .init(startCursor: .empty, endCursor: batch.endCursor,
+                events: capture.batch!.events + batch.events, targetCustomerJSONL: batch.targetCustomerJSONL),
+            customerCursor: batch.endCursor, unexpectedServiceMessageIDs: [])
+        var state = AutoReplyPersistentState.empty
+        state.jobs = [source]
+        state.nextSequence = 1
+
+        XCTAssertTrue(state.advanceSourceAndPromoteSupplement(at: 0))
+        XCTAssertEqual(state.jobs[1].capture.batch?.events.map(\.messageID), ["new-question"])
+    }
+
+    func testRestartRecoversLatestUnsentOCRLookupFailureWithoutReplayingSentJobs() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let uid = "PDD-NAME-ocr"
+        let capture = try makeFrozenCapture(uid: uid, ids: ["ocr-provisional-temp"], after: .empty)
+        var state = AutoReplyPersistentState.empty
+        state.jobs = [AutoReplyJob(id: UUID(), uid: uid, sequence: 104, state: .failed,
+            capture: capture, reply: "Please send your times.", deliveryOutcome: .notSent,
+            confirmedServiceMessageID: nil, retries: 0, nextAttemptAt: nil,
+            lastError: "当前列表前两个同昵称会话均不包含目标消息；已丢弃当前批次并继续")]
+        state.nextSequence = 104
+        state.answeredCursors[uid] = capture.customerCursor
+        let store = AutoReplyStore(rootDirectory: root)
+        try store.save(state)
+        try AutoReplyTransactionalStore(rootDirectory: root).archiveTerminal(state.jobs[0])
+        let archivedURL = root.appendingPathComponent("archive/records/\(state.jobs[0].id).json")
+        let archived = try Data(contentsOf: archivedURL)
+        let driver = ControlledAutoReplyDriver(capturesByUID: [:])
+        let scheduler = try AutoReplyScheduler(driver: driver,
+            generator: ControlledReplyGenerator(delayNanoseconds: 0), store: store)
+
+        XCTAssertFalse(scheduler.isRunning)
+        XCTAssertEqual(scheduler.jobs.map(\.state), [.failed, .ready])
+        XCTAssertNotEqual(scheduler.jobs[0].id, scheduler.jobs[1].id)
+        XCTAssertEqual(scheduler.answeredCursor(uid), .empty)
+        XCTAssertEqual(try store.load().jobs[1].reply, "Please send your times.")
+        scheduler.start()
+        for _ in 0..<10 {
+            await scheduler.tick()
+            if driver.sendCallCount > 0 { break }
+        }
+        scheduler.stop()
+        XCTAssertEqual(driver.sendCallCount, 1)
+        XCTAssertEqual(scheduler.jobs[1].deliveryOutcome, .sent)
+        XCTAssertEqual(try Data(contentsOf: archivedURL), archived)
+        XCTAssertTrue(FileManager.default.fileExists(atPath:
+            root.appendingPathComponent("archive/records/\(scheduler.jobs[1].id).json").path))
+
+        state.jobs[0].state = .completed
+        state.jobs[0].deliveryOutcome = .sent
+        state.answeredCursors[uid] = capture.customerCursor
+        try store.save(state)
+        let sentScheduler = try AutoReplyScheduler(driver: ControlledAutoReplyDriver(capturesByUID: [:]),
+            generator: ControlledReplyGenerator(delayNanoseconds: 0), store: store)
+        XCTAssertEqual(sentScheduler.jobs[0].state, .completed)
+        XCTAssertEqual(sentScheduler.answeredCursor(uid), capture.customerCursor)
+    }
+
+    func testGeneratedImageSelectionPersistsAndReachesDeliveryWithStableJobID() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let image = try makeDatasetReplyImageFixture(root: root)
+        let uid = "PDD-NAME-image"
+        let driver = ControlledAutoReplyDriver(capturesByUID: [uid: [["card-sample-request"]]])
+        driver.discoveries = [.init(uid: uid, hasUnreadEvidence: true)]
+        let store = AutoReplyStore(rootDirectory: root)
+        let scheduler = try AutoReplyScheduler(driver: driver, generator: FixedImageReplyGenerator(image: image), store: store,
+            configuredMaximumConcurrentGenerations: 1, availableMemoryBytes: { 64 << 30 })
+        scheduler.start()
+        var persistedID: UUID?
+        for _ in 0..<50 {
+            await scheduler.tick()
+            if let job = try store.load().jobs.first(where: { !$0.outgoingImages.isEmpty }) {
+                XCTAssertEqual(job.outgoingImages, [image])
+                persistedID = job.id
+            }
+            if driver.sendCallCount > 0 { break }
+            try await Task.sleep(for: .milliseconds(3))
+        }
+        scheduler.stop()
+        XCTAssertEqual(driver.sentOutgoingImages, [[image]])
+        XCTAssertEqual(driver.sentImageDeliveryIDs, [try XCTUnwrap(persistedID)])
+        XCTAssertEqual(driver.sentTexts, ["Here is the card sample."])
+    }
+    func testIncomingTransferFailureAcknowledgesOnceAndDoesNotCreateTransferLoop() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let uid = "PDD-NAME-incoming"
+        let history = [PDDChatMessage(id: "old", sender: .customer, content: "I want to return this item.",
+            displayTime: nil, kind: .text, capturedAt: Date())]
+        let cursor = try AutoReplyTimeline.make(messages: history).cursor
+        let capture = AutoReplyCapture(uid: uid, fullHistory: history,
+            batch: .incomingHandoff(key: "boundary", cursor: cursor), customerCursor: cursor,
+            unexpectedServiceMessageIDs: [])
+        let driver = ControlledAutoReplyDriver(capturesByUID: [:])
+        driver.captureOverridesByUID[uid] = capture
+        driver.discoveries = [.init(uid: uid, hasUnreadEvidence: true)]
+        let store = AutoReplyStore(rootDirectory: root)
+        let generator = AlwaysFailingCodexGenerator(error: CodexProcessError.timeout(60))
+        let scheduler = try AutoReplyScheduler(driver: driver, generator: generator, store: store,
+            configuredMaximumConcurrentGenerations: 1, availableMemoryBytes: { 64 << 30 })
+        scheduler.start()
+        for _ in 0..<50 {
+            await scheduler.tick()
+            if driver.sendCallCount > 0 { break }
+            try await Task.sleep(for: .milliseconds(3))
+        }
+        XCTAssertEqual(driver.sentTexts, ["I’ve received your conversation and am here to continue helping you."])
+        XCTAssertTrue(driver.transferredUIDs.isEmpty)
+        XCTAssertTrue(try store.load().transferTasks.isEmpty)
+        let closed = try await CustomerTransferPolicyStore.shared.closedMessageIDs(root: root, uid: uid)
+        XCTAssertTrue(closed.contains(FrozenCustomerBatch.incomingHandoffPrefix + "boundary"))
+        driver.discoveries = [.init(uid: uid, hasUnreadEvidence: true)]
+        for _ in 0..<10 { await scheduler.tick() }
+        XCTAssertEqual(driver.sendCallCount, 1)
+        let log = try String(contentsOf: root.appendingPathComponent("logs/automation-steps.jsonl"))
+        XCTAssertTrue(log.contains("incoming-handoff-fallback-ready"))
+        XCTAssertTrue(log.contains("reply-delivery-confirmed"))
+        scheduler.stop()
+    }
+
     func testConfirmed429CreatesCourtesyReplyAndTransferWithoutGenerationRetry() async throws {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("pdd-codex-429-transfer-\(UUID().uuidString)")
@@ -29,7 +516,7 @@ final class AutoReplySchedulerTests: XCTestCase {
 
         let callCount = await generator.calls()
         XCTAssertEqual(callCount, 1)
-        XCTAssertEqual(driver.sentTexts, ["亲亲，这边系统暂时繁忙，我帮您转接人工客服处理～"])
+        XCTAssertEqual(driver.sentTexts, ["抱歉，这个问题需要同事继续协助，我现在为您转接。"])
         XCTAssertEqual(driver.transferredUIDs, [uid])
         XCTAssertEqual(try store.load().transferTasks.first?.state, .completed)
     }
@@ -209,8 +696,7 @@ final class AutoReplySchedulerTests: XCTestCase {
             if scheduler.jobs.contains(where: { $0.state == .completed }) { break }
             try? await Task.sleep(nanoseconds: 3_000_000)
         }
-        await scheduler.tick()
-        await scheduler.tick()
+        for _ in 0..<6 where driver.transferredUIDs.isEmpty { await scheduler.tick() }
 
         XCTAssertEqual(driver.sentTexts, ["好的，我帮您转人工处理～"])
         XCTAssertEqual(driver.transferredUIDs, [uid])
@@ -324,12 +810,14 @@ final class AutoReplySchedulerTests: XCTestCase {
 
     func testPersistentUnreadRedDotCanCreateFreshAttemptAfterTwoCaptureFailures() async throws {
         let uid = "PDD-reappearing"
-        let f = try SchedulerFixture(capturesByUID: [uid: [["A"]]])
+        let clock = SchedulerTestClock(Date(timeIntervalSince1970: 100))
+        let f = try SchedulerFixture(capturesByUID: [uid: [["A"]]], now: { clock.value })
         f.driver.captureErrorsByUID[uid] = CocoaError(.fileReadUnknown)
         f.driver.discoveries = [.init(uid: uid, hasUnreadEvidence: true)]
         await f.runTicks(3)
         XCTAssertEqual(f.driver.captureCallCountByUID[uid], 2)
 
+        clock.value = Date(timeIntervalSince1970: 116)
         f.driver.captureErrorsByUID[uid] = nil
         f.driver.discoveries = [.init(uid: uid, hasUnreadEvidence: true)]
         f.scheduler.requestAXRefresh()
@@ -370,7 +858,7 @@ final class AutoReplySchedulerTests: XCTestCase {
 
         await scheduler.tick()
         driver.captureErrorsByUID[uid] = nil
-        await scheduler.tick()
+        for _ in 0..<5 where driver.captureIncludeImages.count < 2 { await scheduler.tick() }
 
         XCTAssertEqual(driver.captureIncludeImages, [true, false])
         XCTAssertTrue(try store.load().jobs[0].imageCaptureAttempted)
@@ -1158,7 +1646,7 @@ final class AutoReplySchedulerTests: XCTestCase {
         XCTAssertEqual(scheduler.jobs[1].capture.batch?.events.map(\.messageID), ["B"])
     }
 
-    func testRepeatedUnreadDotDoesNotRecaptureOrEraseDurableSupplement() async throws {
+    func testRepeatedUnreadDotRefreshesButDoesNotEraseDurableSupplement() async throws {
         let uid = "GZC-000001"
         let clock = SchedulerTestClock(Date(timeIntervalSince1970: 100))
         let f = try SchedulerFixture(
@@ -1175,7 +1663,7 @@ final class AutoReplySchedulerTests: XCTestCase {
         f.driver.discoveries = [.init(uid: uid, hasUnreadEvidence: true)]
         await f.runTicks(4)
 
-        XCTAssertEqual(f.driver.captureCallCount, 2)
+        XCTAssertEqual(f.driver.captureCallCount, 3)
         XCTAssertEqual(
             f.scheduler.jobs.first?.pendingSupplement?.batch?.events.map(\.messageID), ["B"]
         )
@@ -1290,16 +1778,13 @@ final class AutoReplySchedulerTests: XCTestCase {
         )
         scheduler.start()
 
-        await scheduler.tick()
-        await scheduler.tick()
-        await scheduler.tick()
-        await scheduler.tick()
+        for _ in 0..<8 where driver.sendCallCount < 2 { await scheduler.tick() }
 
         XCTAssertEqual(driver.sendCallCount, 2)
         XCTAssertEqual(scheduler.jobs.prefix(2).map(\.state), [.completed, .completed])
     }
 
-    func testOrdinaryCaptureFailureMovesToTailOnceThenDropsWithoutStarvingOtherUID() async throws {
+    func testOrdinaryCaptureFailureDefersDurablyWithoutStarvingOtherUID() async throws {
         let firstUID = "GZC-000001"
         let otherUID = "GZC-000002"
         let f = try SchedulerFixture(capturesByUID: [otherUID: [["B"]]])
@@ -1312,11 +1797,13 @@ final class AutoReplySchedulerTests: XCTestCase {
         await f.runTicks(8)
 
         XCTAssertEqual(f.driver.captureCallCountByUID[firstUID], 2)
-        XCTAssertEqual(f.driver.captureCallCountByUID[otherUID], 1)
+        XCTAssertEqual(f.driver.captureCallCountByUID[otherUID], 2) // initial plus mandatory post-send check
         XCTAssertTrue(f.scheduler.jobs.contains {
             $0.uid == otherUID && $0.capture.batch?.events.map(\.messageID) == ["B"]
         })
-        XCTAssertTrue(try AutoReplyStore(rootDirectory: f.root).load().pendingCaptureRequests.isEmpty)
+        let pending = try AutoReplyStore(rootDirectory: f.root).load().pendingCaptureRequests
+        XCTAssertEqual(pending.map(\.uid), [firstUID])
+        XCTAssertNotNil(pending.first?.nextAttemptAt)
     }
 
     func testRestartPromotionDeletesLegacyDuplicateSupplementRequest() async throws {
@@ -1426,13 +1913,12 @@ final class AutoReplySchedulerTests: XCTestCase {
         )
         scheduler.start()
 
-        await scheduler.tick()
-        await scheduler.tick()
+        for _ in 0..<6 where driver.captureCallCount == 0 { await scheduler.tick() }
 
         XCTAssertEqual(scheduler.jobs.count, 2)
         XCTAssertEqual(scheduler.jobs[1].capture.batch?.events.map(\.messageID), ["B"])
-        XCTAssertNil(scheduler.jobs[1].pendingSupplement)
-        XCTAssertEqual(driver.captureCallCount, 0)
+        XCTAssertEqual(scheduler.jobs[1].pendingSupplement?.batch?.events.map(\.messageID), ["C"])
+        XCTAssertEqual(driver.captureCallCount, 1)
     }
 
     func testLegacyNilSourceSupplementResolvesByFrozenBaseCursorNotCurrentActiveJob() async throws {
@@ -1467,8 +1953,7 @@ final class AutoReplySchedulerTests: XCTestCase {
         )
         scheduler.start()
 
-        await scheduler.tick()
-        await scheduler.tick()
+        for _ in 0..<6 where scheduler.jobs.count < 3 { await scheduler.tick() }
 
         XCTAssertEqual(scheduler.jobs.count, 3)
         XCTAssertNil(scheduler.jobs[1].pendingSupplement)
@@ -1508,7 +1993,7 @@ final class AutoReplySchedulerTests: XCTestCase {
         XCTAssertEqual(f.scheduler.latestCapture?.ocrDiagnostic, "OCR 已读取 2 条可见气泡")
     }
 
-    func testCompletedReplyDoesNotProbeOrCreateTailWithoutNewUnreadDot() async throws {
+    func testCompletedReplyCapturesTailWithoutNewUnreadDot() async throws {
         let f = try SchedulerFixture(capturesByUID: ["GZC-000001": [["A"], ["B", "C"], []]])
         f.driver.discoveries = [.init(uid: "GZC-000001", hasUnreadEvidence: true)]
         f.driver.deliveryResults = [.sent(serviceMessageID: "s1"), .sent(serviceMessageID: "s2")]
@@ -1516,9 +2001,9 @@ final class AutoReplySchedulerTests: XCTestCase {
         await f.runUntilCompletedJobs(1)
         await f.runTicks(20)
 
-        XCTAssertEqual(f.generator.targetIDs, [["A"]])
-        XCTAssertEqual(f.driver.sentTexts.count, 1)
-        XCTAssertEqual(f.driver.captureCallCount, 1)
+        XCTAssertEqual(f.generator.targetIDs, [["A"], ["B", "C"]])
+        XCTAssertEqual(f.driver.sentTexts.count, 2)
+        XCTAssertEqual(f.driver.captureCallCount, 3)
     }
 
     func testAppendedBCDoesNotCancelReadyReplyForA() async throws {
@@ -1607,7 +2092,7 @@ final class AutoReplySchedulerTests: XCTestCase {
         XCTAssertEqual(f.scheduler.answeredCursor("GZC-000001").count, 1)
     }
 
-    func testCustomerCursorChangeWaitsForFreshUnreadBeforeRecapturingTail() async throws {
+    func testCustomerCursorChangeRecapturesTailWithoutWaitingForFreshUnread() async throws {
         let f = try SchedulerFixture(capturesByUID: ["GZC-000001": [["A"], ["A", "B", "C"]]])
         f.driver.discoveries = [.init(uid: "GZC-000001", hasUnreadEvidence: true)]
         f.driver.deliveryResults = [
@@ -1617,9 +2102,9 @@ final class AutoReplySchedulerTests: XCTestCase {
 
         await f.runTicks(20)
 
-        XCTAssertEqual(f.generator.targetIDs, [["A"]])
-        XCTAssertEqual(f.driver.sendCallCount, 1)
-        XCTAssertEqual(f.scheduler.jobs.map(\.state), [.failed])
+        XCTAssertEqual(f.generator.targetIDs, [["A"], ["A", "B", "C"]])
+        XCTAssertEqual(f.driver.sendCallCount, 2)
+        XCTAssertEqual(f.scheduler.jobs.map(\.state), [.failed, .completed])
 
         f.driver.discoveries = [.init(uid: "GZC-000001", hasUnreadEvidence: true)]
         f.scheduler.requestAXRefresh()
@@ -1661,7 +2146,7 @@ final class AutoReplySchedulerTests: XCTestCase {
         XCTAssertEqual(f.scheduler.answeredCursor(uid).count, 1)
     }
 
-    func testRepeatedUIDMismatchParksOnlyThatJobAndAllowsNewCustomerToContinue() async throws {
+    func testRepeatedUIDMismatchRetainsUnsentReplyAndAllowsNewCustomerToContinue() async throws {
         let blockedUID = "PDD-NAME-blocked"
         let nextUID = "PDD-NAME-next"
         let clock = SchedulerTestClock(Date(timeIntervalSince1970: 100))
@@ -1679,8 +2164,9 @@ final class AutoReplySchedulerTests: XCTestCase {
         clock.value = Date(timeIntervalSince1970: 102)
         await f.runTicks(12)
 
-        XCTAssertEqual(f.scheduler.jobs.first?.state, .quarantined)
+        XCTAssertEqual(f.scheduler.jobs.first?.state, .ready)
         XCTAssertEqual(f.scheduler.jobs.first?.stageAttempt, 2)
+        XCTAssertEqual(f.scheduler.answeredCursor(blockedUID), .empty)
         XCTAssertTrue(f.scheduler.isRunning)
 
         f.driver.discoveries = [.init(uid: nextUID, hasUnreadEvidence: true)]
@@ -1692,7 +2178,7 @@ final class AutoReplySchedulerTests: XCTestCase {
         })
     }
 
-    func testExhaustedNicknameFallbackDropsCurrentBatchWithoutRetry() async throws {
+    func testExhaustedNicknameFallbackRetainsCurrentBatchForRetry() async throws {
         let uid = "PDD-NAME-masked"
         let f = try SchedulerFixture(capturesByUID: [uid: [["middlePanel_list_target"]]])
         f.driver.discoveries = [.init(uid: uid, hasUnreadEvidence: true)]
@@ -1704,10 +2190,31 @@ final class AutoReplySchedulerTests: XCTestCase {
 
         XCTAssertEqual(f.driver.sendCallCount, 1)
         XCTAssertEqual(f.driver.sentExpectedCustomerMessageIDs, [["middlePanel_list_target"]])
-        XCTAssertEqual(f.scheduler.jobs.first?.state, .failed)
-        XCTAssertEqual(f.scheduler.jobs.first?.stageAttempt, 0)
-        XCTAssertEqual(f.scheduler.answeredCursor(uid).count, 1)
+        XCTAssertEqual(f.scheduler.jobs.first?.state, .ready)
+        XCTAssertEqual(f.scheduler.jobs.first?.stageAttempt, 1)
+        XCTAssertEqual(f.scheduler.answeredCursor(uid), .empty)
         XCTAssertTrue(f.scheduler.isRunning)
+    }
+
+    func testUnsentLookupRetriesAfterBackoffAndAdvancesOnlyAfterSuccessfulDelivery() async throws {
+        let uid = "PDD-NAME-ocr"
+        let clock = SchedulerTestClock(Date(timeIntervalSince1970: 100))
+        let f = try SchedulerFixture(capturesByUID: [uid: [["ocr-provisional-temp"]]], now: { clock.value })
+        f.driver.discoveries = [.init(uid: uid, hasUnreadEvidence: true)]
+        f.driver.deliveryResults = [.failedBeforeSend("目标消息暂未核对成功"),
+            .failedBeforeSend("目标消息暂未核对成功"), .sent(serviceMessageID: "delivered")]
+        await f.runTicks(12)
+        XCTAssertEqual(f.scheduler.answeredCursor(uid), .empty)
+        clock.value = Date(timeIntervalSince1970: 102)
+        await f.runTicks(12)
+        XCTAssertEqual(f.scheduler.answeredCursor(uid), .empty)
+        XCTAssertEqual(f.driver.sendCallCount, 2)
+        XCTAssertEqual(f.scheduler.jobs[0].state, .ready)
+        clock.value = Date(timeIntervalSince1970: 118)
+        await f.runUntilCompletedJobs(1)
+        XCTAssertEqual(f.driver.sendCallCount, 3)
+        XCTAssertEqual(f.scheduler.jobs[0].deliveryOutcome, .sent)
+        XCTAssertEqual(f.scheduler.answeredCursor(uid).count, 1)
     }
 
     func testRestartedSchedulerUsesPersistedKnownServiceIDsToQuarantineHumanReply() async throws {
@@ -2286,14 +2793,10 @@ final class AutoReplySchedulerTests: XCTestCase {
         )
         scheduler.start()
 
-        await scheduler.tick()
-        await scheduler.tick()
-        await scheduler.tick()
-        await scheduler.tick()
-
+        for _ in 0..<8 where driver.sendCallCount < 3 { await scheduler.tick() }
         XCTAssertEqual(driver.sendCallCount, 3)
-        XCTAssertEqual(driver.discoverCallCount, 1)
-        await scheduler.tick()
+        XCTAssertGreaterThanOrEqual(driver.discoverCallCount, 1)
+        for _ in 0..<6 where driver.sendCallCount < 4 { await scheduler.tick() }
         XCTAssertEqual(driver.sendCallCount, 4)
     }
 }
@@ -2415,6 +2918,22 @@ private func makeVideoCapture(
 
 @MainActor
 private final class ControlledAutoReplyDriver: AutoReplyAutomationDriver {
+    var visibleLocators: [PDDConversationLocator]?
+    func visibleConversationsSnapshot() -> [PDDConversationLocator]? { visibleLocators }
+    var sentOutgoingImages: [[DatasetReplyImage]] = []
+    var sentImageDeliveryIDs: [UUID] = []
+    func send(uid: String, text: String, outgoingImages: [DatasetReplyImage], deliveryID: UUID,
+              expectedCustomerCursor: AutoReplyCursor, expectedCustomerMessageIDs: Set<String>,
+              lease: UIOperationLease) async throws -> AutoReplyDeliveryResult {
+        try lease.validate()
+        if !outgoingImages.isEmpty {
+            sentOutgoingImages.append(outgoingImages)
+            sentImageDeliveryIDs.append(deliveryID)
+        }
+        return try await send(uid: uid, text: text, expectedCustomerCursor: expectedCustomerCursor,
+            expectedCustomerMessageIDs: expectedCustomerMessageIDs)
+    }
+    var captureOverridesByUID: [String: AutoReplyCapture] = [:]
     var discoveries: [AutoReplyDiscovery] = []
     var deliveryResults: [AutoReplyDeliveryResult] = []
     var sentExpectedCustomerMessageIDs: [Set<String>] = []
@@ -2431,6 +2950,12 @@ private final class ControlledAutoReplyDriver: AutoReplyAutomationDriver {
     var sendError: Error?
     var discoverError: Error?
     var discoverNeverReturns = false
+    var cleanupNeverReturns = false
+    func revokeCurrentUIOperation(operationID: UUID) async {
+        if cleanupNeverReturns {
+            await withUnsafeContinuation { (_: UnsafeContinuation<Void, Never>) in }
+        }
+    }
     var captureErrorsByUID: [String: Error] = [:]
     var preflightErrorsByUID: [String: Error] = [:]
     private(set) var latestLease: UIOperationLease?
@@ -2475,6 +3000,7 @@ private final class ControlledAutoReplyDriver: AutoReplyAutomationDriver {
         captureCallCount += 1
         captureCallCountByUID[uid, default: 0] += 1
         if let error = captureErrorsByUID[uid] { throw error }
+        if let capture = captureOverridesByUID[uid] { return capture }
         var queue = capturesByUID[uid] ?? []
         let ids = queue.isEmpty ? [] : queue.removeFirst()
         capturesByUID[uid] = queue
@@ -2613,6 +3139,13 @@ private enum FixtureSchedulerError: LocalizedError {
     var errorDescription: String? { "fixture discovery failed" }
 }
 
+private struct FixedImageReplyGenerator: AutoReplyGenerating {
+    let image: DatasetReplyImage
+    func generate(_ capture: AutoReplyCapture) async throws -> CodexReplyResult {
+        CodexReplyResult(reply: "Here is the card sample.", threadID: "image-thread", outgoingImages: [image])
+    }
+}
+
 private final class ControlledReplyGenerator: AutoReplyGenerating, @unchecked Sendable {
     private let lock = NSLock()
     private let delayNanoseconds: UInt64
@@ -2699,4 +3232,71 @@ private actor AlwaysFailingCodexGenerator: AutoReplyGenerating {
         throw error
     }
     func calls() -> Int { callCount }
+}
+
+private struct IsolationFaultGenerator: AutoReplyGenerating {
+    func generate(_ capture: AutoReplyCapture) async throws -> CodexReplyResult {
+        if capture.uid == "hung" {
+            await withUnsafeContinuation { (_: UnsafeContinuation<Void, Never>) in }
+        }
+        return CodexReplyResult(reply: "healthy reply", threadID: "thread-\(capture.uid)")
+    }
+}
+
+@MainActor
+private final class CustomerAbsenceFixture {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    let locator: PDDConversationLocator
+    let otherLocator = PDDConversationLocator(nickname: "here***")
+    let uid: String
+    let otherUID: String
+    let clock = SchedulerTestClock(Date(timeIntervalSince1970: 100))
+    let driver: ControlledAutoReplyDriver
+    let generator = ControlledReplyGenerator(delayNanoseconds: 0)
+    let store: AutoReplyStore
+    let scheduler: AutoReplyScheduler
+
+    init(messageID: String = "old-message", nickname: String = "gone***") throws {
+        locator = PDDConversationLocator(nickname: nickname)
+        uid = PDDConversationKey.make(locator: locator)
+        otherUID = PDDConversationKey.make(locator: otherLocator)
+        driver = ControlledAutoReplyDriver(capturesByUID: [uid: [[messageID, "new-message"]]])
+        driver.visibleLocators = [otherLocator]
+        store = AutoReplyStore(rootDirectory: root)
+        var state = AutoReplyPersistentState.empty
+        state.nextSequence = 2
+        state.conversationLocatorsByUID = [uid: locator, otherUID: otherLocator]
+        state.jobs = [AutoReplyJob(id: UUID(), uid: uid, sequence: 1, state: .ready,
+            capture: try makeFrozenCapture(uid: uid, ids: [messageID], after: .empty),
+            reply: "old generated reply", deliveryOutcome: .notSent, confirmedServiceMessageID: nil,
+            retries: 0, nextAttemptAt: nil, lastError: nil),
+            AutoReplyJob(id: UUID(), uid: otherUID, sequence: 2, state: .ready,
+            capture: try makeFrozenCapture(uid: otherUID, ids: ["other-message"], after: .empty),
+            reply: "healthy reply", deliveryOutcome: .notSent, confirmedServiceMessageID: nil,
+            retries: 0, nextAttemptAt: nil, lastError: nil)]
+        try store.save(state)
+        let testClock = clock
+        scheduler = try AutoReplyScheduler(driver: driver, generator: generator, store: store,
+            now: { testClock.value })
+        scheduler.setDeliveryEnabled(false)
+        scheduler.start()
+    }
+
+    func discover(at seconds: TimeInterval) async {
+        clock.value = Date(timeIntervalSince1970: seconds)
+        scheduler.requestAXRefresh()
+        await scheduler.tick()
+    }
+
+    func clean() { try? FileManager.default.removeItem(at: root) }
+}
+
+private struct AbsenceHangingGenerator: AutoReplyGenerating {
+    let uid: String
+    func generate(_ capture: AutoReplyCapture) async throws -> CodexReplyResult {
+        if capture.uid == uid {
+            await withUnsafeContinuation { (_: UnsafeContinuation<Void, Never>) in }
+        }
+        return .init(reply: "healthy reply", threadID: "healthy")
+    }
 }

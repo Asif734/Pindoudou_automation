@@ -204,6 +204,7 @@ final class LivePDDAXBackend: PDDAXBackend {
     private var nextToken = 0
     private var visited = Set<ElementIdentity>()
     private var webTreeRecovery = PDDAXWebTreeRecoveryPolicy()
+    private var readDeadline: ContinuousClock.Instant?
 
     init(
         targetBundleIdentifier: String = "com.pinduoduo.merchantMac",
@@ -221,17 +222,23 @@ final class LivePDDAXBackend: PDDAXBackend {
     }
 
     func readSemanticTree() throws -> PDDAXSemanticTree {
+        readDeadline = ContinuousClock().now.advanced(by: .seconds(5))
+        defer { readDeadline = nil }
         guard AXIsProcessTrusted() else { throw AXTreeReaderError.accessibilityPermissionRequired }
         guard let application = NSRunningApplication
             .runningApplications(withBundleIdentifier: targetBundleIdentifier).first else {
             throw AXTreeReaderError.applicationNotRunning("拼多多商家版")
         }
         let appElement = AXUIElementCreateApplication(application.processIdentifier)
+        // Synchronous AX IPC runs on the UI executor. Bound each IPC as well as
+        // the whole traversal; an async watchdog cannot interrupt a blocked IPC.
+        AXUIElementSetMessagingTimeout(appElement, 0.5)
         if AXEnhancedUserInterfaceActivation.enableIfNeeded(on: appElement) {
             Thread.sleep(forTimeInterval: 0.2)
         }
-        let titledWindows = copyElements(kAXWindowsAttribute as String, from: appElement).map {
-            (title: copyString(kAXTitleAttribute as String, from: $0) ?? "", element: $0)
+        let titledWindows = try copyElements(kAXWindowsAttribute as String, from: appElement).map {
+            try checkReadDeadline()
+            return (title: copyString(kAXTitleAttribute as String, from: $0) ?? "", element: $0)
         }
         let root = PDDAXRootWindowPreference.select(
             titledWindows: titledWindows,
@@ -243,7 +250,8 @@ final class LivePDDAXBackend: PDDAXBackend {
         visited.removeAll(keepingCapacity: true)
         nextToken = 0
         var nodes: [PDDAXSemanticNode<AXElementToken>] = []
-        let snapshot = walk(root, parent: nil, depth: 0, nodes: &nodes)
+        let snapshot = try walk(root, parent: nil, depth: 0, nodes: &nodes)
+        try checkReadDeadline()
         switch webTreeRecovery.evaluate(nodes: nodes, now: now()) {
         case .healthy:
             return PDDAXSemanticTree(rootSnapshot: snapshot, nodes: nodes)
@@ -287,7 +295,8 @@ final class LivePDDAXBackend: PDDAXBackend {
         depth: Int,
         nodes: inout [PDDAXSemanticNode<AXElementToken>],
         insideConversationList: Bool = false
-    ) -> AXNodeSnapshot {
+    ) throws -> AXNodeSnapshot {
+        try checkReadDeadline()
         guard depth <= maxDepth else { return AXNodeSnapshot(role: "⟪达到最大递归深度⟫") }
         guard nodes.count < maxNodes else { return AXNodeSnapshot(role: "⟪达到最大节点数⟫") }
         guard visited.insert(ElementIdentity(element: element)).inserted else {
@@ -305,6 +314,7 @@ final class LivePDDAXBackend: PDDAXBackend {
                 kAXChildrenAttribute as String,
             ]
         let values = copyMultiple(names, from: element)
+        try checkReadDeadline()
         let role = values[kAXRoleAttribute as String].map(AXValueFormatter.string(from:)) ?? "AXUnknown"
         let value = values[kAXValueAttribute as String].map(AXValueFormatter.string(from:))
         let title = values[kAXTitleAttribute as String].map(AXValueFormatter.string(from:))
@@ -345,13 +355,20 @@ final class LivePDDAXBackend: PDDAXBackend {
             let value = rawClass.lowercased()
             return value.contains("chat-list-box") || value.contains("conversation-list")
         }
-        let children = childElements.map {
-            walk(
+        let children = try childElements.map {
+            try walk(
                 $0, parent: token, depth: depth + 1, nodes: &nodes,
                 insideConversationList: childIsInsideConversationList
             )
         }
         return AXNodeSnapshot(role: role, attributes: attributes, actions: Array(actions), children: children)
+    }
+
+    private func checkReadDeadline() throws {
+        if let readDeadline, ContinuousClock().now >= readDeadline {
+            throw OperationTimeout(stage: "AX-read")
+        }
+        try Task.checkCancellation()
     }
 
     private func frame(position: CFTypeRef?, size: CFTypeRef?) -> CGRect {

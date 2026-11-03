@@ -2,6 +2,27 @@ import XCTest
 @testable import PDDAXReader
 
 final class LiveAutoReplyCodexSmokeTests: XCTestCase {
+    func testLiveCodexSelectsVerifiedM880CardImageWithoutCustomerDelivery() async throws {
+        guard ProcessInfo.processInfo.environment["PDD_LIVE_IMAGE_CODEX_SMOKE"] == "1" else {
+            throw XCTSkip("set PDD_LIVE_IMAGE_CODEX_SMOKE=1 for read-only dataset image selection")
+        }
+        let temporary = FileManager.default.temporaryDirectory.appendingPathComponent("pdd-live-image-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: temporary) }
+        let message = PDDChatMessage(id: "synthetic-card-sample", sender: .customer,
+            content: "I am asking about the M880 attendance machine. Please send me a sample picture of its compatible paper attendance card so I can see what the card looks like.",
+            displayTime: nil, kind: .text, capturedAt: Date())
+        let timeline = try AutoReplyTimeline.make(messages: [message])
+        let capture = try AutoReplyCapture(uid: "GZC-999999998", fullHistory: [message], batch: timeline.freeze(after: .empty),
+            customerCursor: timeline.cursor, unexpectedServiceMessageIDs: [])
+        let result = try await AutoReplyCodexGenerator(executableURL: XCTUnwrap(CodexInstallation.resolve()),
+            sessionRegistry: CodexSessionRegistry(rootDirectory: temporary), loginStatusProvider: CodexLoginCache(),
+            timeout: 180).generate(capture)
+        XCTAssertFalse(result.outgoingImages.isEmpty, "A verified card sample exists in the configured dataset")
+        XCTAssertEqual(result.action, .reply)
+        for image in result.outgoingImages { try image.verify(in: temporary) }
+        print("LIVE_IMAGE_REPLY=\(result.reply)")
+        print("LIVE_IMAGE_PATHS=\(result.outgoingImages.map(\.datasetRelativePath))")
+    }
     func testLiveChatGPTCodexGeneratesReplyFromPackagedV2Evidence() async throws {
         guard ProcessInfo.processInfo.environment["PDD_LIVE_CODEX_SMOKE"] == "1" else {
             throw XCTSkip("set PDD_LIVE_CODEX_SMOKE=1 to run the real local Codex smoke test")

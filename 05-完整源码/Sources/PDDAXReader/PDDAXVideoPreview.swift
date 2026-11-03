@@ -134,6 +134,7 @@ final class PDDAXVideoPreviewOpener: PDDVideoPreviewOpening {
     }
 
     func close() async {
+        if let lease = PDDUIOperationContext.lease, (try? lease.validate()) == nil { return }
         guard let application = NSRunningApplication.runningApplications(
             withBundleIdentifier: "com.pinduoduo.merchantMac"
         ).first else { return }

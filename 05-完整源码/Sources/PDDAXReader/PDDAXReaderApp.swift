@@ -24,11 +24,13 @@ struct PDDAXReaderApp: App {
     }
 
     private var windowTitle: String {
+        let title: String
         switch mode {
-        case .reader: return BilingualText.lines("拼多多 AX 读取器", "Pinduoduo AX Reader")
-        case .singleParse: return BilingualText.lines("拼多多 AX 单次解析测试器", "Pinduoduo AX Snapshot Tester")
-        case .autoReply: return BilingualText.lines("拼多多全自动客服", "Pinduoduo Automatic Customer Service")
-        case .taskIsolationCandidate: return "pinduodou_automation"
+        case .reader: title = BilingualText.lines("拼多多 AX 读取器", "Pinduoduo AX Reader")
+        case .singleParse: title = BilingualText.lines("拼多多 AX 单次解析测试器", "Pinduoduo AX Snapshot Tester")
+        case .autoReply: title = BilingualText.lines("拼多多全自动客服", "Pinduoduo Automatic Customer Service")
+        case .taskIsolationCandidate: title = AppBuildInfo.displayName
         }
+        return "\(title) \(AppBuildInfo.versionLabel)"
     }
 }

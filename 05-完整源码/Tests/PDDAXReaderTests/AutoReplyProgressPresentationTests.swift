@@ -2,6 +2,16 @@ import XCTest
 @testable import PDDAXReader
 
 final class AutoReplyProgressPresentationTests: XCTestCase {
+    func testOmittedReplyShowsOmittedAndNoLongerWaitsForSend() {
+        var omitted = job(state: .completed)
+        omitted.deliveryOutcome = .notSent
+        omitted.omittedAt = Date()
+        XCTAssertTrue(AutoReplyProgressPresentation.jobStageName(omitted).contains("Omitted"))
+        XCTAssertNil(AutoReplyProgressPresentation.progressValue(currentUIOwner: nil, jobs: [omitted]))
+        let headline = AutoReplyProgressPresentation.headline(isRunning: true, currentUIOwner: nil,
+            jobs: [omitted], liveGenerationCount: 0)
+        XCTAssertFalse(headline.contains("waiting to send"))
+    }
     func testMessageSourceLabelDistinguishesAXAndProvisionalOCR() {
         let axImage = PDDChatMessage(
             id: "middlePanel_list_100", sender: .customer, content: "[图片]",
@@ -74,7 +84,7 @@ final class AutoReplyProgressPresentationTests: XCTestCase {
             AutoReplyProgressPresentation.headline(
                 isRunning: true, currentUIOwner: nil, jobs: [], liveGenerationCount: 0
             ),
-            BilingualText.lines("等待截图红点；无红点不读取正文、不生成、不发送", "Waiting for a screenshot red dot; without one, no text is read, generated, or sent")
+            BilingualText.lines("等待新消息；发送后复查并核对逐条提交记录", "Waiting for new messages; post-send checks verify per-message submission receipts")
         )
     }
 
@@ -138,7 +148,7 @@ final class AutoReplyProgressPresentationTests: XCTestCase {
                 isRunning: true, currentUIOwner: nil, jobs: [], liveGenerationCount: 0,
                 latestVideoStatus: status
             ),
-            BilingualText.lines("等待截图红点；无红点不读取正文、不生成、不发送", "Waiting for a screenshot red dot; without one, no text is read, generated, or sent")
+            BilingualText.lines("等待新消息；发送后复查并核对逐条提交记录", "Waiting for new messages; post-send checks verify per-message submission receipts")
         )
     }
 

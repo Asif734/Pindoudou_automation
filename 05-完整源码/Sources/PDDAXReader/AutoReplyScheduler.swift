@@ -3,6 +3,7 @@ import Foundation
 struct AutoReplyDiscovery: Equatable, Sendable {
     let uid: String
     let hasUnreadEvidence: Bool
+    var hasUncapturedCustomerMessages = false
 }
 
 enum AutoReplyDeliveryResult: Equatable, Sendable {
@@ -19,6 +20,10 @@ enum AutoReplyTransferResult: Equatable, Sendable {
 
 @MainActor
 protocol AutoReplyAutomationDriver: AnyObject {
+    func visibleConversationsSnapshot() -> [PDDConversationLocator]?
+    func send(uid: String, text: String, outgoingImages: [DatasetReplyImage], deliveryID: UUID,
+              expectedCustomerCursor: AutoReplyCursor, expectedCustomerMessageIDs: Set<String>,
+              lease: UIOperationLease) async throws -> AutoReplyDeliveryResult
     func discover() async throws -> [AutoReplyDiscovery]
     func capture(uid: String, after cursor: AutoReplyCursor) async throws -> AutoReplyCapture
     func preflight(uid: String, after cursor: AutoReplyCursor) async throws -> AutoReplyCapture?
@@ -79,6 +84,14 @@ protocol AutoReplyAutomationDriver: AnyObject {
 }
 
 extension AutoReplyAutomationDriver {
+    func visibleConversationsSnapshot() -> [PDDConversationLocator]? { nil }
+    func send(uid: String, text: String, outgoingImages: [DatasetReplyImage], deliveryID: UUID,
+              expectedCustomerCursor: AutoReplyCursor, expectedCustomerMessageIDs: Set<String>,
+              lease: UIOperationLease) async throws -> AutoReplyDeliveryResult {
+        guard outgoingImages.isEmpty else { return .failedBeforeSend("驱动不支持发送图片") }
+        return try await send(uid: uid, text: text, expectedCustomerCursor: expectedCustomerCursor,
+            expectedCustomerMessageIDs: expectedCustomerMessageIDs, lease: lease)
+    }
     func transferToAnyHuman(
         uid: String, lease: UIOperationLease
     ) async throws -> AutoReplyTransferResult {
@@ -223,12 +236,18 @@ final class AutoReplyScheduler: ObservableObject {
     private let now: @Sendable () -> Date
     private let resourceMonitor: any RuntimeResourceMonitoring
     private let uiOperationTimeoutOverride: Duration?
+    private let generationTimeout: Duration
     private var backgroundLifecycleHandler: @Sendable (Int, Bool) async -> Void
     private var backgroundLifecycleRevision = 0
     private let uiLeaseRegistry = UIOperationLeaseRegistry()
     private var state: AutoReplyPersistentState
     private var checkpointToken: AutoReplyCheckpointToken?
     private var liveGenerationJobIDs: Set<UUID> = []
+    private var generationAttempts: [UUID: UUID] = [:]
+    private var generationTasks: [UUID: Task<Void, Never>] = [:]
+    private var workTurnsSinceDiscovery = 0
+    private var nextWorkLane = 0
+    private var lastTurnWasTail = false
     private var lastDiscoveryAt = Date.distantPast
     private var pendingFastDiscoveryAttempts = 0
     private var ordinaryCaptureAuthorizations = Set<String>()
@@ -249,6 +268,7 @@ final class AutoReplyScheduler: ObservableObject {
         resourceMonitor: (any RuntimeResourceMonitoring)? = nil,
         codexExecutablePath: String? = nil,
         uiOperationTimeout: Duration? = nil,
+        generationTimeout: Duration = .seconds(210),
         backgroundStopHandler: @escaping @Sendable () async -> Void = {},
         now: @escaping @Sendable () -> Date = { Date() }
     ) throws {
@@ -265,11 +285,13 @@ final class AutoReplyScheduler: ObservableObject {
         )
         self.codexExecutablePath = codexExecutablePath
         self.uiOperationTimeoutOverride = uiOperationTimeout
+        self.generationTimeout = generationTimeout
         self.backgroundLifecycleHandler = { _, enabled in
             if !enabled { await backgroundStopHandler() }
         }
         concurrencyPolicy = AdaptiveConcurrencyPolicy(physicalMemoryBytes: physicalMemoryBytes)
         state = try store.loadRecoveringInterruptedWork(now: now())
+        ordinaryCaptureAuthorizations = Set(state.pendingCaptureRequests.filter { $0.kind == .ordinary }.map(\.uid))
         driver.restoreConversationLocators(state.conversationLocatorsByUID)
         driver.restoreConversationCaptureState(
             baselinedUIDs: state.axFirstBaselinedUIDs,
@@ -326,9 +348,50 @@ final class AutoReplyScheduler: ObservableObject {
             state.answeredCursors[latestJob.uid] = batch.startCursor
             migratedBlockingState = true
         }
+        // Recover the latest known-unsent lookup failure from older builds.
+        // Sent/uncertain deliveries and superseded jobs are never replayed.
+        for index in state.jobs.indices {
+            let job = state.jobs[index]
+            guard job.state == .failed, job.deliveryOutcome == .notSent,
+                  !job.sendWasInvoked, job.outgoingImages.isEmpty, job.replyAction == .reply,
+                  job.lastError?.contains("目标消息") == true,
+                  let batch = job.capture.batch,
+                  !state.jobs.contains(where: { $0.uid == job.uid && $0.sequence > job.sequence })
+            else { continue }
+            state.nextSequence = max(state.nextSequence, state.jobs.map(\.sequence).max() ?? 0) + 1
+            let recovered = AutoReplyJob(id: UUID(), uid: job.uid, sequence: state.nextSequence,
+                state: job.reply == nil ? .queued : .ready, capture: job.capture, reply: job.reply,
+                generationDiagnostic: job.generationDiagnostic, deliveryOutcome: .notSent,
+                confirmedServiceMessageID: nil, retries: 0, nextAttemptAt: nil,
+                lastError: "旧版目标消息定位失败；已恢复未发送回复，等待重试",
+                customerRevision: job.customerRevision + 1,
+                imageAttachments: job.imageAttachments, videoAttachments: job.videoAttachments,
+                imageCaptureAttempted: job.imageCaptureAttempted)
+            state.jobs.append(recovered)
+            if state.answeredCursors[job.uid] == batch.endCursor {
+                state.answeredCursors[job.uid] = batch.startCursor
+            }
+            state.events.append(.init(id: UUID(), timestamp: now(), uid: job.uid,
+                kind: "unsent-lookup-recovered", detail: "source=\(job.id) retry=\(recovered.id) sequence=\(recovered.sequence)"))
+            AutomationStepLog.record(root: store.rootDirectory, uid: job.uid,
+                step: "unsent-lookup-recovered", detail: "source=\(job.id) retry=\(recovered.id) sequence=\(recovered.sequence)")
+            migratedBlockingState = true
+        }
         if migratedBlockingState { try store.save(state) }
         checkpointToken = try transactionalStore.loadCheckpoint().token
         jobs = state.jobs
+        // Recover the narrow crash window between persisting an omission and
+        // archiving it. An archive problem stays local to that historical job.
+        for job in state.jobs where job.omittedAt != nil && job.reply != nil {
+            let record = store.rootDirectory.appendingPathComponent("archive/records/\(job.id.uuidString).json")
+            if !FileManager.default.fileExists(atPath: record.path) {
+                do { try transactionalStore.archiveTerminal(job) }
+                catch {
+                    AutomationStepLog.record(root: store.rootDirectory, uid: job.uid,
+                        step: "omitted-reply-archive-failed", detail: error.localizedDescription)
+                }
+            }
+        }
     }
 
     func setBackgroundLifecycleHandler(
@@ -339,6 +402,7 @@ final class AutoReplyScheduler: ObservableObject {
 
     func start() {
         guard !isRunning else { return }
+        AutomationStepLog.record(root: store.rootDirectory, uid: nil, step: "automation-started")
         isRunning = true
         backgroundLifecycleRevision += 1
         let revision = backgroundLifecycleRevision
@@ -346,11 +410,24 @@ final class AutoReplyScheduler: ObservableObject {
     }
 
     func stop() {
+        AutomationStepLog.record(root: store.rootDirectory, uid: nil, step: "automation-stopped")
         isRunning = false
         backgroundLifecycleRevision += 1
         let revision = backgroundLifecycleRevision
         let operationID = activeUIOperationID
         uiLeaseRegistry.revokeAll()
+        for index in state.jobs.indices where generationAttempts[state.jobs[index].id] != nil {
+            if state.jobs[index].state == .generating {
+                state.jobs[index].state = .queued
+                state.jobs[index].nextAttemptAt = nil
+            }
+        }
+        generationAttempts.removeAll()
+        liveGenerationJobIDs.removeAll()
+        generationTasks.values.forEach { $0.cancel() }
+        generationTasks.removeAll()
+        syncJobs()
+        try? persist()
         if let operationID {
             Task { [driver] in
                 await driver.revokeCurrentUIOperation(operationID: operationID)
@@ -377,6 +454,10 @@ final class AutoReplyScheduler: ObservableObject {
     var pendingVideoBatchesSnapshot: [PDDPendingVideoBatch] { state.pendingVideoBatches }
 
     func requestVideoRecovery(uid: String, messageID: String) {
+        guard !state.jobs.contains(where: { job in
+            job.uid == uid && job.omittedAt != nil
+                && (job.capture.batch?.events.contains { $0.messageID == messageID } ?? false)
+        }) else { return }
         let pendingCapture = state.pendingVideoBatches.first(where: {
             $0.uid == uid && $0.expectedMessageIDs.contains(messageID)
         })?.capture
@@ -399,6 +480,12 @@ final class AutoReplyScheduler: ObservableObject {
     }
 
     func receiveVideoTransferEvent(_ event: PDDVideoTransferEvent) async {
+        if let closed = try? await CustomerTransferPolicyStore.shared.closedMessageIDs(root: store.rootDirectory, uid: event.uid),
+           closed.contains(event.messageID) {
+            appendEvent(uid: event.uid, kind: "video-closed-message-ignored", detail: event.messageID)
+            try? persist()
+            return
+        }
         latestVideoStatus = PDDVideoProgressStatus(event: event)
         onStateChange?()
         appendEvent(
@@ -494,37 +581,53 @@ final class AutoReplyScheduler: ObservableObject {
             await drainDeferredVideoTransferEvents()
             _ = launchQueuedGenerations()
 
-            if state.consecutiveDeliveryCount >= 3 {
-                try await performDiscovery()
+            if state.consecutiveDeliveryCount >= 3 || workTurnsSinceDiscovery >= 3
+                || (workTurnsSinceDiscovery > 0 && now().timeIntervalSince(lastDiscoveryAt) >= 5) {
+                workTurnsSinceDiscovery = 0
                 state.consecutiveDeliveryCount = 0
+                try await performDiscovery()
                 try persist()
                 return
             }
 
-            if let readyIndex = nextReadyJobIndex() {
-                try await deliverJob(at: readyIndex)
-                if state.jobs.indices.contains(readyIndex),
-                   state.jobs[readyIndex].state == .completed,
-                   state.jobs[readyIndex].deliveryOutcome != nil {
-                    state.consecutiveDeliveryCount += 1
-                    try persist()
+            if !lastTurnWasTail, let index = state.pendingCaptureRequests.firstIndex(where: {
+                $0.kind == .tail && ($0.nextAttemptAt.map { $0 <= now() } ?? true)
+            }) {
+                lastTurnWasTail = true
+                workTurnsSinceDiscovery += 1
+                let request = state.pendingCaptureRequests.remove(at: index)
+                try await capture(request: request)
+                return
+            }
+            lastTurnWasTail = false
+            // Rotate sends, transfers and captures. Failed attempts consume a
+            // turn too, so a backlog of broken jobs cannot starve discovery.
+            for offset in 0..<3 {
+                let lane = (nextWorkLane + offset) % 3
+                if lane == 0, let readyIndex = nextReadyJobIndex() {
+                    nextWorkLane = 1
+                    workTurnsSinceDiscovery += 1
+                    try await deliverJob(at: readyIndex)
+                    if state.jobs.indices.contains(readyIndex),
+                       state.jobs[readyIndex].state == .completed,
+                       state.jobs[readyIndex].deliveryOutcome != nil {
+                        state.consecutiveDeliveryCount += 1
+                        try persist()
+                    }
+                    return
                 }
-                return
-            }
-
-            if let transferIndex = nextPendingTransferTaskIndex() {
-                try await executeTransferTask(at: transferIndex)
-                return
-            }
-
-            if let request = nextSupplementCaptureRequest() {
-                try await capture(request: request)
-                return
-            }
-
-            if let request = nextCaptureRequest() {
-                try await capture(request: request)
-                return
+                if lane == 1, let transferIndex = nextPendingTransferTaskIndex() {
+                    nextWorkLane = 2
+                    workTurnsSinceDiscovery += 1
+                    try await executeTransferTask(at: transferIndex)
+                    return
+                }
+                if lane == 2, let request = nextSupplementCaptureRequest() ?? nextCaptureRequest() {
+                    nextWorkLane = 0
+                    workTurnsSinceDiscovery += 1
+                    try await capture(request: request)
+                    return
+                }
             }
 
             let discoveryInterval = pendingFastDiscoveryAttempts > 0 ? 0.2 : 1.0
@@ -551,13 +654,10 @@ final class AutoReplyScheduler: ObservableObject {
             try await driver.discover(lease: lease)
         }
         if pendingFastDiscoveryAttempts > 0 { pendingFastDiscoveryAttempts -= 1 }
-        let unreadUIDs = Set(discoveries.filter(\.hasUnreadEvidence).map(\.uid))
-        ordinaryCaptureFailureCounts = ordinaryCaptureFailureCounts.filter {
-            unreadUIDs.contains($0.key)
-        }
+        try await updateCustomerVisibility(driver.visibleConversationsSnapshot())
         var changed = false
         for discovery in discoveries
-        where discovery.hasUnreadEvidence {
+        where discovery.hasUnreadEvidence || discovery.hasUncapturedCustomerMessages {
             if scheduleSupplementCaptureIfActive(uid: discovery.uid) {
                 changed = true
             } else {
@@ -565,6 +665,25 @@ final class AutoReplyScheduler: ObservableObject {
                 let before = state.pendingCaptureRequests.count
                 enqueueCapture(discovery.uid, kind: .ordinary)
                 changed = changed || state.pendingCaptureRequests.count != before
+            }
+        }
+        // Recover captured-but-unsubmitted messages even after PDD clears its red dot.
+        for (uid, pendingIDs) in try CustomerMessageReceipts(root: store.rootDirectory).awaitingSubmission() {
+            var known = Set<String>()
+            for job in state.jobs where job.uid == uid {
+                known.formUnion(job.capture.batch?.events.map(\.messageID) ?? [])
+                known.formUnion(job.pendingSupplement?.batch?.events.map(\.messageID) ?? [])
+            }
+            for pending in state.pendingVideoBatches where pending.uid == uid {
+                known.formUnion(pending.capture.batch?.events.map(\.messageID) ?? [])
+            }
+            let closed = try await CustomerTransferPolicyStore.shared.closedMessageIDs(root: store.rootDirectory, uid: uid)
+            let missing = pendingIDs.subtracting(known).subtracting(closed)
+            if !missing.isEmpty {
+                enqueueCapture(uid, kind: .tail)
+                appendEvent(uid: uid, kind: "capture-submission-gap-recovered",
+                    detail: "message_ids=\(missing.sorted().joined(separator: ","))")
+                changed = true
             }
         }
         if changed {
@@ -577,9 +696,126 @@ final class AutoReplyScheduler: ObservableObject {
         guard deliveryEnabled, !realDeliveryPausedForPersistence else { return nil }
         return state.jobs.indices
             .filter { state.jobs[$0].state == .ready }
+            .filter { state.jobs[$0].customerMissingSince.map { now().timeIntervalSince($0) < 600 } ?? true }
             .filter { state.jobs[$0].nextAttemptAt.map { $0 <= now() } ?? true }
             .filter { isHeadOfLine($0) }
             .min { state.jobs[$0].sequence < state.jobs[$1].sequence }
+    }
+
+    private func customerIsVisible(_ uid: String, in visible: [PDDConversationLocator]) -> Bool? {
+        let known = state.conversationLocatorsByUID[uid]
+        guard uid.hasPrefix("PDD-") || known != nil else { return nil }
+        if visible.contains(where: { locator in
+            PDDConversationKey.make(locator: locator) == uid
+                || PDDConversationKey.make(locator: .init(nickname: locator.nickname)) == uid
+                || (known?.normalizedIdentifier != nil && known?.normalizedIdentifier == locator.normalizedIdentifier)
+                || (known != nil && known?.normalizedNickname == locator.normalizedNickname)
+        }) { return true }
+        if let known, visible.contains(where: { known.couldBeSameDisplayedCustomer(as: $0) }) {
+            return nil
+        }
+        return false
+    }
+
+    private func resetCustomerAbsence(_ uid: String) {
+        let indexes = state.jobs.indices.filter {
+            state.jobs[$0].uid == uid && [.queued, .generating, .ready].contains(state.jobs[$0].state)
+                && state.jobs[$0].customerMissingSince != nil
+        }
+        guard !indexes.isEmpty else { return }
+        for index in indexes { state.jobs[index].customerMissingSince = nil }
+        appendEvent(uid: uid, kind: "reply-customer-visible", detail: "Customer visible again; absence timer reset")
+    }
+
+    private func updateCustomerVisibility(_ visible: [PDDConversationLocator]?) async throws {
+        let activeStates: Set<AutoReplyJobState> = [.queued, .generating, .ready]
+        let uids = Set(state.jobs.filter { activeStates.contains($0.state) }.map(\.uid))
+        var changed = false
+        for uid in uids.sorted() {
+            let indexes = state.jobs.indices.filter { state.jobs[$0].uid == uid && activeStates.contains(state.jobs[$0].state) }
+            guard let visible, let present = customerIsVisible(uid, in: visible) else {
+                if indexes.contains(where: { state.jobs[$0].customerMissingSince != nil }) {
+                    for index in indexes { state.jobs[index].customerMissingSince = nil }
+                    appendEvent(uid: uid, kind: "reply-customer-presence-uncertain",
+                        detail: "Absence timer cleared: unreadable list or ambiguous masked customer name; not proof of absence")
+                    changed = true
+                }
+                continue
+            }
+            if present {
+                if indexes.contains(where: { state.jobs[$0].customerMissingSince != nil }) {
+                    resetCustomerAbsence(uid)
+                    changed = true
+                }
+                continue
+            }
+            let since = indexes.compactMap { state.jobs[$0].customerMissingSince }.min() ?? now()
+            if !indexes.contains(where: { state.jobs[$0].customerMissingSince != nil }) {
+                let labels = visible.map(\.normalizedNickname).joined(separator: ",")
+                appendEvent(uid: uid, kind: "reply-customer-absent", detail: "Customer absent from conversation list; omit after 600s; visible_count=\(visible.count) visible_labels=\(labels)")
+            }
+            for index in indexes where state.jobs[index].customerMissingSince == nil {
+                state.jobs[index].customerMissingSince = since
+                changed = true
+            }
+            if now().timeIntervalSince(since) >= 600 {
+                try await omitAbsentCustomerWork(uid: uid, at: now())
+                changed = true
+            }
+        }
+        if changed { syncJobs(); try persist() }
+    }
+
+    private func omitAbsentCustomerWork(uid: String, at date: Date) async throws {
+        let jobIDs = Set(state.jobs.filter {
+            $0.uid == uid && [.queued, .generating, .ready].contains($0.state)
+        }.map(\.id))
+        var closed = Set(state.jobs.filter { jobIDs.contains($0.id) }.flatMap {
+            ($0.capture.batch?.events.map(\.messageID) ?? [])
+                + ($0.pendingSupplement?.batch?.events.map(\.messageID) ?? [])
+        })
+        closed.formUnion(state.pendingVideoBatches.filter { $0.uid == uid }.flatMap {
+            $0.capture.batch?.events.map(\.messageID) ?? []
+        })
+        for receipt in state.provisionalReceiptsByUID[uid] ?? [] where closed.contains(receipt.provisionalMessageID) {
+            if let actual = receipt.absorbedAXMessageID { closed.insert(actual) }
+        }
+        try await CustomerTransferPolicyStore.shared.omitMessages(root: store.rootDirectory, uid: uid, messageIDs: closed)
+        for index in state.jobs.indices where jobIDs.contains(state.jobs[index].id) {
+            let id = state.jobs[index].id
+            generationAttempts[id] = nil
+            liveGenerationJobIDs.remove(id)
+            generationTasks.removeValue(forKey: id)?.cancel()
+            state.jobs[index].state = .completed
+            state.jobs[index].deliveryOutcome = .notSent
+            state.jobs[index].omittedAt = date
+            state.jobs[index].lastError = "客户在会话列表中连续不可见超过10分钟，已省略旧回复"
+            state.jobs[index].nextAttemptAt = nil
+            state.jobs[index].durableAttemptOperationID = nil
+            state.jobs[index].sendWasInvoked = false
+            state.jobs[index].pendingSupplement = nil
+            state.jobs[index].supplementCapturePending = false
+            appendEvent(uid: uid, kind: "reply-omitted-customer-absent", detail: "job=\(id) absent_seconds=\(Int(date.timeIntervalSince(state.jobs[index].customerMissingSince ?? date))) sent=false")
+        }
+        for index in state.transferTasks.indices where state.transferTasks[index].uid == uid && state.transferTasks[index].state == .pending {
+            state.transferTasks[index].state = .failed
+        }
+        state.pendingCaptureRequests.removeAll { $0.uid == uid }
+        ordinaryCaptureAuthorizations.remove(uid)
+        ordinaryCaptureFailureCounts[uid] = nil
+        state.pendingVideoBatches.removeAll { $0.uid == uid }
+        state.deferredVideoTransferEvents.removeAll { $0.uid == uid }
+        if latestVideoStatus?.uid == uid { latestVideoStatus = nil }
+        do {
+            try CodexSessionRegistry(rootDirectory: store.rootDirectory).invalidate(uid: uid)
+        } catch {
+            appendEvent(uid: uid, kind: "omitted-reply-session-reset-failed", detail: error.localizedDescription)
+        }
+        syncJobs()
+        try persist()
+        for job in state.jobs where jobIDs.contains(job.id) && job.reply != nil {
+            try transactionalStore.archiveTerminal(job)
+        }
     }
 
     private func nextPendingTransferTaskIndex() -> Int? {
@@ -599,6 +835,7 @@ final class AutoReplyScheduler: ObservableObject {
     private func executeTransferTask(at index: Int) async throws {
         guard state.transferTasks.indices.contains(index) else { return }
         let task = state.transferTasks[index]
+        appendEvent(uid: task.uid, kind: "transfer-started", detail: "target=after-sales task=\(task.id)")
         let result: AutoReplyTransferResult
         do {
             result = try await performUI(stage: "transfer", uid: task.uid) { driver, lease in
@@ -621,6 +858,10 @@ final class AutoReplyScheduler: ObservableObject {
             let closedIDs = Set(state.jobs.filter { $0.uid == task.uid }
                 .flatMap { $0.capture.fullHistory.filter { $0.sender == .customer }.map(\.id) })
             for jobIndex in state.jobs.indices where state.jobs[jobIndex].uid == task.uid {
+                let jobID = state.jobs[jobIndex].id
+                generationAttempts[jobID] = nil
+                liveGenerationJobIDs.remove(jobID)
+                generationTasks.removeValue(forKey: jobID)?.cancel()
                 if [.discovered, .capturing, .queued, .generating, .ready].contains(state.jobs[jobIndex].state) {
                     state.jobs[jobIndex].state = .quarantined
                     state.jobs[jobIndex].lastError = "Closed after successful human handoff"
@@ -652,7 +893,17 @@ final class AutoReplyScheduler: ObservableObject {
 
     private func deliverJob(at index: Int) async throws {
         guard let reply = state.jobs[index].reply,
-              let batch = state.jobs[index].capture.batch else { return }
+              !reply.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              let batch = state.jobs[index].capture.batch else {
+            state.jobs[index].state = .failed
+            state.jobs[index].deliveryOutcome = .notSent
+            state.jobs[index].lastError = "任务缺少回复或客户批次；已隔离，其他会话继续"
+            appendEvent(uid: state.jobs[index].uid, kind: "invalid-ready-job-isolated",
+                detail: "job=\(state.jobs[index].id)")
+            syncJobs()
+            try persist()
+            return
+        }
         let uid = state.jobs[index].uid
         state.jobs[index].state = .sending
         state.jobs[index].durableAttemptOperationID = UUID()
@@ -663,6 +914,8 @@ final class AutoReplyScheduler: ObservableObject {
             return
         }
         state.jobs[index].sendWasInvoked = true
+        // Persist the follow-up scan before the send, so a crash cannot erase it.
+        enqueueCapture(uid, kind: .tail, baseCursor: batch.endCursor)
         do {
             try persist(sendCritical: true)
         } catch {
@@ -680,11 +933,15 @@ final class AutoReplyScheduler: ObservableObject {
         currentUIOwner = "send:\(state.jobs[index].uid)"
         defer { currentUIOwner = nil }
         let result: AutoReplyDeliveryResult
+        let outgoingImages = state.jobs[index].outgoingImages
+        let deliveryID = state.jobs[index].id
         do {
-            result = try await performUI(stage: "send", uid: uid) { driver, lease in
+            result = try await performUI(stage: outgoingImages.isEmpty ? "send" : "send-images", uid: uid) { driver, lease in
                 try await driver.send(
                     uid: uid,
                     text: reply,
+                    outgoingImages: outgoingImages,
+                    deliveryID: deliveryID,
                     expectedCustomerCursor: batch.endCursor,
                     expectedCustomerMessageIDs: Set(batch.events.map(\.messageID)),
                     lease: lease
@@ -706,7 +963,14 @@ final class AutoReplyScheduler: ObservableObject {
             state.jobs[index].state = .completed
             state.jobs[index].deliveryOutcome = .sent
             state.jobs[index].confirmedServiceMessageID = serviceMessageID
+            try CustomerMessageReceipts(root: store.rootDirectory).replied(state.jobs[index].capture, at: now())
             state.confirmedAutoReplyMessageIDsByUID[state.jobs[index].uid, default: []].insert(serviceMessageID)
+            if let key = batch.incomingHandoffKey {
+                try await CustomerTransferPolicyStore.shared.acknowledgeIncomingReply(
+                    root: store.rootDirectory, uid: uid, boundaryKey: key
+                )
+            }
+            appendEvent(uid: uid, kind: "reply-delivery-confirmed", detail: "service_message=\(serviceMessageID)")
             markProvisionalReceiptsAnswered(in: batch, uid: state.jobs[index].uid)
             enqueueTransferTaskIfNeeded(at: index)
             _ = state.advanceSourceAndPromoteSupplement(at: index)
@@ -735,14 +999,21 @@ final class AutoReplyScheduler: ObservableObject {
                 )
             }
         case .discardedBeforeSend(let reason):
+            if batch.incomingHandoffKey == nil {
+                state.jobs[index].durableAttemptOperationID = nil
+                state.jobs[index].sendWasInvoked = false
+                handleTaskUIFailure(at: index, reason: "\(reason)；未发送回复已保留，将重试")
+                break
+            }
             state.jobs[index].state = .failed
             state.jobs[index].deliveryOutcome = .notSent
             state.jobs[index].lastError = "\(reason)；已丢弃当前批次并继续"
             state.jobs[index].nextAttemptAt = nil
             state.jobs[index].durableAttemptOperationID = nil
             state.jobs[index].sendWasInvoked = false
-            state.answeredCursors[uid] = batch.endCursor
-            _ = state.advanceSourceAndPromoteSupplement(at: index)
+            // A superseded handoff is safe to cancel, but no-send is never a
+            // delivery receipt for customer messages.
+            _ = state.advanceSourceAndPromoteSupplement(at: index, advanceCursor: false)
             try transactionalStore.archiveTerminal(state.jobs[index])
         case .uncertain(let reason):
             try finalizeUncertainSend(at: index, batch: batch, reason: reason)
@@ -755,6 +1026,7 @@ final class AutoReplyScheduler: ObservableObject {
     private func launchQueuedGenerations() -> Bool {
         let queued = state.jobs.indices.filter {
             state.jobs[$0].state == .queued
+                && (state.jobs[$0].customerMissingSince.map { now().timeIntervalSince($0) < 600 } ?? true)
                 && (state.jobs[$0].nextAttemptAt.map { $0 <= now() } ?? true)
                 && isHeadOfLine($0)
         }
@@ -774,13 +1046,20 @@ final class AutoReplyScheduler: ObservableObject {
             let id = state.jobs[index].id
             let capture = state.jobs[index].capture
             state.jobs[index].state = .generating
+            appendEvent(uid: capture.uid, kind: "generation-dispatched", detail: "job=\(id)")
             liveGenerationJobIDs.insert(id)
-            Task { [weak self, generator] in
+            let attempt = UUID()
+            generationAttempts[id] = attempt
+            let deadline = capture.batch?.incomingHandoffKey != nil
+                ? min(generationTimeout, .seconds(75)) : generationTimeout
+            generationTasks[id] = Task { [weak self, generator] in
                 do {
-                    let result = try await generator.generate(capture)
-                    self?.generationFinished(jobID: id, result: .success(result))
+                    let result = try await withOperationDeadline(deadline, stage: "generation") {
+                        try await generator.generate(capture)
+                    }
+                    self?.generationFinished(jobID: id, attemptID: attempt, result: .success(result))
                 } catch {
-                    self?.generationFinished(jobID: id, result: .failure(error))
+                    self?.generationFinished(jobID: id, attemptID: attempt, result: .failure(error))
                 }
             }
         }
@@ -793,22 +1072,44 @@ final class AutoReplyScheduler: ObservableObject {
         return true
     }
 
-    private func generationFinished(jobID: UUID, result: Result<CodexReplyResult, Error>) {
+    private func generationFinished(jobID: UUID, attemptID: UUID, result: Result<CodexReplyResult, Error>) {
+        guard generationAttempts[jobID] == attemptID else { return }
+        generationAttempts[jobID] = nil
+        generationTasks[jobID] = nil
         liveGenerationJobIDs.remove(jobID)
         guard let index = state.jobs.firstIndex(where: { $0.id == jobID }),
               state.jobs[index].state == .generating else { return }
         switch result {
         case .success(let generated):
             state.jobs[index].reply = generated.reply
+            state.jobs[index].outgoingImages = generated.outgoingImages
             state.jobs[index].replyAction = generated.action
             state.jobs[index].transferReason = generated.transferReason
             state.jobs[index].generationDiagnostic = generated.diagnostic
+            if state.jobs[index].capture.batch?.incomingHandoffKey != nil {
+                state.jobs[index].replyAction = .reply
+                state.jobs[index].transferReason = .none
+            }
             state.jobs[index].state = .ready
+            appendEvent(uid: state.jobs[index].uid, kind: "generation-ready",
+                detail: "job=\(jobID) action=\(state.jobs[index].replyAction.rawValue)")
             enqueueTransferTaskIfNeeded(at: index)
             concurrencyPolicy.recordSuccess(now: now())
         case .failure(let error):
             state.jobs[index].retries += 1
             state.jobs[index].lastError = retryPolicy.boundedDescription(error)
+            appendEvent(uid: state.jobs[index].uid, kind: "generation-failed",
+                detail: "job=\(jobID) \(retryPolicy.boundedDescription(error))")
+            if state.jobs[index].capture.batch?.incomingHandoffKey != nil, !(error is CancellationError) {
+                state.jobs[index].reply = PDDAXIncomingTransfer.fallbackReply(history: state.jobs[index].capture.fullHistory)
+                state.jobs[index].replyAction = .reply
+                state.jobs[index].transferReason = .none
+                state.jobs[index].state = .ready
+                state.jobs[index].nextAttemptAt = nil
+                appendEvent(uid: state.jobs[index].uid, kind: "incoming-handoff-fallback-ready",
+                    detail: "Generation unavailable; acknowledge receipt without creating a transfer loop")
+                break
+            }
             if retryPolicy.isBackpressure(error) {
                 concurrencyPolicy.recordBackpressure(now: now())
             }
@@ -861,7 +1162,7 @@ final class AutoReplyScheduler: ObservableObject {
         reason: String,
         error: Error
     ) {
-        state.jobs[index].reply = "亲亲，这边系统暂时繁忙，我帮您转接人工客服处理～"
+        state.jobs[index].reply = "抱歉，这个问题需要同事继续协助，我现在为您转接。"
         state.jobs[index].replyAction = .replyThenTransfer
         state.jobs[index].transferReason = .troubleshootingExhausted
         state.jobs[index].state = .ready
@@ -879,11 +1180,19 @@ final class AutoReplyScheduler: ObservableObject {
         var deferred: [AutoReplyCaptureRequest] = []
         while !state.pendingCaptureRequests.isEmpty {
             let request = state.pendingCaptureRequests.removeFirst()
+            if request.nextAttemptAt.map({ $0 > now() }) == true {
+                deferred.append(request)
+                continue
+            }
             if request.kind == .ordinary {
-                guard ordinaryCaptureAuthorizations.remove(request.uid) != nil else { continue }
+                guard ordinaryCaptureAuthorizations.contains(request.uid) else { continue }
             }
             if request.kind == .supplement || request.kind == .videoRecovery
-                || !hasActiveJob(uid: request.uid) { return request }
+                || !hasActiveJob(uid: request.uid) {
+                if request.kind == .ordinary { ordinaryCaptureAuthorizations.remove(request.uid) }
+                state.pendingCaptureRequests.append(contentsOf: deferred)
+                return request
+            }
             deferred.append(request)
         }
         state.pendingCaptureRequests.append(contentsOf: deferred)
@@ -893,6 +1202,7 @@ final class AutoReplyScheduler: ObservableObject {
     private func nextSupplementCaptureRequest() -> AutoReplyCaptureRequest? {
         guard let index = state.pendingCaptureRequests.firstIndex(where: {
             guard $0.kind == .supplement && ($0.tailAttempt ?? 0) == 0 else { return false }
+            guard $0.nextAttemptAt.map({ $0 <= now() }) ?? true else { return false }
             guard let source = supplementSourceIndex(for: $0) else { return false }
             return isHeadOfLine(source)
         })
@@ -904,7 +1214,7 @@ final class AutoReplyScheduler: ObservableObject {
         let uid = request.uid
         currentUIOwner = "capture:\(uid)"
         defer { currentUIOwner = nil }
-        let startingCursor = request.kind == .ordinary
+        let startingCursor = request.kind == .ordinary || request.kind == .tail
             ? answeredCursor(uid)
             : request.baseCursor
         let sourceIndex = request.kind == .supplement
@@ -938,10 +1248,11 @@ final class AutoReplyScheduler: ObservableObject {
                         sourceJobID: request.sourceJobID
                     ))
                 } else {
-                    if let index = supplementSourceIndex(for: request) {
-                        state.jobs[index].supplementCapturePending = false
-                    }
-                    enqueueCapture(uid, kind: .ordinary)
+                    var retry = request
+                    retry.nextAttemptAt = now().addingTimeInterval(15)
+                    state.pendingCaptureRequests.append(retry)
+                    appendEvent(uid: uid, kind: "capture-retry-deferred",
+                        detail: "supplement retry_in=15s; other conversations continue")
                 }
             } else {
                 let failureCount = ordinaryCaptureFailureCounts[uid, default: 0] + 1
@@ -954,10 +1265,13 @@ final class AutoReplyScheduler: ObservableObject {
                         detail: "首次定位或采集失败；已移到队尾"
                     )
                 } else {
-                    ordinaryCaptureAuthorizations.remove(uid)
+                    if request.kind == .ordinary { ordinaryCaptureAuthorizations.insert(uid) }
+                    var retry = request
+                    retry.nextAttemptAt = now().addingTimeInterval(15)
+                    state.pendingCaptureRequests.append(retry)
                     appendEvent(
-                        uid: uid, kind: "capture-dropped",
-                        detail: "连续两次定位或采集失败；已删除本次请求并继续其他会话"
+                        uid: uid, kind: "capture-retry-deferred",
+                        detail: "连续采集失败；请求已保留，15 秒后重试，其他会话继续"
                     )
                 }
             }
@@ -966,18 +1280,31 @@ final class AutoReplyScheduler: ObservableObject {
         if request.kind == .ordinary {
             ordinaryCaptureFailureCounts[uid] = nil
         }
+        try CustomerMessageReceipts(root: store.rootDirectory).capture(rawCapture, at: now())
+        appendEvent(uid: uid, kind: "customer-messages-captured",
+            detail: "message_ids=\((rawCapture.batch?.customerMessageIDs ?? []).sorted().joined(separator: ","))")
         try reconcileVisibleReplies(in: rawCapture, uid: uid)
         let normalizedCapture = normalizeObservation(rawCapture, uid: uid)
         let capture: AutoReplyCapture
-        if request.kind == .ordinary {
+        if request.kind == .ordinary || request.kind == .tail {
             let closed = try await CustomerTransferPolicyStore.shared.closedMessageIDs(
                 root: store.rootDirectory, uid: uid)
-            let covered = coveredMessageIDs(uid: uid).union(closed)
+            let aliasCovered = confirmedAliasMessageIDs(in: normalizedCapture)
+            let covered = coveredMessageIDs(uid: uid).union(closed).union(aliasCovered)
+            if !aliasCovered.isEmpty {
+                appendEvent(uid: uid, kind: "masked-name-delivery-reconciled",
+                    detail: "Previously sent reply verified after its exact target message in this chat; covered_message_ids=\(aliasCovered.sorted().joined(separator: ","))")
+            }
             guard let filtered = captureByRemovingMessages(
                 normalizedCapture, messageIDs: covered
             ) else {
                 latestCapture = normalizedCapture
-                if normalizedCapture.customerCursor.count > startingCursor.count {
+                let inFlight = Set(state.jobs.filter {
+                    $0.uid == uid && [.queued, .generating, .ready, .sending].contains($0.state)
+                }.flatMap { $0.capture.batch?.events.map(\.messageID) ?? [] })
+                let observed = Set(normalizedCapture.batch?.events.map(\.messageID) ?? [])
+                if normalizedCapture.customerCursor.count > startingCursor.count,
+                   inFlight.isDisjoint(with: observed) {
                     state.answeredCursors[uid] = normalizedCapture.customerCursor
                 }
                 syncJobs()
@@ -989,6 +1316,18 @@ final class AutoReplyScheduler: ObservableObject {
             capture = normalizedCapture
         }
         latestCapture = capture
+        if request.kind == .tail, let batch = capture.batch,
+           let index = activeJobIndex(uid: uid) {
+            let count = state.jobs[index].pendingSupplement?.customerCursor.count ?? -1
+            if capture.customerCursor.count > count {
+                state.jobs[index].pendingSupplement = capture
+            }
+            appendEvent(uid: uid, kind: "post-send-capture-attached",
+                detail: "message_ids=\(batch.customerMessageIDs.sorted().joined(separator: ","))")
+            syncJobs()
+            try persist()
+            return
+        }
         if request.kind == .supplement {
             let sourceIndex = supplementSourceIndex(for: request)
             guard let index = sourceIndex else {
@@ -1214,7 +1553,7 @@ final class AutoReplyScheduler: ObservableObject {
         let cursor = baseCursor ?? answeredCursor(uid)
         let duplicate = state.pendingCaptureRequests.contains {
             $0.uid == uid && $0.kind == kind && $0.baseCursor == cursor
-                && $0.tailAttempt == tailAttempt && $0.sourceJobID == sourceJobID
+                && $0.sourceJobID == sourceJobID
         }
         guard !duplicate else { return }
         if kind == .ordinary && hasActiveJob(uid: uid) { return }
@@ -1258,8 +1597,7 @@ final class AutoReplyScheduler: ObservableObject {
     @discardableResult
     private func scheduleSupplementCaptureIfActive(uid: String) -> Bool {
         guard let index = activeJobIndex(uid: uid) else { return false }
-        guard !state.jobs[index].supplementCapturePending,
-              state.jobs[index].pendingSupplement == nil else { return false }
+        guard !state.jobs[index].supplementCapturePending else { return false }
         let baseCursor = state.jobs[index].capture.batch?.endCursor
             ?? state.jobs[index].capture.customerCursor
         state.jobs[index].supplementCapturePending = true
@@ -1296,12 +1634,12 @@ final class AutoReplyScheduler: ObservableObject {
                 TaskFailurePolicy.firstRetryDelay
             )
         case .parkRevision:
-            state.jobs[index].state = .quarantined
-            state.jobs[index].nextAttemptAt = nil
-            if state.jobs[index].pendingSupplement != nil
-                || state.jobs[index].supplementCapturePending {
-                _ = state.advanceSourceAndPromoteSupplement(at: index)
-            }
+            // Keep a known-unsent reply retryable without holding the UI or
+            // blocking other customers. A temporary AX failure must not consume it.
+            state.jobs[index].state = .ready
+            state.jobs[index].nextAttemptAt = now().addingTimeInterval(15)
+            appendEvent(uid: state.jobs[index].uid, kind: "reply-not-sent-retry-scheduled",
+                detail: "attempt=\(state.jobs[index].stageAttempt) retry_in=15s \(reason)")
         }
     }
 
@@ -1339,6 +1677,8 @@ final class AutoReplyScheduler: ObservableObject {
             throw error
         }
         let lease = uiLeaseRegistry.acquire(uid: uid)
+        AutomationStepLog.record(root: store.rootDirectory, uid: uid, step: "\(stage)-operation-started",
+            detail: "operation=\(lease.operationID)")
         activeUIOperationID = lease.operationID
         currentUIOwner = "\(stage):\(uid)"
         defer {
@@ -1350,19 +1690,32 @@ final class AutoReplyScheduler: ObservableObject {
         }
         do {
             let deadline = uiOperationTimeoutOverride ?? timeout(for: stage)
-            return try await withOperationDeadline(
+            let result = try await withOperationDeadline(
                 deadline,
                 stage: stage,
-                shouldDeferTimeout: { lease.isDeadlineSuspended }
+                shouldDeferTimeout: { lease.isDeadlineSuspended },
+                maximumDuration: deadline
             ) {
                 try lease.validate()
                 let value = try await operation(self.driver, lease)
                 try lease.validate()
                 return value
             }
+            AutomationStepLog.record(root: store.rootDirectory, uid: uid, step: "\(stage)-operation-completed",
+                detail: "operation=\(lease.operationID)")
+            return result
         } catch {
+            AutomationStepLog.record(root: store.rootDirectory, uid: uid, step: "\(stage)-operation-failed",
+                detail: "operation=\(lease.operationID) \(error.localizedDescription)")
             uiLeaseRegistry.revoke(operationID: lease.operationID)
-            await driver.revokeCurrentUIOperation(operationID: lease.operationID)
+            // Cleanup may itself be stuck. Revocation is synchronous above;
+            // never await an unbounded driver cleanup while holding the pump.
+            Task { [driver] in
+                _ = try? await withOperationDeadline(.seconds(1), stage: "ui-cleanup") {
+                    await driver.revokeCurrentUIOperation(operationID: lease.operationID)
+                    return true
+                }
+            }
             throw error
         }
     }
@@ -1452,6 +1805,23 @@ final class AutoReplyScheduler: ObservableObject {
             imageAttachments: capture.imageAttachments,
             videoAttachments: attachments
         ))
+    }
+
+    private func confirmedAliasMessageIDs(in capture: AutoReplyCapture) -> Set<String> {
+        let customerIDs = Set(capture.fullHistory.filter { $0.sender == .customer }.map(\.id))
+        return Set(state.jobs.filter { job in
+            guard job.uid != capture.uid, job.state == .completed, job.deliveryOutcome == .sent,
+                  let target = job.capture.batch?.events.last?.messageID,
+                  let index = capture.fullHistory.lastIndex(where: { $0.id == target && $0.sender == .customer })
+            else { return false }
+            // Text sender receipts may use a synthetic ax-send ID. In that
+            // case, also require the exact delivered reply after the exact
+            // target customer message; a sent flag alone is insufficient.
+            return capture.fullHistory.dropFirst(index + 1).contains { message in
+                message.sender == .service && (message.id == job.confirmedServiceMessageID
+                    || (job.reply?.isEmpty == false && message.content == job.reply))
+            }
+        }.flatMap { $0.capture.batch?.customerMessageIDs ?? [] }).intersection(customerIDs)
     }
 
     private func coveredMessageIDs(uid: String) -> Set<String> {
@@ -1705,6 +2075,7 @@ final class AutoReplyScheduler: ObservableObject {
     }
 
     private func appendEvent(uid: String?, kind: String, detail: String) {
+        AutomationStepLog.record(root: store.rootDirectory, uid: uid, step: kind, detail: detail)
         state.events.append(AutoReplyEvent(
             id: UUID(), timestamp: now(), uid: uid, kind: kind, detail: detail
         ))

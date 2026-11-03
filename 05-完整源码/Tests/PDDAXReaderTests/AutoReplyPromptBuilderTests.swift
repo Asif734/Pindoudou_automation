@@ -2,6 +2,22 @@ import XCTest
 @testable import PDDAXReader
 
 final class AutoReplyPromptBuilderTests: XCTestCase {
+    func testIncomingHandoffRepliesUsingHistoryWithoutInventingNewCustomerIntent() throws {
+        let history = [message("return", .customer, .text, "I want a seven-day no-reason return.")]
+        let timeline = try AutoReplyTimeline.make(messages: history)
+        let capture = AutoReplyCapture(uid: "customer", fullHistory: history,
+            batch: .incomingHandoff(key: "boundary", cursor: timeline.cursor),
+            customerCursor: timeline.cursor, unexpectedServiceMessageIDs: [])
+        let prompt = try AutoReplyPromptBuilder.build(capture: capture)
+        XCTAssertTrue(prompt.contains("<incoming_handoff_reply>"))
+        XCTAssertTrue(prompt.contains("不能等待客户再次发言"))
+        XCTAssertTrue(prompt.contains("I want a seven-day no-reason return."))
+        XCTAssertFalse(prompt.contains("转入后没有新客户消息时不生成回复"))
+        let target = try XCTUnwrap(prompt.components(separatedBy: "<target_customer_batch>")
+            .last?.components(separatedBy: "</target_customer_batch>").first)
+        XCTAssertTrue(target.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+    }
+
     func testPromptKeepsGreetingSeparateFromHistoricalIssuesAndUsesStoreIdentity() throws {
         let prompt = try AutoReplyPromptBuilder.build(capture: makePromptCapture())
         XCTAssertTrue(prompt.contains("你是 Grozziie（格志）店铺的客服助手"))
@@ -44,6 +60,12 @@ final class AutoReplyPromptBuilderTests: XCTestCase {
         XCTAssertTrue(prompt.contains("<target_customer_batch>"))
         XCTAssertTrue(prompt.contains("\"messageID\":\"B\""))
         XCTAssertTrue(prompt.contains("\"messageID\":\"C\""))
+        XCTAssertTrue(prompt.contains("<current_customer_message_for_intent>"))
+        let currentSection = try XCTUnwrap(prompt.components(
+            separatedBy: "<current_customer_message_for_intent>"
+        ).last?.components(separatedBy: "</current_customer_message_for_intent>").first)
+        XCTAssertTrue(currentSection.contains("\"messageID\":\"C\""))
+        XCTAssertFalse(currentSection.contains("\"messageID\":\"B\""))
         XCTAssertTrue(prompt.contains("<full_history.jsonl>"))
         XCTAssertTrue(prompt.contains("[图片]"), "图片只作为历史占位文本")
         XCTAssertTrue(prompt.contains("chat_image_attachments"))
@@ -86,7 +108,7 @@ final class AutoReplyPromptBuilderTests: XCTestCase {
     func testPromptRequiresBriefHumanLikeRepliesAndVariesUnclearFallbacks() throws {
         let prompt = try AutoReplyPromptBuilder.build(capture: makePromptCapture())
 
-        XCTAssertTrue(prompt.contains("像真人客服一样尽量简短地回复"))
+        XCTAssertTrue(prompt.contains("使用自然的店铺客服语气"))
         XCTAssertTrue(prompt.contains("不要连续重复完全相同的兜底话术"))
         XCTAssertTrue(prompt.contains("结合最近客服历史换一种自然说法"))
         XCTAssertTrue(prompt.contains("不要求客户重新描述或重复提问"))

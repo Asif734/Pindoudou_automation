@@ -168,7 +168,7 @@ final class AutoReplyStoreTests: XCTestCase {
         )
         source.sendWasInvoked = true
         source.pendingSupplement = capture(
-            uid: fixture.uid, digest: String(repeating: "8", count: 64)
+            uid: fixture.uid, digest: String(repeating: "8", count: 64), messageID: "m2"
         )
         var state = AutoReplyPersistentState.empty
         state.nextSequence = 1
@@ -416,9 +416,9 @@ final class AutoReplyStoreTests: XCTestCase {
         )
     }
 
-    private func capture(uid: String, digest: String) -> AutoReplyCapture {
+    private func capture(uid: String, digest: String, messageID: String = "m1") -> AutoReplyCapture {
         let event = ActionableCustomerEvent(
-            messageID: "m1",
+            messageID: messageID,
             kind: .text,
             content: "问题",
             displayTime: "10:00"
@@ -427,7 +427,7 @@ final class AutoReplyStoreTests: XCTestCase {
         return AutoReplyCapture(
             uid: uid,
             fullHistory: [PDDChatMessage(
-                id: "m1",
+                id: messageID,
                 sender: .customer,
                 content: "问题",
                 displayTime: "10:00",
@@ -438,7 +438,7 @@ final class AutoReplyStoreTests: XCTestCase {
                 startCursor: .empty,
                 endCursor: end,
                 events: [event],
-                targetCustomerJSONL: "{\"messageID\":\"m1\"}"
+                targetCustomerJSONL: "{\"messageID\":\"\(messageID)\"}"
             ),
             customerCursor: end,
             unexpectedServiceMessageIDs: []

@@ -63,7 +63,9 @@ enum AutoReplyProgressPresentation {
             .min(by: { priority($0.state) == priority($1.state)
                 ? $0.sequence < $1.sequence
                 : priority($0.state) < priority($1.state) }) {
-            let stage = BilingualText.split(stageName(active.state))
+            let stage = BilingualText.split(active.customerMissingSince != nil && active.state == .ready
+                ? BilingualText.lines("客户暂不在会话列表，连续10分钟后省略", "Customer absent; reply expires after 10 continuous minutes")
+                : stageName(active.state))
             if active.state == .generating {
                 return BilingualText.lines(
                     "\(active.uid) · \(stage.chinese) · CLI \(liveGenerationCount)",
@@ -79,7 +81,7 @@ enum AutoReplyProgressPresentation {
         if let lastRuntimeIssue, !lastRuntimeIssue.isEmpty {
             return BilingualText.lines("错误后继续扫描 · \(lastRuntimeIssue)", "Continuing to scan after an error · \(lastRuntimeIssue)")
         }
-        return BilingualText.lines("等待截图红点；无红点不读取正文、不生成、不发送", "Waiting for a screenshot red dot; without one, no text is read, generated, or sent")
+        return BilingualText.lines("等待新消息；发送后复查并核对逐条提交记录", "Waiting for new messages; post-send checks verify per-message submission receipts")
     }
 
     static func knowledgeSummary(_ diagnostic: KnowledgeRetrievalDiagnostic) -> String {
@@ -119,6 +121,12 @@ enum AutoReplyProgressPresentation {
     }
 
     static func jobStageName(_ job: AutoReplyJob) -> String {
+        if job.omittedAt != nil {
+            return BilingualText.lines("已省略 · 客户不可见超过10分钟", "Omitted · customer absent for 10 minutes")
+        }
+        if job.state == .ready, job.customerMissingSince != nil {
+            return BilingualText.lines("客户暂不在会话列表，连续10分钟后省略", "Customer absent; reply expires after 10 continuous minutes")
+        }
         if job.state == .completed, job.deliveryOutcome == .uncertain {
             return BilingualText.lines("已完成 · 发送结果不确定（不会自动重发）", "Completed · send result uncertain (will not resend automatically)")
         }
@@ -140,7 +148,7 @@ enum AutoReplyProgressPresentation {
         switch parts[0] {
         case "capture": stage = BilingualText.lines("AX 正在读取；失效时才启用尾部 OCR", "Reading with AX; tail OCR is used only if AX fails")
         case "preflight": stage = BilingualText.lines("发送前 AX 复查", "Pre-send AX check")
-        case "send": stage = BilingualText.lines("正在发送并回读确认", "Sending and reading back for confirmation")
+        case "send", "send-images": stage = BilingualText.lines("正在发送并回读确认", "Sending and reading back for confirmation")
         case "reconcile": stage = BilingualText.lines("只读核对发送结果", "Read-only send-result verification")
         case "image": stage = BilingualText.lines("正在从 AX 图片预览下载客户原图", "Downloading the original customer image from AX preview")
         case "transfer": stage = BilingualText.lines("正在无原因直接转人工", "Transferring directly to a human without a reason")

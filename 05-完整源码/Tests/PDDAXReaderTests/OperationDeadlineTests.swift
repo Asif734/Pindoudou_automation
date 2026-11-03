@@ -7,13 +7,27 @@ final class OperationDeadlineTests: XCTestCase {
         let result: String = try await withOperationDeadline(
             .milliseconds(20),
             stage: "capture",
-            shouldDeferTimeout: { true }
+            shouldDeferTimeout: { true },
+            maximumDuration: .milliseconds(150)
         ) {
             try await Task.sleep(for: .milliseconds(60))
             return "finished"
         }
 
         XCTAssertEqual(result, "finished")
+    }
+
+    func testSuspendedDeadlineStillHasFiniteHardLimit() async {
+        let started = Date()
+        do {
+            let _: String = try await withOperationDeadline(.milliseconds(15), stage: "preview",
+                shouldDeferTimeout: { true }, maximumDuration: .milliseconds(45)) {
+                await withUnsafeContinuation { (_: UnsafeContinuation<Void, Never>) in }
+                return "unreachable"
+            }
+            XCTFail("expected hard timeout")
+        } catch { XCTAssertEqual(error as? OperationTimeout, .init(stage: "preview")) }
+        XCTAssertLessThan(Date().timeIntervalSince(started), 0.3)
     }
 
     func testDeadlineReturnsWithoutWaitingForOperationThatIgnoresCancellation() async {

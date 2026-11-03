@@ -30,7 +30,8 @@ final class CustomerTransferPolicyTests: XCTestCase {
         let first = try await decide(store, root, "A", "1", .refundReturn, now)
         XCTAssertEqual(first.action, .reply)
         let second = try await decide(store, root, "A", "2", .refundReturn, now.addingTimeInterval(5))
-        XCTAssertEqual(second.action, .replyThenTransfer)
+        XCTAssertEqual(second.action, .reply)
+        XCTAssertEqual(second.count, 0)
         let missing = try await decide(store, root, "B", "3", .refundReturn, now, missing: true)
         XCTAssertEqual(missing.action, .replyThenTransfer)
         let technical = try await decide(store, root, "C", "4", .technical, now, missing: true)
@@ -39,6 +40,48 @@ final class CustomerTransferPolicyTests: XCTestCase {
             answerFound: false, issueHasNoSolution: false, proposedAction: .reply,
             proposedReason: .none, now: now)
         XCTAssertEqual(unclear.action, .reply)
+    }
+
+    func testIncomingHandoffResetsCounterOnceAndClosesPreBoundaryMessages() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = CustomerTransferPolicyStore()
+        let now = Date()
+        _ = try await decide(store, root, "A", "old-1", .humanRequest, now)
+        let oldSecond = try await decide(
+            store, root, "A", "old-2", .humanRequest, now.addingTimeInterval(5)
+        )
+        XCTAssertEqual(oldSecond.action, .replyThenTransfer)
+
+        let began = try await store.beginIncomingHandoff(
+            root: root,
+            uid: "A",
+            boundaryKey: "boundary-1",
+            priorMessageIDs: ["old-1", "old-2"]
+        )
+        XCTAssertTrue(began)
+        let repeated = try await store.beginIncomingHandoff(
+            root: root,
+            uid: "A",
+            boundaryKey: "boundary-1",
+            priorMessageIDs: ["old-1", "old-2"]
+        )
+        XCTAssertFalse(repeated)
+
+        let stale = try await decide(
+            store, root, "A", "old-2", .humanRequest, now.addingTimeInterval(10)
+        )
+        XCTAssertEqual(stale.action, .reply)
+        let firstNew = try await decide(
+            store, root, "A", "new-1", .humanRequest, now.addingTimeInterval(11)
+        )
+        XCTAssertEqual(firstNew.count, 1)
+        XCTAssertEqual(firstNew.action, .reply)
+        let secondNew = try await decide(
+            store, root, "A", "new-2", .humanRequest, now.addingTimeInterval(12)
+        )
+        XCTAssertEqual(secondNew.count, 2)
+        XCTAssertEqual(secondNew.action, .replyThenTransfer)
     }
 
     func testCompletedHandoffClosesOldMessagesAndResetsOnlyThatCustomer() async throws {

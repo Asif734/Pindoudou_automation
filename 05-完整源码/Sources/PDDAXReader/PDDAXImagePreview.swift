@@ -155,7 +155,7 @@ final class PDDAXImagePreviewResolver: PDDCustomerImageResolving {
         try clicker.doubleClick(at: CGPoint(x: candidate.frame.midX, y: candidate.frame.midY))
         defer {
             lease.resumeDeadline()
-            reader.closePreview()
+            if (try? lease.validate()) != nil { reader.closePreview() }
         }
         try lease.validate()
         let url = try await reader.waitForOriginalURL {
@@ -250,6 +250,10 @@ final class LivePDDImagePreviewReader: PDDImagePreviewReading {
         var previewWasOpen = false
         var previewMissingSince: Date?
         while true {
+            try Task.checkCancellation()
+            if now().timeIntervalSince(started) >= previewOpenTimeout + previewDownloadTimeout + previewLossGrace {
+                throw PDDCustomerImageError.previewDownloadTimedOut
+            }
             switch previewProbeProvider?() ?? probeLivePreview() {
             case .absent:
                 if previewWasOpen {

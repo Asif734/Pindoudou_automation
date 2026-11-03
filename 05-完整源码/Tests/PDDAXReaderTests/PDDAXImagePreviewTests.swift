@@ -176,23 +176,23 @@ final class PDDAXImagePreviewTests: XCTestCase {
         XCTAssertLessThan(elapsed, 2.3)
     }
 
-    func testOpenPreviewKeepsPollingWithoutURLDeadline() async throws {
+    func testOpenPreviewWithoutURLHasFiniteDeadline() async throws {
         var elapsed: TimeInterval = 0
-        let expected = URL(string: "https://chat-img.pddugc.com/second-image.jpeg")!
         let reader = LivePDDImagePreviewReader(
             previewOpenTimeout: 2,
             pollInterval: 0.2,
             now: { Date(timeIntervalSince1970: elapsed) },
             sleep: { seconds in elapsed += seconds },
             previewProbeProvider: {
-                .open(url: elapsed >= 120 ? expected : nil)
+                .open(url: nil)
             }
         )
 
-        let result = try await reader.waitForOriginalURL()
-
-        XCTAssertEqual(result, expected)
-        XCTAssertGreaterThanOrEqual(elapsed, 120)
+        do {
+            _ = try await reader.waitForOriginalURL()
+            XCTFail("expected bounded preview failure")
+        } catch { XCTAssertEqual(error as? PDDCustomerImageError, .previewDownloadTimedOut) }
+        XCTAssertLessThan(elapsed, 10)
     }
 }
 

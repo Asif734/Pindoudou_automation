@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 
 enum AutoReplyRevisionError: Error, Equatable {
@@ -17,8 +18,13 @@ struct AutoReplyRevision: Codable, Equatable, Hashable, Sendable {
     }
 
     static func derived(from capture: AutoReplyCapture, legacyOrdinal: Int) throws -> Self {
-        try Self(
-            digest: capture.batch?.endCursor.digest ?? capture.customerCursor.digest,
+        let cursorDigest = capture.batch?.endCursor.digest ?? capture.customerCursor.digest
+        let digest = capture.batch?.incomingHandoffKey.map { key in
+            SHA256.hash(data: Data("\(cursorDigest)\n\(key)".utf8))
+                .map { String(format: "%02x", $0) }.joined()
+        } ?? cursorDigest
+        return try Self(
+            digest: digest,
             ordinal: legacyOrdinal
         )
     }

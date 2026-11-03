@@ -19,6 +19,10 @@ struct AutoReplyView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
+            Text("\(AppBuildInfo.displayName) \(AppBuildInfo.versionLabel)")
+                .font(.title2.weight(.semibold))
+                .textSelection(.enabled)
+
             HStack(spacing: 10) {
                 Button {
                     model.isRunning ? model.stop() : model.start()
@@ -51,8 +55,8 @@ struct AutoReplyView: View {
             }
 
                 Text(BilingualText.lines(
-                    "范围：截图红点触发 · AX 权威读取正文 · AX 失效才用尾部 OCR · AX 点击和发送",
-                    "Scope: screenshot red-dot trigger · AX authoritative text · tail OCR only if AX fails · AX click and send"
+                    "范围：红点或新消息触发 · AX 读取 · 发送后复查 · 逐条核对 Codex 提交",
+                    "Scope: unread or new-message trigger · AX capture · post-send checks · per-message Codex receipts"
                 ))
                     .foregroundStyle(.secondary)
                     .font(.caption)
@@ -161,7 +165,7 @@ struct AutoReplyView: View {
                     }
                     .frame(maxWidth: .infinity, alignment: .leading)
                 } else {
-                    Text(BilingualText.lines("等待红点触发；无红点不会读取正文、生成或发送…", "Waiting for a red-dot trigger; without one, no text is read, generated, or sent…"))
+                    Text(BilingualText.lines("等待新消息；发送后会复查会话并核对提交记录…", "Waiting for new messages; conversations and submission receipts are rechecked after sending…"))
                         .foregroundStyle(.secondary)
                 }
             }
@@ -179,7 +183,12 @@ struct AutoReplyView: View {
                     Text(BilingualText.lines("客户游标：\(job.capture.customerCursor.count) · \(job.capture.customerCursor.digest.prefix(12))", "Customer cursor: \(job.capture.customerCursor.count) · \(job.capture.customerCursor.digest.prefix(12))"))
                         .font(.caption.monospaced())
                     if let reply = job.reply { Text(reply).lineLimit(3) }
-                    if let error = job.lastError { Text(BilingualText.lines("错误：\(error)", "Error: \(error)")).foregroundStyle(.red).font(.caption) }
+                    if let error = job.lastError {
+                        Text(job.omittedAt == nil
+                            ? BilingualText.lines("错误：\(error)", "Error: \(error)")
+                            : BilingualText.lines("原因：\(error)", "Reason: \(error)"))
+                            .foregroundStyle(job.omittedAt == nil ? .red : .secondary).font(.caption)
+                    }
                 }
                 .padding(.vertical, 4)
             }

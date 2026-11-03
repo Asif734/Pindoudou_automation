@@ -3,6 +3,26 @@ import XCTest
 
 @MainActor
 final class PDDLeaseValidatedBackendTests: XCTestCase {
+    func testOldTaskCannotBorrowNewCustomersLeaseAfterTimeout() throws {
+        let base = LeaseBackendSpy()
+        let gate = PDDUIOperationLeaseGate()
+        let backend = LeaseValidatedPDDAXBackend(base: base, gate: gate)
+        let registry = UIOperationLeaseRegistry()
+        let old = registry.acquire(uid: "old")
+        gate.activate(old)
+        let next = registry.acquire(uid: "next")
+        gate.activate(next)
+
+        try PDDUIOperationContext.$lease.withValue(old) {
+            XCTAssertThrowsError(try backend.setValue("stale reply", on: .init(rawValue: 1)))
+            XCTAssertThrowsError(try backend.performPress(.init(rawValue: 1)))
+        }
+        try PDDUIOperationContext.$lease.withValue(next) {
+            try backend.setValue("current reply", on: .init(rawValue: 1))
+        }
+        XCTAssertEqual(base.writeCount, 1)
+        XCTAssertEqual(base.pressCount, 0)
+    }
     func testRevokedLeasePreventsPressFromReachingLiveBackend() throws {
         let base = LeaseBackendSpy()
         let gate = PDDUIOperationLeaseGate()

@@ -25,6 +25,29 @@ actor CustomerTransferPolicyStore {
         var closedMessageIDs: Set<String> = []
         var windows: [String: Window] = [:]
         var decisions: [String: CustomerTransferDecision] = [:]
+        var incomingBoundaryKey: String?
+
+        private enum CodingKeys: String, CodingKey {
+            case closedMessageIDs, windows, decisions, incomingBoundaryKey
+        }
+
+        init() {}
+
+        init(from decoder: Decoder) throws {
+            let values = try decoder.container(keyedBy: CodingKeys.self)
+            closedMessageIDs = try values.decodeIfPresent(
+                Set<String>.self, forKey: .closedMessageIDs
+            ) ?? []
+            windows = try values.decodeIfPresent(
+                [String: Window].self, forKey: .windows
+            ) ?? [:]
+            decisions = try values.decodeIfPresent(
+                [String: CustomerTransferDecision].self, forKey: .decisions
+            ) ?? [:]
+            incomingBoundaryKey = try values.decodeIfPresent(
+                String.self, forKey: .incomingBoundaryKey
+            )
+        }
     }
     private struct State: Codable {
         var customers: [String: Customer] = [:]
@@ -40,6 +63,26 @@ actor CustomerTransferPolicyStore {
         try load(root: root).customers[uid]?.closedMessageIDs ?? []
     }
 
+    func omitMessages(root: URL, uid: String, messageIDs: Set<String>) throws {
+        var state = try load(root: root)
+        var customer = state.customers[uid] ?? Customer()
+        customer.closedMessageIDs.formUnion(messageIDs)
+        state.customers[uid] = customer
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        try JSONEncoder().encode(state).write(to: root.appendingPathComponent("customer-transfer-policy.json"), options: .atomic)
+    }
+
+    func acknowledgeIncomingReply(root: URL, uid: String, boundaryKey: String) throws {
+        var state = try load(root: root)
+        var customer = state.customers[uid] ?? Customer()
+        customer.closedMessageIDs.insert(FrozenCustomerBatch.incomingHandoffPrefix + boundaryKey)
+        state.customers[uid] = customer
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        try JSONEncoder().encode(state).write(
+            to: root.appendingPathComponent("customer-transfer-policy.json"), options: .atomic
+        )
+    }
+
     func completeHandoff(root: URL, uid: String, messageIDs: Set<String>) throws {
         var state = try load(root: root)
         var customer = state.customers[uid] ?? Customer()
@@ -51,6 +94,29 @@ actor CustomerTransferPolicyStore {
         try JSONEncoder().encode(state).write(to: root.appendingPathComponent("customer-transfer-policy.json"), options: .atomic)
     }
 
+    /// A platform transfer into this account starts a fresh decision window.
+    /// The boundary key makes this idempotent while the same notice remains visible.
+    func beginIncomingHandoff(
+        root: URL,
+        uid: String,
+        boundaryKey: String,
+        priorMessageIDs: Set<String>
+    ) throws -> Bool {
+        var state = try load(root: root)
+        var customer = state.customers[uid] ?? Customer()
+        guard customer.incomingBoundaryKey != boundaryKey else { return false }
+        customer.incomingBoundaryKey = boundaryKey
+        customer.windows.removeAll()
+        customer.decisions.removeAll()
+        customer.closedMessageIDs.formUnion(priorMessageIDs)
+        state.customers[uid] = customer
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        try JSONEncoder().encode(state).write(
+            to: root.appendingPathComponent("customer-transfer-policy.json"), options: .atomic
+        )
+        return true
+    }
+
     func context(root: URL, uid: String, now: Date) throws -> String {
         let customer = try load(root: root).customers[uid] ?? Customer()
         func count(_ kind: CustomerRequestKind) -> Int {
@@ -58,7 +124,7 @@ actor CustomerTransferPolicyStore {
                   now >= window.firstAt, now.timeIntervalSince(window.firstAt) <= 600 else { return 0 }
             return window.count
         }
-        return "本客户此前10分钟窗口内的已记录请求：human_request=\(count(.humanRequest))，refund_return=\(count(.refundReturn))。本轮请求尚未计入；重复执行同一批次不增加计数。计数与最终动作由应用持久化执行。"
+        return "本客户此前10分钟窗口内的已记录明确转接请求：human_request=\(count(.humanRequest))。本轮请求尚未计入；重复执行同一批次不增加计数。退货退款不按次数转接，只在具体问题已明确且本地知识无解决方案时转接。计数与最终动作由应用持久化执行。"
     }
 
     func decide(root: URL, uid: String, messageIDs: [String], kind: CustomerRequestKind,
@@ -75,7 +141,7 @@ actor CustomerTransferPolicyStore {
         }
         if let recorded = customer.decisions[key] { return recorded }
         var count = 0
-        if kind == .humanRequest || kind == .refundReturn {
+        if kind == .humanRequest {
             var window = customer.windows[kind.rawValue] ?? Window(firstAt: now, count: 0)
             if now < window.firstAt || now.timeIntervalSince(window.firstAt) > 600 {
                 window = Window(firstAt: now, count: 0)
@@ -90,7 +156,9 @@ actor CustomerTransferPolicyStore {
             decision = .init(count: count, action: count >= 2 ? .replyThenTransfer : .reply,
                              reason: count >= 2 ? .customerExplicitlyRequestedHuman : .none)
         case .refundReturn:
-            let transfer = count >= 2 || issueHasNoSolution
+            // Clarify return/refund requests until the concrete issue is known
+            // and the local knowledge has no supported solution.
+            let transfer = issueHasNoSolution
             decision = .init(count: count, action: transfer ? .replyThenTransfer : .reply,
                              reason: transfer ? .explicitReturnRefund : .none)
         case .technical where issueHasNoSolution:

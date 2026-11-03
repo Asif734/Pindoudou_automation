@@ -463,9 +463,10 @@ final class AutoReplyViewModel: ObservableObject {
             videoArmer: videoArmer,
             videoPreviewOpener: PDDAXVideoPreviewOpener(backend: backend)
         )
-        let sender = PDDAXReplySender(backend: backend, opener: conversation)
+        let sender = PDDAXReplySender(backend: backend, opener: conversation, logRoot: root,
+            observeSnapshot: { uid, snapshot in try conversation.observeSendSnapshot(uid: uid, root: snapshot) })
         let transferer = PDDAXConversationTransferer(
-            backend: backend, opener: conversation, clicker: CGEventPDDTransferClicker()
+            backend: backend, opener: conversation, clicker: CGEventPDDTransferClicker(), logRoot: root
         )
         let driver = PDDLiveAutoReplyDriver(
             conversationDriver: conversation, sender: sender,
@@ -491,6 +492,9 @@ final class AutoReplyViewModel: ObservableObject {
             store: AutoReplyStore(rootDirectory: root),
             codexExecutablePath: codexURL.path
         )
+        try CustomerMessageReceipts(root: root).prepare()
+        AutomationStepLog.record(root: root, uid: nil, step: "runtime-created",
+            detail: "version=\(AppBuildInfo.versionLabel); incoming-transfer=contextual-reply; outgoing-transfer=after-sales-only; message-receipts=enabled")
         let sink = AutoReplyVideoSchedulerSink(scheduler: scheduler)
         Task {
             await videoRelay.install { event in

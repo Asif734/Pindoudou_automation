@@ -175,7 +175,7 @@ struct KnowledgeEvidenceService: KnowledgeEvidencePreparing, Sendable {
 
 // Direct mode supplies a location, never ranked snippets or embeddings.
 struct DirectLocalKnowledge: KnowledgeEvidencePreparing {
-    static let defaultPath = "/Users/m1air/vscode/Pindoudou_automation/格志京东客服知识库-2026-10-04"
+    static let defaultPath = "/Users/tht_developers/Vscode-Asif/Pindoudou_automation/格志京东客服知识库-2026-10-04"
     let folderURL: URL
 
     init(folderURL: URL = DirectLocalKnowledge.configuredURL) {

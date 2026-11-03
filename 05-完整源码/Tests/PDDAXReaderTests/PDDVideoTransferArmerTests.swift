@@ -22,7 +22,7 @@ final class PDDVideoTransferArmerTests: XCTestCase {
         XCTAssertEqual(recorder.values, ["arm", "open", "start", "close"])
     }
 
-    func testPreviewRemainsOpenUntilDownloadFinishesThenClosesOnce() async throws {
+    func testPreviewRemainsOpenUntilAddressCaptureFinishesThenClosesOnce() async throws {
         let recorder = VideoOrderRecorder()
         let started = expectation(description: "download started")
         let release = AsyncReleaseGate()

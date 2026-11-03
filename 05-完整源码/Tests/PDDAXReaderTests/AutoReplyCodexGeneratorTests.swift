@@ -2,6 +2,46 @@ import XCTest
 @testable import PDDAXReader
 
 final class AutoReplyCodexGeneratorTests: XCTestCase {
+    func testCancellationReachesDetachedCLITaskAndReleasesGenerationPromptly() async throws {
+        let root = temporaryRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let started = expectation(description: "CLI started")
+        let cancelled = expectation(description: "CLI cancelled")
+        let generator = AutoReplyCodexGenerator(executableURL: URL(fileURLWithPath: "/bin/echo"),
+            runner: CancellationObservingCodexRunner(started: started, cancelled: cancelled),
+            sessionRegistry: CodexSessionRegistry(rootDirectory: root),
+            evidencePreparer: FallbackKnowledgeEvidencePreparer())
+        let input = try capture(uid: "GZC-000001")
+        let operation = Task { try await generator.generate(input) }
+        await fulfillment(of: [started], timeout: 1)
+        operation.cancel()
+        do { _ = try await operation.value; XCTFail("expected cancellation") }
+        catch { XCTAssertTrue(error is CancellationError) }
+        await fulfillment(of: [cancelled], timeout: 1)
+    }
+    func testIncomingHandoffCannotCountOldRequestsOrImmediatelyTransferAgain() async throws {
+        let root = temporaryRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let original = try capture(uid: "GZC-000001")
+        let input = AutoReplyCapture(uid: original.uid, fullHistory: original.fullHistory,
+            batch: .incomingHandoff(key: "boundary", cursor: original.customerCursor),
+            customerCursor: original.customerCursor, unexpectedServiceMessageIDs: [])
+        let generator = AutoReplyCodexGenerator(executableURL: URL(fileURLWithPath: "/bin/echo"),
+            runner: DocumentCodexRunner(document: [
+                "request_kind": "human_request", "action": "reply_then_transfer",
+                "reply_text": "I will transfer you again.", "transfer_reason": "customer_explicitly_requested_human",
+                "clarification_reply": "I understand you want to return the item. Have you received it?",
+                "handoff_reply": "I will transfer you again."
+            ]), sessionRegistry: CodexSessionRegistry(rootDirectory: root),
+            evidencePreparer: FallbackKnowledgeEvidencePreparer())
+        let result = try await generator.generate(input)
+        XCTAssertEqual(result.action, .reply)
+        XCTAssertEqual(result.transferReason, .none)
+        XCTAssertTrue(result.reply.contains("Have you received it?"))
+        let context = try await CustomerTransferPolicyStore.shared.context(root: root, uid: input.uid, now: Date())
+        XCTAssertTrue(context.contains("human_request=0"))
+    }
+
     func testProhibitedIdentityTermIsBlockedBeforeDelivery() async throws {
         let root = temporaryRoot()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -120,7 +160,7 @@ final class AutoReplyCodexGeneratorTests: XCTestCase {
             executableURL: URL(fileURLWithPath: "/bin/echo"),
             runner: DocumentCodexRunner(document: [
                 "action": "reply_then_transfer",
-                "reply_text": "好的，我帮您转人工处理～",
+                "reply_text": "好的，我为您转接同事继续协助。",
                 "transfer_reason": "customer_explicitly_requested_human"
             ]),
             sessionRegistry: CodexSessionRegistry(rootDirectory: root),
@@ -133,7 +173,7 @@ final class AutoReplyCodexGeneratorTests: XCTestCase {
 
         XCTAssertEqual(result.action, .replyThenTransfer)
         XCTAssertEqual(result.transferReason, .customerExplicitlyRequestedHuman)
-        XCTAssertEqual(result.reply, "好的，我帮您转人工处理～")
+        XCTAssertEqual(result.reply, "好的，我为您转接同事继续协助。")
     }
 
     func testGeneratorRejectsReplyWithTransferReason() async throws {
@@ -552,7 +592,7 @@ private actor SchemaValidatingCodexRunner: CodexProcessRunning {
         let properties = try XCTUnwrap(schema["properties"] as? [String: Any])
         let action = try XCTUnwrap(properties["action"] as? [String: Any])
         let transferReason = try XCTUnwrap(properties["transfer_reason"] as? [String: Any])
-        guard Set(properties.keys) == Set(["answer_found", "action", "reply_text", "transfer_reason", "request_kind", "issue_has_no_solution", "clarification_reply", "handoff_reply"]),
+        guard Set(properties.keys) == Set(["answer_found", "action", "reply_text", "transfer_reason", "request_kind", "issue_has_no_solution", "clarification_reply", "handoff_reply", "image_paths"]),
               action["enum"] as? [String] == ["reply", "reply_then_transfer"],
               transferReason["enum"] as? [String] == [
                 "customer_explicitly_requested_human", "explicit_return_refund",
@@ -669,5 +709,20 @@ private actor SemanticRetryEvidencePreparer: KnowledgeEvidencePreparing {
     private func evidence(_ text: String, _ version: String) -> KnowledgeEvidence {
         KnowledgeEvidence(mode: .v2Top12, version: version, documents: [text], context: text,
                           diagnostic: .emptyFallback)
+    }
+}
+
+private struct CancellationObservingCodexRunner: CodexProcessRunning {
+    let started: XCTestExpectation
+    let cancelled: XCTestExpectation
+    func run(executable: URL, arguments: [String], stdin: String, timeout: TimeInterval) async throws -> CodexProcessResult {
+        started.fulfill()
+        do {
+            try await Task.sleep(for: .seconds(30))
+            return .init(exitCode: 0, stdout: "", stderr: "")
+        } catch {
+            cancelled.fulfill()
+            throw error
+        }
     }
 }

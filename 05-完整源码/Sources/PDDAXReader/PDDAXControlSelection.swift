@@ -158,7 +158,9 @@ enum PDDAXControlSelection {
                     !transferDialogNoiseLabels.contains(text) && Int(text) == nil
             } ?? "未命名客服"
             return PDDOrdinaryTransferAction(
-                controlID: control.id, agentLabel: label, frame: control.frame
+                controlID: control.id, agentLabel: label, frame: control.frame,
+                routingLabels: (hierarchicalRow.isEmpty ? sameVisualRow : hierarchicalRow)
+                    .flatMap(exactTexts)
             )
         }.sorted {
             if $0.frame.minY == $1.frame.minY { return $0.frame.minX < $1.frame.minX }
@@ -166,10 +168,32 @@ enum PDDAXControlSelection {
         }
     }
 
+    static func afterSalesTransferActions<ID: Hashable>(
+        in nodes: [PDDAXSemanticNode<ID>]
+    ) throws -> [PDDOrdinaryTransferAction<ID>] {
+        try ordinaryTransferActions(in: nodes).filter { action in
+            action.routingLabels.contains { label in
+                label.contains("售后")
+                    || label.range(of: #"after[\s-]*sales?"#,
+                                   options: [.regularExpression, .caseInsensitive]) != nil
+            }
+        }
+    }
+
     static func isTransferDialogVisible<ID: Hashable>(
         in nodes: [PDDAXSemanticNode<ID>]
     ) -> Bool {
         transferDialog(in: nodes) != nil
+    }
+
+    static func transferDialogCloseControl<ID: Hashable>(in nodes: [PDDAXSemanticNode<ID>]) -> PDDAXSemanticNode<ID>? {
+        guard let dialog = transferDialog(in: nodes) else { return nil }
+        let matches = descendants(of: dialog.id, nodes: nodes).filter { node in
+            node.role == "AXCloseButton" || exactTexts(node).contains(where: ["取消", "关闭", "Close"].contains)
+                || node.domClasses.contains { $0.contains("el-dialog__headerbtn") }
+        }
+        let actionable = matches.filter { $0.actionNames.contains("AXPress") || ($0.frame.width > 1 && $0.frame.height > 1) }
+        return actionable.count == 1 ? actionable.first : nil
     }
 
     private static func uniqueID<ID: Hashable>(
