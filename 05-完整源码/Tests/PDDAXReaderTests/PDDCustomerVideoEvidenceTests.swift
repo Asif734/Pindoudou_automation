@@ -2,6 +2,37 @@ import XCTest
 @testable import PDDAXReader
 
 final class PDDCustomerVideoEvidenceTests: XCTestCase {
+    func testIdenticalResendReusesEvidenceButDamagedFramesAreRegenerated() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let source = root.appendingPathComponent("video.mp4")
+        try Data("video".utf8).write(to: source)
+        let extractor = CountingFrameExtractor()
+        let transcriber = CountingTranscriber()
+        func receipt(_ id: String) -> PDDDownloadedCustomerVideo {
+            .init(uid: "customer", messageID: id, key: .init(uid: "customer", messageID: id),
+                fileURL: source, summary: .init(byteCount: 5, sha256: "same", durationSeconds: 8,
+                    width: 720, height: 1280, videoCodec: "H.264", audioCodec: nil))
+        }
+        func preparer() -> PDDCustomerVideoEvidencePreparer {
+            .init(rootURL: root.appendingPathComponent("evidence"), transcriber: transcriber, frameExtractor: extractor)
+        }
+        let first = try await preparer().prepare(download: receipt("morning"))
+        let second = try await preparer().prepare(download: receipt("afternoon"))
+        XCTAssertEqual(second.messageID, "afternoon")
+        XCTAssertEqual(second.frames, first.frames)
+        XCTAssertTrue(second.diagnostic?.contains("reused_verified_video_evidence") == true)
+        let extracted = await extractor.count
+        let transcribed = await transcriber.count
+        XCTAssertEqual(extracted, 1)
+        XCTAssertEqual(transcribed, 1)
+        try Data("damaged".utf8).write(to: first.frames[0].localURL)
+        _ = try await preparer().prepare(download: receipt("evening"))
+        let regenerated = await extractor.count
+        XCTAssertEqual(regenerated, 2)
+    }
+
     func testNoAudioEvidenceKeepsRepeatedFramesAndWritesOrderedManifest() async throws {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("pdd-video-evidence-\(UUID().uuidString)")
@@ -45,6 +76,23 @@ final class PDDCustomerVideoEvidenceTests: XCTestCase {
             ),
             video
         )
+    }
+}
+
+private actor CountingFrameExtractor: PDDVideoFrameExtracting {
+    var count = 0
+    func extractFrames(from videoURL: URL, durationSeconds: Double, destinationDirectory: URL) async throws -> [AutoReplyVideoFrame] {
+        count += 1
+        return try await RepeatedFrameExtractorStub().extractFrames(from: videoURL,
+            durationSeconds: durationSeconds, destinationDirectory: destinationDirectory)
+    }
+}
+
+private actor CountingTranscriber: PDDVideoSpeechTranscribing {
+    var count = 0
+    func transcribe(_ mediaURL: URL) async -> [PDDVideoTranscriptSegment] {
+        count += 1
+        return [.init(startSeconds: 1, durationSeconds: 1, text: "test")]
     }
 }
 

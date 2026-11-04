@@ -110,7 +110,20 @@ enum BoundedProcess {
             }
         }
         posix_spawnattr_setpgroup(&attributes, 0)
-        posix_spawnattr_setflags(&attributes, Int16(POSIX_SPAWN_SETPGROUP))
+        // Dispatch workers block asynchronous signals. Inheriting that mask
+        // prevents Codex from observing SIGCHLD for its completed shell tools
+        // and also delays normal SIGTERM cancellation. Reset only the child's
+        // mask; never mutate the worker or the application's signal handling.
+        var childSignalMask = sigset_t()
+        sigemptyset(&childSignalMask)
+        let maskStatus = posix_spawnattr_setsigmask(&attributes, &childSignalMask)
+        let flagStatus = posix_spawnattr_setflags(&attributes,
+            Int16(POSIX_SPAWN_SETPGROUP | POSIX_SPAWN_SETSIGMASK))
+        guard maskStatus == 0, flagStatus == 0 else {
+            closePipe(&stdoutPipe); closePipe(&stderrPipe); closePipe(&stdinPipe)
+            return launchFailure(maskStatus != 0 ? maskStatus : flagStatus,
+                "posix_spawn signal mask", start: start, clock: clock)
+        }
 
         let argumentStrings = [configuration.executable.path] + configuration.arguments
         let environmentStrings = configuration.environment.map { "\($0.key)=\($0.value)" }

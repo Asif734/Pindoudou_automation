@@ -34,6 +34,8 @@ struct KnowledgeRetrievalDiagnostic: Codable, Equatable, Sendable {
     let error: String?
     var queries: [String]? = nil
     var queryPlannerIssue: String? = nil
+    var hashCacheHit: Bool? = nil
+    var hashedByteCount: Int64? = nil
 
     static let emptyFallback = KnowledgeRetrievalDiagnostic(
         mode: .unavailable,

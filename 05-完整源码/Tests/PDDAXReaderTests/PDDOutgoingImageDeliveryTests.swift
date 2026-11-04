@@ -1,8 +1,59 @@
+import AppKit
 import XCTest
 @testable import PDDAXReader
 
 @MainActor
 final class PDDOutgoingImageDeliveryTests: XCTestCase {
+    func testReadImageWithoutAXURLContinuesSecondImageAndCaptionWithoutDuplicateUpload() async throws {
+        let fixture = try ImageDeliveryFixture(timeout: 0.15)
+        defer { fixture.clean() }
+        fixture.backend.imageHasRemoteURL = false
+        fixture.backend.imageReadState = "已读"
+        fixture.uploader.usesPreview = true
+        let bitmap = try XCTUnwrap(NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: 3, pixelsHigh: 3,
+            bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
+            colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0))
+        for x in 0..<3 { for y in 0..<3 { bitmap.setColor(.red, atX: x, y: y) } }
+        try XCTUnwrap(bitmap.representation(using: .png, properties: [:]))
+            .write(to: fixture.root.appendingPathComponent("assets/second.png"))
+        let second = try XCTUnwrap(DatasetReplyImageResolver(datasetRoot: fixture.root, outputRoot: fixture.root)
+            .resolve(["assets/second.png"]).first)
+        XCTAssertNotEqual(second.sha256, fixture.image.sha256)
+        guard case .sent = try await fixture.send(images: [fixture.image, second]) else {
+            return XCTFail("Read-state confirmation must continue the entire image/caption batch")
+        }
+        XCTAssertEqual(fixture.uploader.calls, 2)
+        XCTAssertEqual(fixture.backend.previewSendCount, 2)
+        XCTAssertEqual(fixture.backend.textSendCount, 1)
+        for image in [fixture.image, second] {
+            XCTAssertNotNil(try PDDOutgoingImageReceiptStore(root: fixture.root)
+                .load(deliveryID: fixture.id, hash: image.sha256)?.confirmedMessageID)
+        }
+    }
+
+    func testReadStateCannotConfirmFailedPendingCustomerOrUnacknowledgedImage() throws {
+        let backend = ImageDeliveryBackend()
+        backend.imageVisible = true
+        backend.imageHasRemoteURL = false
+        XCTAssertTrue(PDDOutgoingImageControls.confirmedImageMessageIDs(in: try backend.readSemanticTree()).isEmpty)
+        backend.imageReadState = "未读"
+        XCTAssertEqual(PDDOutgoingImageControls.confirmedImageMessageIDs(in: try backend.readSemanticTree()), ["middlePanel_list_image1"])
+        backend.imageFailureClass = "image-msg--loading"
+        XCTAssertTrue(PDDOutgoingImageControls.confirmedImageMessageIDs(in: try backend.readSemanticTree()).isEmpty)
+        backend.imageFailureClass = "send-failed"
+        XCTAssertTrue(PDDOutgoingImageControls.confirmedImageMessageIDs(in: try backend.readSemanticTree()).isEmpty)
+        backend.imageFailureClass = nil
+        backend.imageSenderIsCustomer = true
+        XCTAssertTrue(PDDOutgoingImageControls.confirmedImageMessageIDs(in: try backend.readSemanticTree()).isEmpty)
+    }
+
+    func testImageAltTextCannotPretendToBeReadState() throws {
+        let backend = ImageDeliveryBackend()
+        backend.imageVisible = true
+        backend.imageHasRemoteURL = false
+        backend.imageAltReadState = true
+        XCTAssertTrue(PDDOutgoingImageControls.confirmedImageMessageIDs(in: try backend.readSemanticTree()).isEmpty)
+    }
     func testImageAndCaptionSendUsingUniqueAXChatWithoutOCRorTriggerBubble() async throws {
         let fixture = try ImageDeliveryFixture(timeout: 0.1)
         defer { fixture.clean() }
@@ -240,8 +291,9 @@ private final class ImageDeliveryFixture {
             confirmationTimeout: 0, pollIntervalNanoseconds: 0, logRoot: root,
             imageUploader: uploader, imageConfirmationTimeout: timeout, imagePreviewClicker: clicker)
     }
-    func send(uid: String = "GZC-000001", lease: UIOperationLease? = nil) async throws -> AutoReplyDeliveryResult {
-        try await sender.send(uid: uid, text: "Here is the card sample.", outgoingImages: [image], deliveryID: id,
+    func send(uid: String = "GZC-000001", lease: UIOperationLease? = nil,
+              images: [DatasetReplyImage]? = nil) async throws -> AutoReplyDeliveryResult {
+        try await sender.send(uid: uid, text: "Here is the card sample.", outgoingImages: images ?? [image], deliveryID: id,
             expectedCustomerCursor: .empty, expectedCustomerMessageIDs: ["customer1"], lease: lease)
     }
     func clean() { try? FileManager.default.removeItem(at: root) }
@@ -262,6 +314,7 @@ private final class ImageDeliveryUploader: PDDOutgoingImageUploading {
         beforeCommitHook?()
         try beforeCommit()
         if throwAfterCommit { throw CocoaError(.fileReadUnknown) }
+        backend.imageMessageID = "middlePanel_list_image\(calls)"
         backend.previewVisible = usesPreview
         backend.imageVisible = !usesPreview
     }
@@ -280,6 +333,12 @@ private final class ImageDeliveryBackend: PDDAXBackend {
     var activeNickname: String?
     var imageVisible = false
     var imageFailed = false
+    var imageHasRemoteURL = true
+    var imageReadState: String?
+    var imageFailureClass: String?
+    var imageSenderIsCustomer = false
+    var imageAltReadState = false
+    var imageMessageID = "middlePanel_list_image1"
     var previewVisible = false
     var previewUsesAXPress = true
     var previewUsesCombinedAXText = false
@@ -290,14 +349,15 @@ private final class ImageDeliveryBackend: PDDAXBackend {
     var previewSendCount = 0
     var previewCancelCount = 0
     func readSemanticTree() throws -> PDDAXSemanticTree {
-        let image = AXNodeSnapshot(role: "AXGroup", attributes: [("AXDOMIdentifier", "middlePanel_list_image1"),
-            ("AXDOMClassList", imageFailed ? "[onemsg, failed]" : "[onemsg]")], children: [
-                AXNodeSnapshot(role: "AXGroup", attributes: [("AXDOMClassList", "[cs-item]")], children: [
+        let image = AXNodeSnapshot(role: "AXGroup", attributes: [("AXDOMIdentifier", imageMessageID),
+            ("AXDOMClassList", imageFailed ? "[onemsg, failed]" : "[onemsg, \(imageFailureClass ?? "")]")], children: [
+                AXNodeSnapshot(role: "AXGroup", attributes: [("AXDOMClassList", imageSenderIsCustomer ? "[buyer-item]" : "[cs-item]")], children: [
                     AXNodeSnapshot(role: "AXGroup", attributes: [("AXDOMClassList", "[msg-content-box]")], children: [
-                        AXNodeSnapshot(role: "AXImage", attributes: [("AXDOMClassList", "[image-msg]"),
-                            ("AXURL", "https://img.example/card.png")])
+                        AXNodeSnapshot(role: imageHasRemoteURL ? "AXImage" : "AXGroup", attributes: [("AXDOMClassList", "[image-msg]")]
+                            + (imageHasRemoteURL ? [("AXURL", "https://img.example/card.png")] : []),
+                            children: imageAltReadState ? [.init(role: "AXStaticText", attributes: [("AXValue", "已读")])] : [])
                     ])
-                ])
+                ] + (imageReadState.map { [.init(role: "AXStaticText", attributes: [("AXValue", $0)])] } ?? []))
             ])
         var nodes = [imageSemantic(1, classes: ["chat-panel"]),
             imageSemantic(2, parent: 1, role: "AXTextArea", settable: true),

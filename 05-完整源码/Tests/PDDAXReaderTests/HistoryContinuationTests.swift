@@ -50,7 +50,7 @@ final class HistoryContinuationTests: XCTestCase {
         XCTAssertTrue(submission.imageAttachments.isEmpty)
     }
 
-    func testSameVideoDigestAtNewPathIsNotResubmitted() throws {
+    func testResentVideoWithSameDigestAndNewMessageIDIsSubmittedAgain() throws {
         var original = try makeCapture([message("1", "[视频]")])
         original.videoAttachments = [video("old", path: "/tmp/old.mp4", digest: "same-video")]
         let checkpoint = try HistoryContinuation.plan(capture: original, after: nil).checkpoint
@@ -59,7 +59,32 @@ final class HistoryContinuationTests: XCTestCase {
 
         let submission = try HistoryContinuation.plan(capture: updated, after: checkpoint)
 
-        XCTAssertTrue(submission.videoAttachments.isEmpty)
+        XCTAssertEqual(submission.videoAttachments.map(\.messageID), ["copy"])
+    }
+
+    func testSameVideoMessageIsNotResubmittedAfterInterveningTextOnlyTurn() throws {
+        var morning = try makeCapture([message("morning", "[视频]")])
+        morning.videoAttachments = [video("morning", path: "/tmp/morning.mp4", digest: "same")]
+        let checkpoint = try HistoryContinuation.plan(capture: morning, after: nil).checkpoint
+        let textOnly = try makeCapture(morning.fullHistory + [message("thanks", "thank you")])
+        let textCheckpoint = try HistoryContinuation.plan(capture: textOnly, after: checkpoint).checkpoint
+        let encoded = try JSONEncoder().encode(textCheckpoint)
+        let restored = try JSONDecoder().decode(CodexHistoryCheckpoint.self, from: encoded)
+        var later = try makeCapture(textOnly.fullHistory + [message("question", "explain the old video")])
+        later.videoAttachments = [video("morning", path: "/tmp/restored.mp4", digest: "same")]
+        XCTAssertTrue(try HistoryContinuation.plan(capture: later, after: restored).videoAttachments.isEmpty)
+        later.videoAttachments.append(video("afternoon", path: "/tmp/afternoon.mp4", digest: "same"))
+        XCTAssertEqual(try HistoryContinuation.plan(capture: later, after: restored).videoAttachments.map(\.messageID), ["afternoon"])
+    }
+
+    func testLegacyHashOnlyCheckpointCannotSuppressNewVideoMessage() throws {
+        let morning = try makeCapture([message("morning", "[视频]")])
+        let modern = try HistoryContinuation.plan(capture: morning, after: nil).checkpoint
+        let legacy = CodexHistoryCheckpoint(historyByteCount: modern.historyByteCount,
+            prefixSHA256: modern.prefixSHA256, attachmentSHA256: ["/tmp/old.mp4": "same"])
+        var afternoon = try makeCapture(morning.fullHistory + [message("afternoon", "[视频]")])
+        afternoon.videoAttachments = [video("afternoon", path: "/tmp/afternoon.mp4", digest: "same")]
+        XCTAssertEqual(try HistoryContinuation.plan(capture: afternoon, after: legacy).videoAttachments.map(\.messageID), ["afternoon"])
     }
 
     private func makeCapture(_ history: [PDDChatMessage]) throws -> AutoReplyCapture {

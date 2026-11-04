@@ -66,7 +66,7 @@ struct CodexReplyService: Sendable {
     }
 
     func generate(uid: String, history: [PDDChatMessage]) async throws -> CodexReplyResult {
-        if let binding = try sessionRegistry.activeBinding(uid: uid, now: now()) {
+        if let binding = try sessionRegistry.activeBinding(uid: uid, now: now()), binding.matchesCurrentModel {
             do {
                 let reply = try await runTurn(uid: uid, history: history, sessionID: binding.threadID)
                 try sessionRegistry.save(CodexSessionBinding(

@@ -2,6 +2,27 @@ import XCTest
 @testable import PDDAXReader
 
 final class PDDBackgroundVideoRecoveryTests: XCTestCase {
+    func testResentVideoGetsTimestampedDistinctFileAndRecoveryReusesSameOccurrence() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let morning = PDDVideoTransferKey(uid: "customer", messageID: "morning-message")
+        let afternoon = PDDVideoTransferKey(uid: "customer", messageID: "afternoon-message")
+        let morningTime = Date(timeIntervalSince1970: 1_793_779_200)
+        let afternoonTime = morningTime.addingTimeInterval(6 * 3600)
+        let first = PDDBackgroundVideoRecovery.savedVideoURL(root: root, key: morning, savedAt: morningTime)
+        let second = PDDBackgroundVideoRecovery.savedVideoURL(root: root, key: afternoon, savedAt: afternoonTime)
+        XCTAssertNotEqual(first, second)
+        XCTAssertNotEqual(first.lastPathComponent, second.lastPathComponent)
+        XCTAssertTrue(first.lastPathComponent.hasPrefix("video_20261104T080000000Z_"))
+        for file in [first, second] {
+            try FileManager.default.createDirectory(at: file.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try Data("same exact video bytes".utf8).write(to: file)
+        }
+        XCTAssertEqual(PDDBackgroundVideoRecovery.savedVideoURL(root: root, key: morning, savedAt: afternoonTime), first,
+            "Retrying the morning message must reuse its saved occurrence")
+        XCTAssertEqual(PDDBackgroundVideoRecovery.action(root: root, uid: "customer", messageID: "afternoon-message"),
+            .prepareEvidence(uid: "customer", messageID: "afternoon-message", stableURL: second))
+    }
     func testPartialVideoURLKeepsMP4ExtensionForAVFoundationValidation() {
         let root = FileManager.default.temporaryDirectory
         let key = PDDVideoTransferKey(uid: "PDD-one", messageID: "v1")

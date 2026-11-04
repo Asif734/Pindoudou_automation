@@ -3,18 +3,21 @@ import SwiftUI
 struct AutoReplyView: View {
     @StateObject private var model: AutoReplyViewModel
     @StateObject private var progressPanel: AutoReplyProgressPanelController
+    @StateObject private var mediaPermissions: PDDMediaPermissionController
 
     @MainActor
     init() {
         let model = AutoReplyViewModel()
         _model = StateObject(wrappedValue: model)
         _progressPanel = StateObject(wrappedValue: AutoReplyProgressPanelController(model: model))
+        _mediaPermissions = StateObject(wrappedValue: PDDMediaPermissionController())
     }
 
     @MainActor
     init(model: AutoReplyViewModel) {
         _model = StateObject(wrappedValue: model)
         _progressPanel = StateObject(wrappedValue: AutoReplyProgressPanelController(model: model))
+        _mediaPermissions = StateObject(wrappedValue: PDDMediaPermissionController())
     }
 
     var body: some View {
@@ -30,7 +33,13 @@ struct AutoReplyView: View {
                     toolbarLabel(model.isRunning ? "停止" : "开始", model.isRunning ? "Stop" : "Start")
                 }
                 .buttonStyle(.borderedProminent)
-                .disabled(!model.isRunning && !model.canStart)
+                .disabled(!model.isRunning && (!model.canStart || mediaPermissions.isRequesting))
+
+                Button { Task { await mediaPermissions.requestPermissions() } } label: {
+                    toolbarLabel("文件权限", "File permission")
+                }
+                .disabled(model.isRunning || mediaPermissions.isRequesting)
+                .help(BilingualText.lines("开始前请求下载文件夹与视频语音识别权限", "Request Downloads and video speech-recognition access before Start"))
 
                 Button { progressPanel.toggleCollapsed() } label: {
                     toolbarLabel("收起／展开进度浮窗", "Collapse / expand progress")
@@ -52,6 +61,24 @@ struct AutoReplyView: View {
                 .fixedSize()
 
                 Spacer(minLength: 0)
+            }
+
+            if let permissionStatus = mediaPermissions.statusText {
+                HStack(spacing: 10) {
+                    Text(permissionStatus).font(.caption).foregroundStyle(.secondary)
+                    if !mediaPermissions.isRequesting {
+                        if let status = mediaPermissions.fileStatus, status != .authorized {
+                            Button { mediaPermissions.openSettings(.filesAndFolders) } label: {
+                                toolbarLabel("打开文件权限设置", "Open file settings")
+                            }
+                        }
+                        if let status = mediaPermissions.speechStatus, status != .authorized {
+                            Button { mediaPermissions.openSettings(.speechRecognition) } label: {
+                                toolbarLabel("打开语音权限设置", "Open speech settings")
+                            }
+                        }
+                    }
+                }
             }
 
                 Text(BilingualText.lines(
@@ -110,7 +137,7 @@ struct AutoReplyView: View {
                         }
                     }
                     Text(BilingualText.lines("Codex：\(model.codexExecutablePath ?? "不可用")", "Codex: \(model.codexExecutablePath ?? "Unavailable")"))
-                    Text(BilingualText.lines("模型：gpt-5.6-sol · medium · 每位用户独立 session", "Model: gpt-5.6-sol · medium · separate session for each user"))
+                    Text(BilingualText.lines("模型：\(CodexInvocation.model) · \(CodexInvocation.reasoningEffort) · 每位用户独立 session", "Model: \(CodexInvocation.model) · \(CodexInvocation.reasoningEffort) · separate session for each user"))
                     if let diagnostic = model.latestKnowledgeDiagnostic {
                         let summary = BilingualText.split(AutoReplyProgressPresentation.knowledgeSummary(diagnostic))
                         Text(BilingualText.lines("知识：\(summary.chinese)", "Knowledge: \(summary.english)"))

@@ -122,7 +122,9 @@ struct PDDCustomerVideoDownloader: PDDCustomerVideoDownloading, Sendable {
         let summary = try await PDDVideoFileInspector.inspect(temporary)
         try Task.checkCancellation()
         try FileManager.default.createDirectory(at: destinationDirectory, withIntermediateDirectories: true)
-        let videoURL = destinationDirectory.appendingPathComponent("\(summary.sha256).mp4")
+        let key = PDDVideoTransferKey(uid: "download", messageID: messageID)
+        let videoURL = destinationDirectory.appendingPathComponent(
+            PDDBackgroundVideoRecovery.timestampedFileName(key: key, savedAt: Date()))
         if !FileManager.default.fileExists(atPath: videoURL.path) {
             try Task.checkCancellation()
             do { try FileManager.default.copyItem(at: temporary, to: videoURL) }
@@ -132,7 +134,7 @@ struct PDDCustomerVideoDownloader: PDDCustomerVideoDownloading, Sendable {
         let frames = try await frameExtractor.extractFrames(
             from: videoURL,
             durationSeconds: summary.durationSeconds,
-            destinationDirectory: destinationDirectory.appendingPathComponent("\(summary.sha256)-frames")
+            destinationDirectory: destinationDirectory.appendingPathComponent("\(videoURL.deletingPathExtension().lastPathComponent)-frames")
         )
         try Task.checkCancellation()
         return AutoReplyVideoAttachment(

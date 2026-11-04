@@ -494,7 +494,7 @@ final class AutoReplyViewModel: ObservableObject {
         )
         try CustomerMessageReceipts(root: root).prepare()
         AutomationStepLog.record(root: root, uid: nil, step: "runtime-created",
-            detail: "version=\(AppBuildInfo.versionLabel); incoming-transfer=contextual-reply; outgoing-transfer=after-sales-only; message-receipts=enabled")
+            detail: "version=\(AppBuildInfo.versionLabel); model=\(CodexInvocation.model); reasoning=\(CodexInvocation.reasoningEffort); incoming-transfer=contextual-reply; outgoing-transfer=after-sales-only; message-receipts=enabled")
         let sink = AutoReplyVideoSchedulerSink(scheduler: scheduler)
         Task {
             await videoRelay.install { event in
@@ -581,7 +581,10 @@ final class AutoReplyViewModel: ObservableObject {
         }
         let prewarmer = PDDStartupPrewarmer(
             warmOCR: { try await ocrEngine.prewarm() },
-            warmKnowledge: { try localKnowledge.validate() },
+            warmKnowledge: {
+                try localKnowledge.validate()
+                _ = try await localKnowledge.versionCache.version(folder: localKnowledge.folderURL)
+            },
             warmSenseVoice: { if let senseVoice { try await senseVoice.prepare() } },
             checkCodex: {
                 guard await CodexCompatibilityProbe().check(executableURL: codexURL) == .ready else {

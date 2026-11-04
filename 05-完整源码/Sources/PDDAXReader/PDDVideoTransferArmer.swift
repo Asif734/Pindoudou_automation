@@ -215,10 +215,10 @@ final class PDDVideoTransferArmer: PDDVideoTransferArming {
             .appendingPathComponent(key.customerHash, isDirectory: true)
             .appendingPathComponent(key.messageHash, isDirectory: true)
         let partialURL = transferDirectory.appendingPathComponent("video.partial.mp4")
-        let stableURL = transferDirectory.appendingPathComponent("video.mp4")
         let evidenceRoot = destinationRoot
             .appendingPathComponent("evidence", isDirectory: true)
             .appendingPathComponent(key.customerHash, isDirectory: true)
+        let saveRoot = destinationRoot
         let watcher = self.watcher
         let downloader = self.downloader
         let alternateDownloader = self.alternateDownloader
@@ -266,6 +266,7 @@ final class PDDVideoTransferArmer: PDDVideoTransferArming {
                 }
                 try await stateStore.transition(key: key, to: .validating)
                 let summary = try await PDDVideoFileInspector.inspect(partialURL)
+                let stableURL = PDDBackgroundVideoRecovery.savedVideoURL(root: saveRoot, key: key)
                 try FileManager.default.createDirectory(
                     at: transferDirectory, withIntermediateDirectories: true
                 )
@@ -281,16 +282,10 @@ final class PDDVideoTransferArmer: PDDVideoTransferArming {
                 try await stateStore.transition(
                     key: key, to: .downloaded, fileName: stableURL.lastPathComponent
                 )
-                await eventHandler(.init(uid: uid, messageID: messageID, phase: .downloaded))
+                await eventHandler(.init(uid: uid, messageID: messageID, phase: .downloaded,
+                    diagnostic: "saved_file=\(stableURL.lastPathComponent); identity=customer-message"))
                 await foregroundCompletion.finish()
-                guard try await analysisInbox.claim(receipt) else {
-                    try? await stateStore.transition(key: key, to: .completed)
-                    await eventHandler(.init(
-                        uid: uid, messageID: messageID, phase: .duplicate,
-                        diagnostic: "同一客户的相同视频内容已处理"
-                    ))
-                    return
-                }
+                _ = try await analysisInbox.claim(receipt)
                 await eventHandler(.init(
                     uid: uid, messageID: messageID, phase: .preparingEvidence
                 ))
@@ -306,7 +301,7 @@ final class PDDVideoTransferArmer: PDDVideoTransferArming {
                 }
                 await eventHandler(.init(
                     uid: uid, messageID: messageID, phase: .readyForGeneration,
-                    attachment: attachment, recovered: isRecovery
+                    attachment: attachment, diagnostic: attachment.diagnostic, recovered: isRecovery
                 ))
                 try await stateStore.transition(key: key, to: .readyForGeneration)
             } catch is CancellationError {

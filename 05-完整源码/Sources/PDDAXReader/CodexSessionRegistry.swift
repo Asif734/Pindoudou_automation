@@ -10,6 +10,13 @@ struct CodexSessionBinding: Codable, Equatable {
     let turnCount: Int
     let submittedBytes: Int
     let contaminated: Bool
+    let model: String?
+    let reasoningEffort: String?
+    let threadTokenUsage: CodexTokenUsage?
+
+    var matchesCurrentModel: Bool {
+        model == CodexInvocation.model && reasoningEffort == CodexInvocation.reasoningEffort
+    }
 
     init(
         uid: String,
@@ -20,7 +27,10 @@ struct CodexSessionBinding: Codable, Equatable {
         knowledgeSHA256: String? = nil,
         turnCount: Int = 0,
         submittedBytes: Int = 0,
-        contaminated: Bool = false
+        contaminated: Bool = false,
+        model: String? = CodexInvocation.model,
+        reasoningEffort: String? = CodexInvocation.reasoningEffort,
+        threadTokenUsage: CodexTokenUsage? = nil
     ) {
         self.uid = uid
         self.threadID = threadID
@@ -31,11 +41,14 @@ struct CodexSessionBinding: Codable, Equatable {
         self.turnCount = turnCount
         self.submittedBytes = submittedBytes
         self.contaminated = contaminated
+        self.model = model
+        self.reasoningEffort = reasoningEffort
+        self.threadTokenUsage = threadTokenUsage
     }
 
     private enum CodingKeys: String, CodingKey {
         case uid, threadID, lastUsedAt, historyCheckpoint, promptSHA256, knowledgeSHA256
-        case turnCount, submittedBytes, contaminated
+        case turnCount, submittedBytes, contaminated, model, reasoningEffort, threadTokenUsage
     }
 
     init(from decoder: Decoder) throws {
@@ -51,6 +64,9 @@ struct CodexSessionBinding: Codable, Equatable {
         turnCount = try c.decodeIfPresent(Int.self, forKey: .turnCount) ?? 0
         submittedBytes = try c.decodeIfPresent(Int.self, forKey: .submittedBytes) ?? 0
         contaminated = try c.decodeIfPresent(Bool.self, forKey: .contaminated) ?? false
+        model = try c.decodeIfPresent(String.self, forKey: .model)
+        reasoningEffort = try c.decodeIfPresent(String.self, forKey: .reasoningEffort)
+        threadTokenUsage = try c.decodeIfPresent(CodexTokenUsage.self, forKey: .threadTokenUsage)
     }
 }
 

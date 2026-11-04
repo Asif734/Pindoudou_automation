@@ -2,6 +2,58 @@ import XCTest
 @testable import PDDAXReader
 
 final class AutoReplyCodexGeneratorTests: XCTestCase {
+    func testResumedUsageReportsOnlyCurrentTurnAndPersistsThreadCounter() async throws {
+        let root = temporaryRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let input = try capture(uid: "GZC-000001")
+        func output(input: Int, cached: Int, output: Int) -> String {
+            "{\"type\":\"thread.started\",\"thread_id\":\"usage-thread\"}\n{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":\(input),\"cached_input_tokens\":\(cached),\"output_tokens\":\(output)}}\n"
+        }
+        let runner = AutoReplyFakeCodexRunner(responses: [
+            .init(exitCode: 0, stdout: output(input: 100, cached: 60, output: 20), reply: "回复"),
+            .init(exitCode: 0, stdout: output(input: 150, cached: 80, output: 30), reply: "回复")])
+        let registry = CodexSessionRegistry(rootDirectory: root)
+        let generator = AutoReplyCodexGenerator(executableURL: URL(fileURLWithPath: "/bin/echo"),
+            runner: runner, sessionRegistry: registry, evidencePreparer: FallbackKnowledgeEvidencePreparer())
+        let first = try await generator.generate(input)
+        XCTAssertEqual(first.diagnostic?.tokenUsage?.totalTokens, 120)
+        let second = try await generator.generate(input)
+        XCTAssertEqual(second.diagnostic?.tokenUsage, .init(inputTokens: 50, cachedInputTokens: 20, outputTokens: 10))
+        XCTAssertEqual(second.diagnostic?.tokenUsageScope, "turn")
+        XCTAssertEqual(try registry.activeBinding(uid: input.uid)?.threadTokenUsage?.totalTokens, 180)
+        let invocation = await runner.recorded[1]
+        XCTAssertTrue(invocation.arguments.contains("resume"))
+    }
+
+    func testCounterResetCannotProduceMisleadingNegativePerQueryUsage() {
+        let previous = CodexTokenUsage(inputTokens: 100, cachedInputTokens: 60, outputTokens: 20)
+        XCTAssertNil(CodexTokenUsage(inputTokens: 40, cachedInputTokens: 0, outputTokens: 10).subtracting(previous))
+    }
+    func testModelChangeStartsFreshWithFullHistoryAndKeepsUsageDiagnostics() async throws {
+        let root = temporaryRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let input = try capture(uid: "GZC-000001")
+        let registry = CodexSessionRegistry(rootDirectory: root)
+        try registry.save(.init(uid: input.uid, threadID: "old-model-thread", lastUsedAt: Date(),
+            historyCheckpoint: try HistoryContinuation.plan(capture: input, after: nil).checkpoint,
+            model: "gpt-5.6-sol"))
+        let runner = AutoReplyFakeCodexRunner(responses: [.init(exitCode: 0, stdout:
+            "{\"type\":\"thread.started\",\"thread_id\":\"terra-thread\"}\n{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":100,\"cached_input_tokens\":60,\"output_tokens\":20,\"reasoning_output_tokens\":5}}\n", reply: "回复")])
+        let generator = AutoReplyCodexGenerator(executableURL: URL(fileURLWithPath: "/bin/echo"), runner: runner,
+            sessionRegistry: registry, evidencePreparer: FallbackKnowledgeEvidencePreparer())
+        let result = try await generator.generate(input)
+        let invocation = await runner.recorded[0]
+        XCTAssertFalse(invocation.arguments.contains("resume"))
+        XCTAssertTrue(invocation.arguments.contains("gpt-6.1-sol"))
+        XCTAssertTrue(invocation.stdin.contains("full_history.jsonl"))
+        XCTAssertTrue(invocation.stdin.contains(input.batch!.events[0].content))
+        XCTAssertEqual(result.diagnostic?.model, "gpt-6.1-sol")
+        XCTAssertEqual(result.diagnostic?.reasoningEffort, "medium")
+        XCTAssertEqual(result.diagnostic?.tokenUsage?.totalTokens, 120)
+        XCTAssertEqual(result.diagnostic?.tokenUsage?.cachedInputTokens, 60)
+        XCTAssertTrue(try XCTUnwrap(registry.activeBinding(uid: input.uid)).matchesCurrentModel)
+    }
+
     func testCancellationReachesDetachedCLITaskAndReleasesGenerationPromptly() async throws {
         let root = temporaryRoot()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -284,7 +336,7 @@ final class AutoReplyCodexGeneratorTests: XCTestCase {
         XCTAssertFalse(invocations[1].contains("resume"))
     }
 
-    func testGeneratorContinuesLegacyCheckpointOnSameThreadAndRewritesModernCheckpoint() async throws {
+    func testCurrentModelContinuesLegacyHistoryCheckpointAndRewritesModernCheckpoint() async throws {
         let root = temporaryRoot()
         defer { try? FileManager.default.removeItem(at: root) }
         let directory = root.appendingPathComponent("用户/GZC-000001", isDirectory: true)
@@ -294,6 +346,8 @@ final class AutoReplyCodexGeneratorTests: XCTestCase {
         {
           "uid": "GZC-000001",
           "threadID": "legacy-thread-A",
+          "model": "\(CodexInvocation.model)",
+          "reasoningEffort": "\(CodexInvocation.reasoningEffort)",
           "lastUsedAt": "2026-04-25T02:40:00Z",
           "historyCheckpoint": {
             "messageDigests": ["old-message-digest"],

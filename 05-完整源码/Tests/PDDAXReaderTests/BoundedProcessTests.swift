@@ -3,6 +3,23 @@ import XCTest
 @testable import PDDAXReader
 
 final class BoundedProcessTests: XCTestCase {
+    func testDispatchWorkerSignalMaskDoesNotLeakIntoChild() async {
+        let script = "$old=POSIX::SigSet->new; $empty=POSIX::SigSet->new; POSIX::sigprocmask(SIG_BLOCK,$empty,$old); print $old->ismember(SIGCHLD).\":\".$old->ismember(SIGTERM);"
+        let result = await BoundedProcess.run(.init(executable: URL(fileURLWithPath: "/usr/bin/perl"),
+            arguments: ["-MPOSIX=:signal_h", "-e", script]),
+            softDeadline: .seconds(1), hardDeadline: .seconds(3))
+        XCTAssertEqual(result.termination, .exited(0))
+        XCTAssertEqual(String(decoding: result.stdout, as: UTF8.self), "0:0",
+            "Codex must receive both child-exit and termination signals")
+    }
+
+    func testChildCanTerminateItselfWithoutInheritedBlockedSIGTERM() async {
+        let result = await BoundedProcess.run(.init(executable: URL(fileURLWithPath: "/bin/sh"),
+            arguments: ["-c", "kill -TERM $$; printf signal-was-blocked"]),
+            softDeadline: .seconds(1), hardDeadline: .seconds(3))
+        XCTAssertEqual(result.termination, .exited(128 + SIGTERM))
+        XCTAssertTrue(result.stdout.isEmpty)
+    }
     func testEscapedChildHoldingStdinCannotHoldInputWriterAfterParentExits() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)

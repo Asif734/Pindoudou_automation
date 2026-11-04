@@ -19,15 +19,17 @@
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
-    <string>1.9</string>
+    <string>1.15</string>
     <key>CFBundleVersion</key>
-    <string>10</string>
+    <string>16</string>
     <key>LSMinimumSystemVersion</key>
     <string>14.0</string>
     <key>NSScreenCaptureUsageDescription</key>
     <string>用于读取拼多多聊天窗口并在 AX 消息尚未刷新时进行本地 OCR 补读。&#10;Used to read the Pinduoduo chat window and perform local OCR when AX messages have not refreshed.</string>
     <key>NSSpeechRecognitionUsageDescription</key>
     <string>用于把客户视频中的语音转成文字，帮助客服理解问题；拒绝后仍可继续处理视频画面和文字消息。&#10;Used to transcribe customer videos; video frames and text messages still work if permission is denied.</string>
+    <key>NSDownloadsFolderUsageDescription</key>
+    <string>用于读取拼多多保存到下载文件夹的客户图片；可在开始自动客服前通过文件权限按钮提前授权。&#10;Used to read customer images saved by Pinduoduo in Downloads; grant access with File permission before starting automation.</string>
     <key>NSHighResolutionCapable</key>
     <true/>
     <key>NSPrincipalClass</key>

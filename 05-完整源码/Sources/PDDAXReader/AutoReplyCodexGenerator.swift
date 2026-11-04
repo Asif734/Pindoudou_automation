@@ -71,6 +71,8 @@ struct AutoReplyCodexGenerator: AutoReplyGenerating, Sendable {
         var enrichedCapture = capture
         let evidence = await evidencePreparer.prepare(capture: capture)
         enrichedCapture.knowledgeEvidence = evidence
+        AutomationStepLog.record(root: sessionRegistry.rootDirectory, uid: capture.uid,
+            step: "knowledge-prepared", detail: "mode=\(evidence.mode.rawValue) duration_ms=\(evidence.diagnostic.durationMilliseconds) hash_cache_hit=\(evidence.diagnostic.hashCacheHit.map(String.init) ?? "unknown") hashed_bytes=\(evidence.diagnostic.hashedByteCount ?? 0)")
         let promptSHA256 = try CustomerServicePrompt.runtimeSHA256()
         let knowledgeSHA256 = evidence.diagnostic.knowledgeBaseSHA256
 
@@ -79,7 +81,7 @@ struct AutoReplyCodexGenerator: AutoReplyGenerating, Sendable {
             let legacyCheckpoint = binding.historyCheckpoint?.requiresFullHistoryContinuation == true
             let directKnowledgeCompatible = evidence.mode != .directLocal
                 || (binding.knowledgeSHA256 == knowledgeSHA256 && binding.promptSHA256 == promptSHA256)
-            let compatible = directKnowledgeCompatible && !binding.contaminated
+            let compatible = binding.matchesCurrentModel && directKnowledgeCompatible && !binding.contaminated
                 && binding.turnCount < 40
                 && binding.submittedBytes < 4_000_000
                 && (legacyCheckpoint
@@ -97,7 +99,8 @@ struct AutoReplyCodexGenerator: AutoReplyGenerating, Sendable {
                             capture: enrichedCapture,
                             submission: submission,
                             sessionID: binding.threadID,
-                            continuation: true
+                            continuation: true,
+                            previousTokenUsage: binding.threadTokenUsage
                         )
                         let submittedPrompt = try AutoReplyPromptBuilder.buildContinuation(
                             capture: enrichedCapture,
@@ -112,7 +115,8 @@ struct AutoReplyCodexGenerator: AutoReplyGenerating, Sendable {
                             knowledgeSHA256: knowledgeSHA256,
                             turnCount: binding.turnCount + 1,
                             submittedBytes: binding.submittedBytes + submittedPrompt.utf8.count,
-                            contaminated: turn.contaminated
+                            contaminated: turn.contaminated,
+                            threadTokenUsage: turn.threadTokenUsage
                         ))
                         return CodexReplyResult(
                             reply: turn.reply,
@@ -132,6 +136,10 @@ struct AutoReplyCodexGenerator: AutoReplyGenerating, Sendable {
                     try sessionRegistry.invalidate(uid: capture.uid)
                 }
             } else {
+                if !binding.matchesCurrentModel {
+                    AutomationStepLog.record(root: sessionRegistry.rootDirectory, uid: capture.uid,
+                        step: "codex-session-model-reset", detail: "previous_model=\(binding.model ?? "unknown") model=\(CodexInvocation.model) reasoning=\(CodexInvocation.reasoningEffort); full history retained")
+                }
                 try sessionRegistry.invalidate(uid: capture.uid)
             }
         }
@@ -173,7 +181,8 @@ struct AutoReplyCodexGenerator: AutoReplyGenerating, Sendable {
                 capture: enrichedCapture,
                 submission: submission
             ).utf8.count,
-            contaminated: turn.contaminated
+            contaminated: turn.contaminated,
+            threadTokenUsage: turn.threadTokenUsage
         ))
         return CodexReplyResult(
             reply: turn.reply,
@@ -186,9 +195,12 @@ struct AutoReplyCodexGenerator: AutoReplyGenerating, Sendable {
     }
 
     private struct TurnResult {
+        var tokenUsage: CodexTokenUsage? = nil
+        var threadTokenUsage: CodexTokenUsage? = nil
         var submissionID: UUID? = nil
         var answerFound = true
         var imagePaths: [String] = []
+        var videoAnalysisReports: [PDDVideoAnalysisReport] = []
         var outgoingImages: [DatasetReplyImage] = []
         var semanticEvidence: KnowledgeEvidence? = nil
         var reply: String
@@ -206,6 +218,7 @@ struct AutoReplyCodexGenerator: AutoReplyGenerating, Sendable {
     private struct ReplyDocument: Decodable {
         let answerFound: Bool?
         let imagePaths: [String]?
+        let videoAnalysisReports: [PDDVideoAnalysisReport]?
         let requestKind: CustomerRequestKind?
         let issueHasNoSolution: Bool?
         let clarificationReply: String?
@@ -217,6 +230,7 @@ struct AutoReplyCodexGenerator: AutoReplyGenerating, Sendable {
         private enum CodingKeys: String, CodingKey {
             case answerFound = "answer_found"
             case imagePaths = "image_paths"
+            case videoAnalysisReports = "video_analysis_reports"
             case requestKind = "request_kind"
             case issueHasNoSolution = "issue_has_no_solution"
             case clarificationReply = "clarification_reply"
@@ -231,10 +245,28 @@ struct AutoReplyCodexGenerator: AutoReplyGenerating, Sendable {
         capture: AutoReplyCapture,
         submission: HistorySubmission,
         sessionID: String?,
-        continuation: Bool
+        continuation: Bool,
+        previousTokenUsage: CodexTokenUsage? = nil
     ) async throws -> TurnResult {
-        var turn = try await runSingleTurn(capture: capture, submission: submission,
+        let reportCache = PDDVideoAnalysisReportCache(root: sessionRegistry.rootDirectory)
+        let preparedSubmission = reportCache.reusingReports(in: submission, uid: capture.uid)
+        if !capture.videoAttachments.isEmpty {
+            AutomationStepLog.record(root: sessionRegistry.rootDirectory, uid: capture.uid,
+                step: "video-analysis-report-cache", detail: "reused=\(preparedSubmission.reusedVideoAnalyses.count) analyze=\(preparedSubmission.videoAttachments.count)")
+        }
+        var turn = try await runSingleTurn(capture: capture, submission: preparedSubmission,
                                            sessionID: sessionID, continuation: continuation)
+        // This CLI reports cumulative thread usage, including resumed turns.
+        // Preserve the counter for the next turn; expose only this turn's delta.
+        turn.threadTokenUsage = turn.tokenUsage
+        if continuation {
+            turn.tokenUsage = previousTokenUsage.flatMap { previous in
+                turn.threadTokenUsage?.subtracting(previous)
+            }
+        }
+        let usage = turn.tokenUsage
+        AutomationStepLog.record(root: sessionRegistry.rootDirectory, uid: capture.uid,
+            step: "codex-invocation-completed", detail: "model=\(CodexInvocation.model) duration_ms=\(turn.durationMilliseconds) usage_scope=\(usage == nil ? "unavailable" : "turn") input_tokens=\(usage.map { String($0.inputTokens) } ?? "unknown") cached_input_tokens=\(usage.map { String($0.cachedInputTokens) } ?? "unknown") output_tokens=\(usage.map { String($0.outputTokens) } ?? "unknown") total_tokens=\(usage.map { String($0.totalTokens) } ?? "unknown")")
         if capture.batch?.incomingHandoffKey != nil {
             // The platform event requests a continuation reply, never a new transfer.
             if turn.action == .replyThenTransfer, let clarification = turn.clarificationReply {
@@ -279,6 +311,17 @@ struct AutoReplyCodexGenerator: AutoReplyGenerating, Sendable {
         }
         try CustomerMessageReceipts(root: sessionRegistry.rootDirectory)
             .completed(capture, submissionID: turn.submissionID, at: now())
+        do {
+            try reportCache.save(turn.videoAnalysisReports, uid: capture.uid,
+                                 analyzedVideos: preparedSubmission.videoAttachments)
+            if !turn.videoAnalysisReports.isEmpty {
+                AutomationStepLog.record(root: sessionRegistry.rootDirectory, uid: capture.uid,
+                    step: "video-analysis-report-saved", detail: "reports=\(turn.videoAnalysisReports.count)")
+            }
+        } catch {
+            AutomationStepLog.record(root: sessionRegistry.rootDirectory, uid: capture.uid,
+                step: "video-analysis-report-cache-write-failed", detail: error.localizedDescription)
+        }
         AutomationStepLog.record(root: sessionRegistry.rootDirectory, uid: capture.uid,
             step: "generation-completed", detail: "action=\(turn.action.rawValue) reason=\(turn.transferReason.rawValue)")
         return turn
@@ -328,8 +371,16 @@ struct AutoReplyCodexGenerator: AutoReplyGenerating, Sendable {
         var schema = try JSONSerialization.jsonObject(with: Data(textSchema.utf8)) as! [String: Any]
         var properties = schema["properties"] as! [String: Any]
         properties["image_paths"] = ["type": "array", "items": ["type": "string"], "maxItems": 3]
+        if !capture.videoAttachments.isEmpty {
+            properties["video_analysis_reports"] = ["type": "array", "maxItems": capture.videoAttachments.count,
+                "items": ["type": "object", "properties": [
+                    "sha256": ["type": "string"], "observations": ["type": "string", "maxLength": 12000],
+                    "limitations": ["type": "string", "maxLength": 4000]],
+                    "required": ["sha256", "observations", "limitations"], "additionalProperties": false]]
+        }
         schema["properties"] = properties
         schema["required"] = (schema["required"] as! [String]) + ["image_paths"]
+            + (capture.videoAttachments.isEmpty ? [] : ["video_analysis_reports"])
         try JSONSerialization.data(withJSONObject: schema, options: .sortedKeys).write(to: schemaURL, options: .atomic)
         let arguments = CodexInvocation.arguments(
             sessionID: sessionID,
@@ -344,6 +395,8 @@ struct AutoReplyCodexGenerator: AutoReplyGenerating, Sendable {
             ? try AutoReplyPromptBuilder.buildContinuation(capture: capture, submission: submission)
             : try AutoReplyPromptBuilder.buildInitial(capture: capture, submission: submission)
         let prompt = basePrompt + "\n<application_transfer_state>\n" + policyContext + "\n</application_transfer_state>"
+        AutomationStepLog.record(root: sessionRegistry.rootDirectory, uid: capture.uid,
+            step: "codex-invocation-started", detail: "model=\(CodexInvocation.model) reasoning=\(CodexInvocation.reasoningEffort) session=\(continuation ? "resume" : "new") prompt_bytes=\(prompt.utf8.count) images=\(imageURLs.count) video_frames=\(videoFrameURLs.count)")
         let submissionID = UUID()
         try CustomerMessageReceipts(root: sessionRegistry.rootDirectory).begin(capture, submissionID: submissionID)
         let stream = AutoReplyCLIStream()
@@ -431,10 +484,14 @@ struct AutoReplyCodexGenerator: AutoReplyGenerating, Sendable {
         var completed = false
         var startedThreadID: String?
         var events: [CodexExecutionEvent] = []
+        var tokenUsage: CodexTokenUsage?
         for line in process.stdout.split(separator: "\n") {
             guard let object = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any],
                   let type = object["type"] as? String else { continue }
-            if type == "turn.completed" { completed = true }
+            if type == "turn.completed" {
+                completed = true
+                tokenUsage = CodexTokenUsage(json: object["usage"] as? [String: Any])
+            }
             if type == "thread.started" { startedThreadID = object["thread_id"] as? String }
             events.append(CodexExecutionEvent(type: type, threadID: object["thread_id"] as? String))
         }
@@ -453,8 +510,10 @@ struct AutoReplyCodexGenerator: AutoReplyGenerating, Sendable {
         let reply = document.replyText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !reply.isEmpty else { throw AutoReplyCodexGeneratorError.invalidReply("reply_text 为空") }
         return TurnResult(
+            tokenUsage: tokenUsage,
             answerFound: document.answerFound ?? true,
             imagePaths: document.imagePaths ?? [],
+            videoAnalysisReports: document.videoAnalysisReports ?? [],
             reply: reply,
             action: document.action,
             transferReason: document.transferReason,
@@ -484,7 +543,11 @@ struct AutoReplyCodexGenerator: AutoReplyGenerating, Sendable {
         AutoReplyGenerationDiagnostic(
             knowledge: (turn.semanticEvidence ?? evidence).diagnostic,
             codexDurationMilliseconds: turn.durationMilliseconds,
-            events: turn.events
+            events: turn.events,
+            model: CodexInvocation.model,
+            reasoningEffort: CodexInvocation.reasoningEffort,
+            tokenUsage: turn.tokenUsage,
+            tokenUsageScope: turn.tokenUsage == nil ? nil : "turn"
         )
     }
 }

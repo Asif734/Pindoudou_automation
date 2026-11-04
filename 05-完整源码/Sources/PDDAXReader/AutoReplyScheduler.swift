@@ -1569,10 +1569,10 @@ final class AutoReplyScheduler: ObservableObject {
     private func admitRecoveredVideo(uid: String, attachment: AutoReplyVideoAttachment) {
         guard !state.jobs.contains(where: {
             $0.uid == uid && $0.videoAttachments.contains { existing in
-                existing.sha256 == attachment.sha256
+                existing.messageID == attachment.messageID
             }
         }) else { return }
-        let messageID = "video-analysis:\(attachment.sha256)"
+        let messageID = "video-analysis:\(attachment.messageID)"
         let message = PDDChatMessage(
             id: messageID, sender: .customer, content: "[视频]",
             displayTime: nil, kind: .video, capturedAt: now()

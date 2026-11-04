@@ -2,7 +2,7 @@ import XCTest
 @testable import PDDAXReader
 
 final class PDDVideoAnalysisInboxTests: XCTestCase {
-    func testSameCustomerAndContentWithDifferentMessageIDsIsRejected() async throws {
+    func testSameCustomerResendingIdenticalVideoInNewMessageIsAccepted() async throws {
         let fixture = try Fixture()
         defer { fixture.cleanup() }
         let inbox = PDDVideoAnalysisInbox(stateURL: fixture.stateURL)
@@ -10,7 +10,7 @@ final class PDDVideoAnalysisInboxTests: XCTestCase {
         let first = try await inbox.claim(fixture.receipt(uid: "PDD-one", messageID: "video-a"))
         let second = try await inbox.claim(fixture.receipt(uid: "PDD-one", messageID: "video-b"))
         XCTAssertTrue(first)
-        XCTAssertFalse(second)
+        XCTAssertTrue(second)
     }
 
     func testSameContentFromDifferentCustomersIsAccepted() async throws {
@@ -24,7 +24,7 @@ final class PDDVideoAnalysisInboxTests: XCTestCase {
         XCTAssertTrue(second)
     }
 
-    func testClaimSurvivesInboxRecreation() async throws {
+    func testNewOccurrenceRemainsAcceptedAfterInboxRecreation() async throws {
         let fixture = try Fixture()
         defer { fixture.cleanup() }
         let first = try await PDDVideoAnalysisInbox(stateURL: fixture.stateURL)
@@ -33,7 +33,19 @@ final class PDDVideoAnalysisInboxTests: XCTestCase {
         let second = try await PDDVideoAnalysisInbox(stateURL: fixture.stateURL)
             .claim(fixture.receipt(uid: "PDD-one", messageID: "video-b"))
         XCTAssertTrue(first)
-        XCTAssertFalse(second)
+        XCTAssertTrue(second)
+    }
+
+    func testOldContentHashLedgerDoesNotBlockAfternoonResend() async throws {
+        let fixture = try Fixture()
+        defer { fixture.cleanup() }
+        let entry: [String: Any] = ["uid": "PDD-one", "messageID": "morning",
+            "contentSHA256": "same-real-content-sha256", "videoFilePath": fixture.videoURL.path, "claimedAt": 0]
+        try JSONSerialization.data(withJSONObject: ["schemaVersion": 1, "entries": [entry]])
+            .write(to: fixture.stateURL)
+        let accepted = try await PDDVideoAnalysisInbox(stateURL: fixture.stateURL)
+            .claim(fixture.receipt(uid: "PDD-one", messageID: "afternoon"))
+        XCTAssertTrue(accepted)
     }
 
     func testExactMessageCanResumeAfterRestart() async throws {
@@ -46,7 +58,7 @@ final class PDDVideoAnalysisInboxTests: XCTestCase {
         XCTAssertTrue(resumed)
     }
 
-    func testLegacySchedulerAttachmentSeedsContentDeduplication() async throws {
+    func testLegacySchedulerContentDoesNotSuppressNewVideoOccurrence() async throws {
         let fixture = try Fixture()
         defer { fixture.cleanup() }
         var state = AutoReplyPersistentState.empty
@@ -72,7 +84,7 @@ final class PDDVideoAnalysisInboxTests: XCTestCase {
             fixture.receipt(uid: "PDD-one", messageID: "new-message")
         )
 
-        XCTAssertFalse(accepted)
+        XCTAssertTrue(accepted)
     }
 }
 

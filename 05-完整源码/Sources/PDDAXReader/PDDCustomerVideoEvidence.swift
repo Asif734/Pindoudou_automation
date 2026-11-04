@@ -66,6 +66,12 @@ private struct PDDCustomerVideoAudioExporter: Sendable {
 }
 
 struct PDDCustomerVideoEvidencePreparer: PDDCustomerVideoEvidencePreparing {
+    private struct CachedEvidence: Codable {
+        let version: Int
+        let uid: String
+        let attachment: AutoReplyVideoAttachment
+    }
+
     let rootURL: URL
     let transcriber: any PDDVideoSpeechTranscribing
     let frameExtractor: any PDDVideoFrameExtracting
@@ -91,6 +97,7 @@ struct PDDCustomerVideoEvidencePreparer: PDDCustomerVideoEvidencePreparing {
 
     func prepare(download: PDDDownloadedCustomerVideo) async throws -> AutoReplyVideoAttachment {
         try Task.checkCancellation()
+        if let reused = reusableEvidence(for: download) { return reused }
         let staging = rootURL.appendingPathComponent(
             ".\(download.key.messageHash).\(UUID().uuidString)", isDirectory: true
         )
@@ -151,7 +158,7 @@ struct PDDCustomerVideoEvidencePreparer: PDDCustomerVideoEvidencePreparing {
             let transcriptText = transcript.map {
                 String(format: "%.2f–%.2f秒：%@", $0.startSeconds, $0.startSeconds + $0.durationSeconds, $0.text)
             }.joined(separator: "；")
-            return AutoReplyVideoAttachment(
+            let attachment = AutoReplyVideoAttachment(
                 messageID: download.messageID,
                 localURL: download.fileURL,
                 sha256: download.summary.sha256,
@@ -168,10 +175,64 @@ struct PDDCustomerVideoEvidencePreparer: PDDCustomerVideoEvidencePreparing {
                 audioLocalURL: audioSaved ? final.appendingPathComponent(audioName) : nil,
                 manifestLocalURL: final.appendingPathComponent("manifest.json")
             )
+            // Cache failure must not prevent this customer message from proceeding.
+            try? saveReusableEvidence(attachment, download: download)
+            return attachment
         } catch {
             try? FileManager.default.removeItem(at: staging)
             throw error
         }
+    }
+
+    private func cacheURL(for download: PDDDownloadedCustomerVideo) -> URL {
+        let digest = SHA256.hash(data: Data(download.summary.sha256.utf8))
+            .map { String(format: "%02x", $0) }.joined()
+        return rootURL.appendingPathComponent(".content-cache", isDirectory: true)
+            .appendingPathComponent(download.key.customerHash, isDirectory: true)
+            .appendingPathComponent(digest + ".json")
+    }
+
+    private func reusableEvidence(for download: PDDDownloadedCustomerVideo) -> AutoReplyVideoAttachment? {
+        guard let data = try? Data(contentsOf: cacheURL(for: download)),
+              let cached = try? JSONDecoder().decode(CachedEvidence.self, from: data),
+              cached.version == 1, cached.uid == download.uid else { return nil }
+        let old = cached.attachment
+        guard !old.sha256.isEmpty, old.sha256 == download.summary.sha256,
+              old.byteCount == download.summary.byteCount,
+              old.durationSeconds == download.summary.durationSeconds,
+              old.width == download.summary.width, old.height == download.summary.height,
+              old.videoCodec == download.summary.videoCodec, old.audioCodec == download.summary.audioCodec,
+              !old.frames.isEmpty,
+              let manifestURL = old.manifestLocalURL,
+              let manifestData = try? Data(contentsOf: manifestURL),
+              let manifest = try? JSONDecoder().decode(PDDCustomerVideoEvidenceManifest.self, from: manifestData),
+              manifest.schemaVersion == 2, manifest.frames.count == old.frames.count,
+              manifest.transcript == old.transcriptSegments,
+              // An earlier permission denial or failed transcription is not a complete cache hit.
+              old.audioCodec == nil || !old.transcriptSegments.isEmpty,
+              old.audioLocalURL.map({ FileManager.default.fileExists(atPath: $0.path) }) ?? true,
+              zip(old.frames, manifest.frames).allSatisfy({ frame, recorded in
+                  frame.timestampSeconds == recorded.timestampSeconds
+                      && frame.localURL.lastPathComponent == recorded.fileName
+                      && (try? Self.digest(frame.localURL)) == recorded.sha256
+              }) else { return nil }
+        return AutoReplyVideoAttachment(
+            messageID: download.messageID, localURL: download.fileURL,
+            sha256: download.summary.sha256, byteCount: download.summary.byteCount,
+            durationSeconds: download.summary.durationSeconds,
+            width: download.summary.width, height: download.summary.height,
+            videoCodec: download.summary.videoCodec, audioCodec: download.summary.audioCodec,
+            frames: old.frames, transcript: old.transcript, transcriptSegments: old.transcriptSegments,
+            diagnostic: "reused_verified_video_evidence source_message_id=\(old.messageID)",
+            audioLocalURL: old.audioLocalURL, manifestLocalURL: old.manifestLocalURL
+        )
+    }
+
+    private func saveReusableEvidence(_ attachment: AutoReplyVideoAttachment, download: PDDDownloadedCustomerVideo) throws {
+        let url = cacheURL(for: download)
+        try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try JSONEncoder().encode(CachedEvidence(version: 1, uid: download.uid, attachment: attachment))
+            .write(to: url, options: .atomic)
     }
 
     private static func digest(_ url: URL) throws -> String {

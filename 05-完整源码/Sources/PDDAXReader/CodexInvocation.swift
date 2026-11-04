@@ -6,7 +6,7 @@ enum CodexTurnMode: Equatable, Sendable {
 }
 
 struct CodexInvocation: Equatable, Sendable {
-    static let model = "gpt-5.6-sol"
+    static let model = "gpt-6.1-sol"
     static let reasoningEffort = "medium"
 
     let arguments: [String]

@@ -11,26 +11,30 @@ struct CodexHistoryCheckpoint: Codable, Equatable, Sendable {
     let prefixSHA256: String
     let attachmentSHA256: [String: String]
     let requiresFullHistoryContinuation: Bool
+    let videoSHA256ByMessageID: [String: String]?
 
     init(
         historyByteCount: Int,
         prefixSHA256: String,
         attachmentSHA256: [String: String],
-        requiresFullHistoryContinuation: Bool = false
+        requiresFullHistoryContinuation: Bool = false,
+        videoSHA256ByMessageID: [String: String]? = nil
     ) {
         self.historyByteCount = historyByteCount
         self.prefixSHA256 = prefixSHA256
         self.attachmentSHA256 = attachmentSHA256
         self.requiresFullHistoryContinuation = requiresFullHistoryContinuation
+        self.videoSHA256ByMessageID = videoSHA256ByMessageID
     }
 
     private enum CodingKeys: String, CodingKey {
         case historyByteCount, prefixSHA256, attachmentSHA256
-        case messageDigests, submittedImageSHA256
+        case messageDigests, submittedImageSHA256, videoSHA256ByMessageID
     }
 
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
+        videoSHA256ByMessageID = try container.decodeIfPresent([String: String].self, forKey: .videoSHA256ByMessageID)
         if container.contains(.historyByteCount) {
             historyByteCount = try container.decode(Int.self, forKey: .historyByteCount)
             prefixSHA256 = try container.decode(String.self, forKey: .prefixSHA256)
@@ -58,6 +62,7 @@ struct CodexHistoryCheckpoint: Codable, Equatable, Sendable {
         try container.encode(historyByteCount, forKey: .historyByteCount)
         try container.encode(prefixSHA256, forKey: .prefixSHA256)
         try container.encode(attachmentSHA256, forKey: .attachmentSHA256)
+        try container.encodeIfPresent(videoSHA256ByMessageID, forKey: .videoSHA256ByMessageID)
     }
 }
 
@@ -65,8 +70,9 @@ struct HistorySubmission: Equatable, Sendable {
     let mode: HistorySubmissionMode
     let historyJSONL: String
     let imageAttachments: [AutoReplyImageAttachment]
-    let videoAttachments: [AutoReplyVideoAttachment]
+    var videoAttachments: [AutoReplyVideoAttachment]
     let checkpoint: CodexHistoryCheckpoint
+    var reusedVideoAnalyses: [PDDReusedVideoAnalysis] = []
 }
 
 enum HistoryContinuation {
@@ -80,10 +86,18 @@ enum HistoryContinuation {
             capture.imageAttachments.map { ($0.localURL.path, $0.sha256) }
             + capture.videoAttachments.map { ($0.localURL.path, $0.sha256) }
         )
+        let continuesHistory = previous.map {
+            $0.requiresFullHistoryContinuation || ($0.historyByteCount <= historyData.count
+                && sha256(historyData.prefix($0.historyByteCount)) == $0.prefixSHA256)
+        } ?? false
+        let knownVideos = continuesHistory ? previous?.videoSHA256ByMessageID ?? [:] : [:]
+        let currentVideos = Dictionary(uniqueKeysWithValues: capture.videoAttachments.map { ($0.messageID, $0.sha256) })
+        let submittedVideos = capture.videoAttachments.filter { knownVideos[$0.messageID] != $0.sha256 }
         let checkpoint = CodexHistoryCheckpoint(
             historyByteCount: historyData.count,
             prefixSHA256: sha256(historyData),
-            attachmentSHA256: attachmentDigests
+            attachmentSHA256: attachmentDigests,
+            videoSHA256ByMessageID: knownVideos.merging(currentVideos) { _, current in current }
         )
         if let previous, previous.requiresFullHistoryContinuation {
             let knownDigests = Set(previous.attachmentSHA256.values)
@@ -93,9 +107,7 @@ enum HistoryContinuation {
                 imageAttachments: capture.imageAttachments.filter {
                     !knownDigests.contains($0.sha256)
                 },
-                videoAttachments: capture.videoAttachments.filter {
-                    !knownDigests.contains($0.sha256)
-                },
+                videoAttachments: submittedVideos,
                 checkpoint: checkpoint
             )
         }
@@ -116,7 +128,7 @@ enum HistoryContinuation {
             mode: .incremental,
             historyJSONL: suffix,
             imageAttachments: capture.imageAttachments.filter { !knownDigests.contains($0.sha256) },
-            videoAttachments: capture.videoAttachments.filter { !knownDigests.contains($0.sha256) },
+            videoAttachments: submittedVideos,
             checkpoint: checkpoint
         )
     }

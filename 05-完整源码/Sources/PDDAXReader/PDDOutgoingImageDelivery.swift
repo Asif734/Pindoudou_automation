@@ -63,14 +63,32 @@ enum PDDOutgoingImageControls {
                 func flatten(_ current: AXNodeSnapshot) -> [AXNodeSnapshot] { [current] + current.children.flatMap(flatten) }
                 let all = flatten(node)
                 let failedOrPending = all.contains { item in
-                    item.domClasses.contains { ["sending", "loading", "failed", "error"].contains($0.lowercased()) }
-                        || item.attributes.contains { ["发送失败", "发送中", "上传中"].contains($0.1) }
+                    item.domClasses.contains { value in
+                        let tokens = value.lowercased().split { !$0.isLetter && !$0.isNumber }
+                        return tokens.contains { ["sending", "loading", "failed", "error"].contains(String($0)) }
+                    }
+                        || item.attributes.contains { attribute in
+                            ["AXValue", "AXTitle", "AXDescription"].contains(attribute.0)
+                                && ["发送失败", "发送中", "上传中"].contains { attribute.1.contains($0) }
+                        }
                 }
                 let remoteImage = all.filter { $0.domClasses.contains("image-msg") }.flatMap(flatten).contains {
                     $0.attributes.contains { ["AXURL", "AXValue", "AXDescription"].contains($0.0)
                         && ($0.1.hasPrefix("https://") || $0.1.hasPrefix("http://")) }
                 }
-                if !failedOrPending && remoteImage { confirmed.insert(id) }
+                // Merchant builds can render the image as a CSS background and
+                // expose no AXURL/AXImage. A platform read-state label outside
+                // the image content also proves this service image was posted.
+                // Never interpret an image's own alt text as delivery status.
+                func hasReadState(_ item: AXNodeSnapshot) -> Bool {
+                    guard !item.domClasses.contains("image-msg") else { return false }
+                    let status = item.role == "AXStaticText" && item.attributes.contains {
+                        ["AXValue", "AXTitle"].contains($0.0)
+                            && ["已读", "未读"].contains($0.1.trimmingCharacters(in: .whitespacesAndNewlines))
+                    }
+                    return status || item.children.contains(where: hasReadState)
+                }
+                if !failedOrPending && (remoteImage || hasReadState(node)) { confirmed.insert(id) }
                 return
             }
             node.children.forEach(visit)

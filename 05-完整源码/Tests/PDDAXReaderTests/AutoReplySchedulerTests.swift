@@ -1325,6 +1325,22 @@ final class AutoReplySchedulerTests: XCTestCase {
         XCTAssertEqual(f.scheduler.jobs[1].videoAttachments.map(\.messageID), ["video-1"])
     }
 
+    func testRecoveredResentVideoWithSameBytesGetsOwnJobButRepeatedEventDoesNot() async throws {
+        let uid = "PDD-video-occurrences"
+        let fixture = try SchedulerFixture(capturesByUID: [:])
+        let morning = videoAttachment(messageID: "morning", sha256: "identical-content")
+        let afternoon = videoAttachment(messageID: "afternoon", sha256: "identical-content")
+        for attachment in [morning, afternoon, afternoon] {
+            await fixture.scheduler.receiveVideoTransferEvent(.init(uid: uid,
+                messageID: attachment.messageID, phase: .readyForGeneration,
+                attachment: attachment, recovered: true))
+        }
+        XCTAssertEqual(fixture.scheduler.jobs.count, 2)
+        XCTAssertEqual(fixture.scheduler.jobs.flatMap { $0.videoAttachments.map(\.messageID) }, ["morning", "afternoon"])
+        XCTAssertEqual(fixture.scheduler.jobs.map { $0.capture.batch?.events.first?.messageID },
+            ["video-analysis:morning", "video-analysis:afternoon"])
+    }
+
     func testExhaustedGenerationFailureParksOnlyThatRevisionWithoutSilencingOtherUID() async throws {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("pdd-generation-failure-continuity-\(UUID().uuidString)")

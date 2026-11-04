@@ -26,7 +26,7 @@ final class AdaptiveConcurrencyPolicy: @unchecked Sendable {
         let memoryCapacity = Int((availableMemoryBytes - reserve) / Self.gibibyte)
         let totalDemand = max(queueDepth, activeCleanup)
         var capacity = min(totalDemand, memoryCapacity, emergencyCeiling)
-        if isCoolingDown(at: now) { capacity /= 2 }
+        if capacity > 0, isCoolingDown(at: now) { capacity = max(1, capacity / 2) }
         return capacity
     }
 

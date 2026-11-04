@@ -2,6 +2,18 @@ import XCTest
 @testable import PDDAXReader
 
 final class CodexSessionRegistryTests: XCTestCase {
+    func testLegacyBindingCannotResumeUnderNewModel() throws {
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        let legacy = try decoder.decode(CodexSessionBinding.self, from: Data(
+            #"{"uid":"GZC-000001","threadID":"old","lastUsedAt":"2026-11-04T00:00:00Z"}"#.utf8))
+        XCTAssertFalse(legacy.matchesCurrentModel)
+        XCTAssertNil(legacy.model)
+        XCTAssertTrue(CodexSessionBinding(uid: legacy.uid, threadID: "new", lastUsedAt: Date()).matchesCurrentModel)
+        XCTAssertFalse(CodexSessionBinding(uid: legacy.uid, threadID: "old", lastUsedAt: Date(),
+            model: "gpt-5.6-sol").matchesCurrentModel)
+    }
+
     func testBindingIsActiveUntilOneHourLeaseExpires() throws {
         let root = temporaryRoot()
         defer { try? FileManager.default.removeItem(at: root) }

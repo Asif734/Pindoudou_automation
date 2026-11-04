@@ -13,7 +13,32 @@ enum PDDBackgroundVideoRecovery {
     }
 
     static func stableVideoURL(root: URL, key: PDDVideoTransferKey) -> URL {
-        transferDirectory(root: root, key: key).appendingPathComponent("video.mp4")
+        let directory = transferDirectory(root: root, key: key)
+        let legacy = directory.appendingPathComponent("video.mp4")
+        if FileManager.default.fileExists(atPath: legacy.path) { return legacy }
+        let suffix = "_\(key.messageHash.prefix(12)).mp4"
+        let saved = (try? FileManager.default.contentsOfDirectory(at: directory,
+            includingPropertiesForKeys: [.isRegularFileKey], options: [.skipsHiddenFiles])) ?? []
+        let match = saved.filter {
+            $0.lastPathComponent.hasPrefix("video_") && $0.lastPathComponent.hasSuffix(suffix)
+                && (try? $0.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true
+        }.sorted { $0.lastPathComponent < $1.lastPathComponent }.last
+        return match.map { directory.appendingPathComponent($0.lastPathComponent) } ?? legacy
+    }
+
+    static func timestampedFileName(key: PDDVideoTransferKey, savedAt: Date) -> String {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = TimeZone(secondsFromGMT: 0)
+        formatter.dateFormat = "yyyyMMdd'T'HHmmssSSS'Z'"
+        return "video_\(formatter.string(from: savedAt))_\(key.messageHash.prefix(12)).mp4"
+    }
+
+    static func savedVideoURL(root: URL, key: PDDVideoTransferKey, savedAt: Date = Date()) -> URL {
+        let existing = stableVideoURL(root: root, key: key)
+        if FileManager.default.fileExists(atPath: existing.path) { return existing }
+        return transferDirectory(root: root, key: key)
+            .appendingPathComponent(timestampedFileName(key: key, savedAt: savedAt))
     }
 
     static func partialVideoURL(root: URL, key: PDDVideoTransferKey) -> URL {
@@ -54,13 +79,7 @@ enum PDDBackgroundVideoRecovery {
                 uid: uid, messageID: messageID, key: key,
                 fileURL: stableURL, summary: summary
             )
-            guard try await analysisInbox.claim(receipt) else {
-                await eventHandler(.init(
-                    uid: uid, messageID: messageID, phase: .duplicate,
-                    diagnostic: "同一客户的相同视频内容已处理"
-                ))
-                return
-            }
+            _ = try await analysisInbox.claim(receipt)
             await eventHandler(.init(uid: uid, messageID: messageID, phase: .downloaded))
             await eventHandler(.init(uid: uid, messageID: messageID, phase: .preparingEvidence))
             let preparer = PDDCustomerVideoEvidencePreparer(
@@ -75,7 +94,7 @@ enum PDDBackgroundVideoRecovery {
             }
             await eventHandler(.init(
                 uid: uid, messageID: messageID, phase: .readyForGeneration,
-                attachment: attachment, recovered: recovered
+                attachment: attachment, diagnostic: attachment.diagnostic, recovered: recovered
             ))
         } catch is CancellationError {
             return

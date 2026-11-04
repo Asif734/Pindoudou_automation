@@ -94,7 +94,7 @@ final class AutoReplyPromptBuilderTests: XCTestCase {
         let prompt = try AutoReplyPromptBuilder.build(capture: capture)
 
         XCTAssertTrue(prompt.contains("<local_knowledge_access>"))
-        XCTAssertTrue(prompt.contains("Codex 直接读取本地知识库"))
+        XCTAssertTrue(prompt.contains("含实际问题时直接读取本地知识库"))
         XCTAssertFalse(prompt.contains("不得运行命令"))
         XCTAssertFalse(prompt.contains("不得运行命令、读取 Skill、搜索文件、打开知识库文件或重新检索"))
         XCTAssertFalse(prompt.contains("回答前请充分检索"))

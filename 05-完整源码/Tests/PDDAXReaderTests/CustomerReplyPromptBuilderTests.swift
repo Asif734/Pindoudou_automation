@@ -49,7 +49,7 @@ final class CustomerReplyPromptBuilderTests: XCTestCase {
         XCTAssertTrue(create.contains("read-only"))
         XCTAssertTrue(create.contains("web_search=\"disabled\""))
         XCTAssertTrue(create.contains("--output-schema"))
-        XCTAssertTrue(create.contains("gpt-5.6-sol"))
+        XCTAssertTrue(create.contains("gpt-6.1-sol"))
         XCTAssertTrue(create.contains("model_reasoning_effort=\"medium\""))
         XCTAssertEqual(create.last, "-")
         XCTAssertEqual(Array(resume.prefix(6)), ["-a", "never", "--enable", "shell_tool", "exec", "resume"])
