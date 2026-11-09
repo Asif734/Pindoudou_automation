@@ -2,6 +2,9 @@ import XCTest
 @testable import PDDAXReader
 
 final class CodexFailureClassifierTests: XCTestCase {
+    func testWordingCorrectionCannotCreateAnInfrastructureHandoff() {
+        XCTAssertEqual(CodexFailureClassifier.classify(AutoReplyCodexGeneratorError.customerFacingWording("handoff verification")), .ordinaryRetry)
+    }
     func testPermanentHTTPAuthenticationQuotaContextAndSafetyErrorsTransferImmediately() {
         let errors: [Error] = [
             AutoReplyCodexGeneratorError.commandFailed(1, "HTTP 401 Unauthorized"),

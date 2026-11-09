@@ -420,6 +420,7 @@ struct AutoReplyPersistentState: Codable, Equatable, Sendable {
     var pendingVideoBatches: [PDDPendingVideoBatch] = []
     var deferredVideoTransferEvents: [PDDVideoTransferEvent] = []
     var transferTasks: [AutoReplyTransferTask] = []
+    var videoHoldingNotices: [PDDVideoHoldingNotice] = []
 
     private enum CodingKeys: String, CodingKey {
         case schemaVersion, nextSequence, jobs, answeredCursors, baselinedUIDs
@@ -430,6 +431,7 @@ struct AutoReplyPersistentState: Codable, Equatable, Sendable {
         case messageSourceSelectorStatesByUID
         case pendingVideoBatches, deferredVideoTransferEvents
         case transferTasks
+        case videoHoldingNotices
     }
 
     init() {}
@@ -477,6 +479,9 @@ struct AutoReplyPersistentState: Codable, Equatable, Sendable {
         ) ?? []
         transferTasks = try container.decodeIfPresent(
             [AutoReplyTransferTask].self, forKey: .transferTasks
+        ) ?? []
+        videoHoldingNotices = try container.decodeIfPresent(
+            [PDDVideoHoldingNotice].self, forKey: .videoHoldingNotices
         ) ?? []
     }
 

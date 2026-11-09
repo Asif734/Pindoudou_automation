@@ -2,6 +2,13 @@ import XCTest
 @testable import PDDAXReader
 
 final class PDDAXBackendPolicyTests: XCTestCase {
+    func testReadsAXActionsForTransferMenuAndRecipientGroups() {
+        for label in ["转移", "无原因直接转移"] {
+            XCTAssertTrue(PDDAXActionPolicy.shouldReadActions(role: "AXGroup", value: label, title: nil, domClasses: []))
+        }
+        XCTAssertTrue(PDDAXActionPolicy.shouldReadActions(role: "AXGroup", value: nil, title: nil,
+            domClasses: ["item-btn-transfer"]))
+    }
     func testSemanticWalkRequestsAllTextAndMediaAttributes() {
         XCTAssertEqual(
             Set(PDDAXBackendPolicy.semanticAttributeNames),

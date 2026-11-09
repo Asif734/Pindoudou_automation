@@ -2,6 +2,29 @@ import XCTest
 @testable import PDDAXReader
 
 final class PDDAXControlSelectionTests: XCTestCase {
+    func testTransferDialogBackdropIsInsideWebAreaAndOutsideModal() {
+        let nodes = [
+            node("web", role: "AXWebArea", frame: .init(x: 100, y: 50, width: 1200, height: 800)),
+            node("dialog", parent: "web", role: "AXGroup", value: "转移会话", frame: .init(x: 400, y: 200, width: 600, height: 400)),
+            node("search", parent: "dialog", role: "AXTextField", value: "请输入内容", settable: true)
+        ]
+        XCTAssertEqual(PDDAXControlSelection.transferDialogDismissPoint(in: nodes), .init(x: 108, y: 450))
+        XCTAssertNil(PDDAXControlSelection.transferDialogDismissPoint(in: Array(nodes.dropFirst())))
+    }
+
+    func testNestedRecipientTransferLabelsAreDeduplicatedAndOffscreenRowsAreIgnored() throws {
+        let nodes = [
+            node("dialog", role: "AXGroup", value: "转移会话"),
+            node("search", parent: "dialog", role: "AXTextField", value: "请输入内容", settable: true),
+            node("row", parent: "dialog", role: "AXRow"),
+            node("name", parent: "row", role: "AXStaticText", value: "客服甲"),
+            node("remark", parent: "row", role: "AXStaticText", value: "售后"),
+            node("control", parent: "row", role: "AXGroup", value: "转移", classes: ["item-btn-transfer"], frame: .init(x: 500, y: 200, width: 50, height: 25)),
+            node("text", parent: "control", role: "AXStaticText", value: "转移", frame: .init(x: 500, y: 200, width: 30, height: 20)),
+            node("offscreen", parent: "row", role: "AXGroup", value: "转移")
+        ]
+        XCTAssertEqual(try PDDAXControlSelection.afterSalesTransferActions(in: nodes).map(\.controlID), ["control"])
+    }
     func testSelectsOnlyComposerUnderChatPanel() throws {
         XCTAssertEqual(try PDDAXControlSelection.composer(in: fixtureNodes), "composer")
     }

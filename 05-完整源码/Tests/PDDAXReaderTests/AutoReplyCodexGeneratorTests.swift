@@ -106,7 +106,7 @@ final class AutoReplyCodexGeneratorTests: XCTestCase {
             _ = try await generator.generate(try capture(uid: "GZC-000001"))
             XCTFail("Prohibited customer wording must not reach delivery")
         } catch let error as AutoReplyCodexGeneratorError {
-            guard case .invalidReply = error else { return XCTFail("Unexpected error: \(error)") }
+            guard case .customerFacingWording = error else { return XCTFail("Unexpected error: \(error)") }
         }
     }
 

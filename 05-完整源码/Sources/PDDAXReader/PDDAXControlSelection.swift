@@ -125,7 +125,15 @@ enum PDDAXControlSelection {
                 && !hasAncestor(node, in: index, matching: isConversationList)
                 && !isDescendant(node, of: dialogID, in: index)
         }
-        return try uniqueID(candidates, name: "当前会话的转移会话控件")
+        var seen = Set<ID>()
+        let controls = candidates.compactMap { node -> PDDAXSemanticNode<ID>? in
+            let control = nearestAncestor(of: node, in: index, matching: {
+                $0.actionNames.contains("AXPress") && PDDTransferMenuControls.valid($0.frame)
+                    && $0.frame.width <= 400 && $0.frame.height <= 100
+            }) ?? node
+            return seen.insert(control.id).inserted ? control : nil
+        }
+        return try uniqueID(controls, name: "当前会话的转移会话控件")
     }
 
     static func ordinaryTransferActions<ID: Hashable>(
@@ -136,11 +144,13 @@ enum PDDAXControlSelection {
         }
         let index = Dictionary(uniqueKeysWithValues: nodes.map { ($0.id, $0) })
         let dialogNodes = descendants(of: dialog.id, nodes: nodes)
+        var seen = Set<ID>()
         return dialogNodes.filter { exactTexts($0).contains("转移") }.compactMap { labelNode in
             let control = nearestAncestor(
                 of: labelNode, in: index,
                 matching: { hasClass($0, fragment: "item-btn-transfer") }
             ) ?? labelNode
+            guard PDDTransferMenuControls.valid(control.frame), seen.insert(control.id).inserted else { return nil }
             let sameVisualRow = dialogNodes.filter { candidate in
                 guard candidate.id != labelNode.id,
                       candidate.role == "AXStaticText",
@@ -153,8 +163,9 @@ enum PDDAXControlSelection {
             let hierarchicalRow = nearestAncestor(
                 of: labelNode, in: index, matching: { $0.role == "AXRow" }
             ).map { [ $0 ] + descendants(of: $0.id, nodes: nodes) } ?? []
-            let label = (sameVisualRow.sorted { $0.frame.minX < $1.frame.minX }
-                + hierarchicalRow).flatMap(exactTexts).first { text in
+            let label = (hierarchicalRow.isEmpty
+                ? sameVisualRow.sorted { $0.frame.minX < $1.frame.minX }
+                : hierarchicalRow).flatMap(exactTexts).first { text in
                     !transferDialogNoiseLabels.contains(text) && Int(text) == nil
             } ?? "未命名客服"
             return PDDOrdinaryTransferAction(
@@ -194,6 +205,18 @@ enum PDDAXControlSelection {
         }
         let actionable = matches.filter { $0.actionNames.contains("AXPress") || ($0.frame.width > 1 && $0.frame.height > 1) }
         return actionable.count == 1 ? actionable.first : nil
+    }
+
+    static func transferDialogDismissPoint<ID: Hashable>(in nodes: [PDDAXSemanticNode<ID>]) -> CGPoint? {
+        guard let dialog = transferDialog(in: nodes), PDDTransferMenuControls.valid(dialog.frame),
+              dialog.frame.width > 100, dialog.frame.height > 100 else { return nil }
+        let index = Dictionary(uniqueKeysWithValues: nodes.map { ($0.id, $0) })
+        guard let web = nearestAncestor(of: dialog, in: index, matching: { $0.role == "AXWebArea" }),
+              PDDTransferMenuControls.valid(web.frame), web.frame.contains(dialog.frame) else { return nil }
+        // These points are on the dimmed web backdrop, never on a dialog/menu control.
+        return [CGPoint(x: web.frame.minX + 8, y: web.frame.midY),
+                CGPoint(x: web.frame.maxX - 8, y: web.frame.midY)]
+            .first { !dialog.frame.insetBy(dx: -8, dy: -8).contains($0) }
     }
 
     private static func uniqueID<ID: Hashable>(

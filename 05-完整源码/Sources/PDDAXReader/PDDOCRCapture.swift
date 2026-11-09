@@ -90,6 +90,13 @@ final class PDDWindowOCRCapture: PDDOCRCapturing {
         self.bundleIdentifier = bundleIdentifier
     }
 
+    func activateWorkbenchOnly() async throws {
+        guard let app = NSRunningApplication.runningApplications(withBundleIdentifier: bundleIdentifier).first else {
+            throw PDDOCRError.windowNotFound
+        }
+        _ = try await activateWorkbench(application: app)
+    }
+
     func capture() async throws -> PDDOCRFrame {
         try await capture(cropChat: true)
     }

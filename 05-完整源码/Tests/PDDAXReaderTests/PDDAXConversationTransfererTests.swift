@@ -3,6 +3,62 @@ import XCTest
 
 @MainActor
 final class PDDAXConversationTransfererTests: XCTestCase {
+    func testMissedOpeningClickBringsWindowForwardAndRelocatesBeforeRetry() async throws {
+        let backend = TransferBackendStub(tree: chatTree())
+        let opener = TransferOpenerStub(tree: chatTree())
+        let moved = tree([
+            node(0, role: "AXWindow"), node(1, parent: 0, role: "AXGroup", classes: ["middle-panel"]),
+            node(2, parent: 1, role: "AXStaticText", value: "转移会话", frame: .init(x: 700, y: 200, width: 70, height: 24))])
+        backend.onPrepare = {
+            if backend.foregroundPreparations == 2 { backend.tree = moved; opener.tree = moved }
+        }
+        let clicker = TransferClickerSpy { _ in backend.tree = self.transferredTree(recipient: "客服甲") }
+        clicker.onClick = { point in
+            if point == CGPoint(x: 735, y: 212) { backend.tree = self.transferDialogTree() }
+        }
+        let transferer = PDDAXConversationTransferer(backend: backend, opener: opener, clicker: clicker,
+            menuSubmitter: clicker, sleep: { _ in })
+        let result = try await transferer.transferToAnyHuman(uid: "customer", lease: UIOperationLeaseRegistry().acquire(uid: "customer"))
+        XCTAssertEqual(result, .transferred(agentLabel: "客服甲"))
+        XCTAssertEqual(Array(clicker.clickedPoints.prefix(2)), [.init(x: 835, y: 112), .init(x: 735, y: 212)])
+        XCTAssertEqual(backend.foregroundPreparations, 2)
+        XCTAssertEqual(opener.openedUIDs, ["customer", "customer"])
+    }
+
+    func testOpeningFailureIsBoundedAndSavesAXEvidenceWithoutSelectingRecipient() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let backend = TransferBackendStub(tree: chatTree()); let clicker = TransferClickerSpy()
+        let transferer = PDDAXConversationTransferer(backend: backend, opener: TransferOpenerStub(tree: chatTree()),
+            clicker: clicker, logRoot: root, menuSubmitter: clicker, sleep: { _ in })
+        do {
+            _ = try await transferer.transferToAnyHuman(uid: "customer", lease: UIOperationLeaseRegistry().acquire(uid: "customer"))
+            XCTFail("dialog never opened")
+        } catch { XCTAssertTrue(error.localizedDescription.contains("重试3次")) }
+        XCTAssertEqual(clicker.clickedPoints.count, 3)
+        XCTAssertEqual(backend.foregroundPreparations, 3)
+        XCTAssertTrue(clicker.noReasonAnchors.isEmpty)
+        let files = try FileManager.default.contentsOfDirectory(at: root.appendingPathComponent("logs/transfer-diagnostics"), includingPropertiesForKeys: nil)
+        XCTAssertEqual(files.count, 1)
+    }
+    func testRecipientUsesAXPressWhenAvailable() async throws {
+        let original = transferDialogTree()
+        let dialog = PDDAXSemanticTree(rootSnapshot: original.rootSnapshot, nodes: original.nodes.map { node in
+            guard node.id.rawValue == 6 else { return node }
+            return .init(id: node.id, parentID: node.parentID, role: node.role, value: node.value,
+                title: node.title, domIdentifier: node.domIdentifier, domClasses: node.domClasses,
+                actionNames: ["AXPress"], isSettable: false, frame: node.frame)
+        })
+        let backend = TransferBackendStub(tree: dialog)
+        let clicker = TransferClickerSpy { _ in backend.tree = self.transferredTree(recipient: "客服甲") }
+        let transferer = PDDAXConversationTransferer(backend: backend, opener: TransferOpenerStub(tree: dialog),
+            clicker: clicker, menuSubmitter: clicker, sleep: { _ in })
+        let result = try await transferer.transferToAnyHuman(uid: "customer", lease: UIOperationLeaseRegistry().acquire(uid: "customer"))
+        XCTAssertEqual(result, .transferred(agentLabel: "客服甲"))
+        XCTAssertEqual(backend.pressedIDs.map(\.rawValue), [6])
+        XCTAssertTrue(clicker.clickedPoints.isEmpty)
+    }
+
     func testFailedTransferDismissesItsDialogSoOtherCustomersCanContinue() async throws {
         let original = transferDialogTree(includeAfterSales: false)
         let close = PDDAXSemanticNode(id: AXElementToken(rawValue: 99), parentID: .init(rawValue: 1),
@@ -10,8 +66,9 @@ final class PDDAXConversationTransfererTests: XCTestCase {
             actionNames: ["AXPress"], isSettable: false)
         let dialog = PDDAXSemanticTree(rootSnapshot: original.rootSnapshot, nodes: original.nodes + [close])
         let backend = TransferBackendStub(tree: dialog)
+        let clicker = TransferClickerSpy()
         let transferer = PDDAXConversationTransferer(backend: backend, opener: TransferOpenerStub(tree: dialog),
-            clicker: TransferClickerSpy(), sleep: { _ in })
+            clicker: clicker, menuSubmitter: clicker, sleep: { _ in })
         guard case .failed = try await transferer.transferToAnyHuman(uid: "customer",
             lease: UIOperationLeaseRegistry().acquire(uid: "customer")) else { return XCTFail("Expected failure") }
         XCTAssertEqual(backend.pressedIDs, [.init(rawValue: 99)])
@@ -24,7 +81,7 @@ final class PDDAXConversationTransfererTests: XCTestCase {
             if $0 == 2 { backend.tree = self.transferredTree(recipient: "客服乙") }
         }
         let transferer = PDDAXConversationTransferer(
-            backend: backend, opener: opener, clicker: clicker,
+            backend: backend, opener: opener, clicker: clicker, menuSubmitter: clicker,
             sleep: { _ in }
         )
         let lease = UIOperationLeaseRegistry().acquire(uid: "PDD-customer")
@@ -43,7 +100,7 @@ final class PDDAXConversationTransfererTests: XCTestCase {
         let backend = TransferBackendStub(tree: transferDialogTree())
         let clicker = TransferClickerSpy { _ in backend.tree = self.transferredTree(recipient: "主账号") }
         let transferer = PDDAXConversationTransferer(backend: backend,
-            opener: TransferOpenerStub(tree: chatTree()), clicker: clicker, sleep: { _ in })
+            opener: TransferOpenerStub(tree: chatTree()), clicker: clicker, menuSubmitter: clicker, sleep: { _ in })
         let result = try await transferer.transferToAnyHuman(uid: "PDD-customer",
             lease: UIOperationLeaseRegistry().acquire(uid: "PDD-customer"))
         XCTAssertEqual(result, .failed("转移弹窗已关闭，但未确认接收客服为选定售后人员；停止进一步转移"))
@@ -62,7 +119,7 @@ final class PDDAXConversationTransfererTests: XCTestCase {
         let clicker = TransferClickerSpy()
         let transferer = PDDAXConversationTransferer(
             backend: backend, opener: TransferOpenerStub(tree: chatTree()),
-            clicker: clicker, sleep: { _ in }
+            clicker: clicker, menuSubmitter: clicker, sleep: { _ in }
         )
         let lease = UIOperationLeaseRegistry().acquire(uid: "PDD-customer")
 
@@ -79,7 +136,7 @@ final class PDDAXConversationTransfererTests: XCTestCase {
         let backend = TransferBackendStub(tree: dialog)
         let clicker = TransferClickerSpy()
         let transferer = PDDAXConversationTransferer(
-            backend: backend, opener: TransferOpenerStub(tree: dialog), clicker: clicker, sleep: { _ in }
+            backend: backend, opener: TransferOpenerStub(tree: dialog), clicker: clicker, menuSubmitter: clicker, sleep: { _ in }
         )
         let result = try await transferer.transferToAnyHuman(
             uid: "PDD-customer", lease: UIOperationLeaseRegistry().acquire(uid: "PDD-customer")
@@ -142,9 +199,12 @@ final class PDDAXConversationTransfererTests: XCTestCase {
 
 @MainActor
 private final class TransferBackendStub: PDDAXBackend {
+    var foregroundPreparations = 0
+    var onPrepare: (() -> Void)?
     var pressedIDs: [AXElementToken] = []
     var tree: PDDAXSemanticTree
     init(tree: PDDAXSemanticTree) { self.tree = tree }
+    func prepareForeground() async throws { foregroundPreparations += 1; onPrepare?() }
     func readSemanticTree() throws -> PDDAXSemanticTree { tree }
     func performPress(_ id: AXElementToken) throws { pressedIDs.append(id) }
     func setValue(_ text: String, on id: AXElementToken) throws {}
@@ -153,7 +213,7 @@ private final class TransferBackendStub: PDDAXBackend {
 
 @MainActor
 private final class TransferOpenerStub: PDDConversationOpening {
-    let tree: PDDAXSemanticTree
+    var tree: PDDAXSemanticTree
     private(set) var openedUIDs: [String] = []
     init(tree: PDDAXSemanticTree) { self.tree = tree }
     func openAndResolve(uid: String) async throws -> PDDAXSemanticTree {
@@ -163,14 +223,15 @@ private final class TransferOpenerStub: PDDConversationOpening {
 }
 
 @MainActor
-private final class TransferClickerSpy: PDDTransferClicking {
+private final class TransferClickerSpy: PDDTransferClicking, PDDTransferMenuSubmitting {
+    var onClick: ((CGPoint) -> Void)?
     private let onSubmit: (Int) -> Void
     private(set) var clickedPoints: [CGPoint] = []
     private(set) var noReasonAnchors: [CGRect] = []
     init(onSubmit: @escaping (Int) -> Void = { _ in }) { self.onSubmit = onSubmit }
-    func click(at point: CGPoint) throws { clickedPoints.append(point) }
-    func submitNoReasonTransfer(anchorFrame: CGRect) async throws {
-        noReasonAnchors.append(anchorFrame)
+    func click(at point: CGPoint) throws { clickedPoints.append(point); onClick?(point) }
+    func submit(uid: String, anchor: CGRect, lease: UIOperationLease) async throws {
+        noReasonAnchors.append(anchor)
         onSubmit(noReasonAnchors.count)
     }
 }

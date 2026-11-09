@@ -29,7 +29,7 @@ enum CodexFailureClassifier {
                 return .retryOnceThenTransfer("Codex 返回内容为空或格式无效")
             case .freshSessionRetryFailed:
                 return .transferImmediately("Codex 新会话或新进程重试仍失败")
-            case .missingBatch, .invalidImageAttachment:
+            case .missingBatch, .invalidImageAttachment, .customerFacingWording:
                 return .ordinaryRetry
             }
         }

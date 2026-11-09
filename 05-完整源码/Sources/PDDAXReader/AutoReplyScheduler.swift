@@ -291,6 +291,15 @@ final class AutoReplyScheduler: ObservableObject {
         }
         concurrencyPolicy = AdaptiveConcurrencyPolicy(physicalMemoryBytes: physicalMemoryBytes)
         state = try store.loadRecoveringInterruptedWork(now: now())
+        var activeReceiptIDs: [String: Set<String>] = [:]
+        for job in state.jobs where [.queued, .generating, .ready, .sending].contains(job.state) {
+            activeReceiptIDs[job.uid, default: []].formUnion(job.capture.batch?.customerMessageIDs ?? [])
+        }
+        for pending in state.pendingVideoBatches {
+            activeReceiptIDs[pending.uid, default: []].formUnion(pending.expectedMessageIDs)
+        }
+        _ = try CustomerMessageReceipts(root: store.rootDirectory)
+            .reconcileLegacyVideoSkips(excluding: activeReceiptIDs, at: now())
         ordinaryCaptureAuthorizations = Set(state.pendingCaptureRequests.filter { $0.kind == .ordinary }.map(\.uid))
         driver.restoreConversationLocators(state.conversationLocatorsByUID)
         driver.restoreConversationCaptureState(
@@ -487,6 +496,9 @@ final class AutoReplyScheduler: ObservableObject {
             return
         }
         latestVideoStatus = PDDVideoProgressStatus(event: event)
+        if [.waitingForAddress, .downloading, .downloaded, .preparingEvidence, .readyForGeneration].contains(event.phase) {
+            registerVideoHold(uid: event.uid, messageIDs: [event.messageID])
+        }
         onStateChange?()
         appendEvent(
             uid: event.uid,
@@ -545,6 +557,12 @@ final class AutoReplyScheduler: ObservableObject {
                 return
             }
             state.pendingVideoBatches[index].duplicateMessageIDs.insert(event.messageID)
+            do {
+                try CustomerMessageReceipts(root: store.rootDirectory).closeUnsubmitted(uid: event.uid,
+                    messageIDs: [event.messageID], reason: "legacy-video-content-duplicate", at: now())
+            } catch {
+                appendEvent(uid: event.uid, kind: "message-receipt-closure-failed", detail: error.localizedDescription)
+            }
         default:
             try? persist()
             return
@@ -579,7 +597,10 @@ final class AutoReplyScheduler: ObservableObject {
 
         do {
             await drainDeferredVideoTransferEvents()
+            refreshVideoHoldingNotices()
             _ = launchQueuedGenerations()
+
+            if try await sendDueVideoHoldingNotice() { return }
 
             if state.consecutiveDeliveryCount >= 3 || workTurnsSinceDiscovery >= 3
                 || (workTurnsSinceDiscovery > 0 && now().timeIntervalSince(lastDiscoveryAt) >= 5) {
@@ -1022,13 +1043,121 @@ final class AutoReplyScheduler: ObservableObject {
         try persist(sendCritical: true)
     }
 
+    private func registerVideoHold(uid: String, messageIDs: Set<String>) {
+        guard !messageIDs.isEmpty else { return }
+        let known = Set(state.videoHoldingNotices.filter { $0.uid == uid }.flatMap { $0.messageIDs })
+        let sent = (try? CustomerMessageReceipts(root: store.rootDirectory).receipts(uid: uid)) ?? [:]
+        let fresh = messageIDs.subtracting(known).filter { sent[$0]?.replySentAt == nil && sent[$0]?.closedAt == nil }
+        guard !fresh.isEmpty else { return }
+        refreshVideoHoldingNotices()
+        if let index = state.videoHoldingNotices.firstIndex(where: { $0.uid == uid && $0.finishedAt == nil }) {
+            state.videoHoldingNotices[index].messageIDs.formUnion(fresh)
+        } else {
+            state.videoHoldingNotices.append(.init(uid: uid, messageIDs: Set(fresh), capturedAt: now()))
+        }
+        appendEvent(uid: uid, kind: "video-hold-timer-started", detail: "delay_seconds=10 message_ids=\(fresh.sorted().joined(separator: ","))")
+    }
+
+    private func refreshVideoHoldingNotices() {
+        for index in state.videoHoldingNotices.indices where state.videoHoldingNotices[index].finishedAt == nil {
+            let notice = state.videoHoldingNotices[index]
+            let terminal = Set(state.jobs.filter {
+                $0.uid == notice.uid && [.completed, .failed, .quarantined].contains($0.state)
+            }.flatMap { $0.capture.batch?.customerMessageIDs ?? [] })
+            if notice.messageIDs.isSubset(of: terminal) {
+                state.videoHoldingNotices[index].finishedAt = now()
+                appendEvent(uid: notice.uid, kind: "video-hold-finished", detail: "final work terminal; notice=\(notice.id)")
+            }
+        }
+    }
+
+    private func sendDueVideoHoldingNotice() async throws -> Bool {
+        guard deliveryEnabled, !realDeliveryPausedForPersistence else { return false }
+        guard let index = state.videoHoldingNotices.firstIndex(where: { notice in
+            notice.finishedAt == nil && notice.attemptedAt == nil && now().timeIntervalSince(notice.capturedAt) >= 10
+                && videoHoldCapture(for: notice) != nil
+                && !state.jobs.contains { $0.uid == notice.uid && [.ready, .sending].contains($0.state) }
+        }) else { return false }
+        let notice = state.videoHoldingNotices[index]
+        guard let capture = videoHoldCapture(for: notice) else { return false }
+        // Save the attempt before any UI action. Uncertain sends are never replayed.
+        state.videoHoldingNotices[index].attemptedAt = now()
+        appendEvent(uid: notice.uid, kind: "video-hold-send-started", detail: "notice=\(notice.id) message=\(notice.text)")
+        try persist(sendCritical: true)
+        currentUIOwner = "video-hold:\(notice.uid)"
+        defer { currentUIOwner = nil }
+        do {
+            let result = try await performUI(stage: "send", uid: notice.uid) { driver, lease in
+                try await driver.send(uid: notice.uid, text: notice.text, outgoingImages: [], deliveryID: notice.id,
+                    expectedCustomerCursor: capture.customerCursor, expectedCustomerMessageIDs: notice.messageIDs, lease: lease)
+            }
+            switch result {
+            case .sent(let id):
+                state.videoHoldingNotices[index].outcome = "sent"
+                state.videoHoldingNotices[index].confirmedServiceMessageID = id
+                state.confirmedAutoReplyMessageIDsByUID[notice.uid, default: []].insert(id)
+            case .failedBeforeSend, .discardedBeforeSend: state.videoHoldingNotices[index].outcome = "not-sent"
+            case .uncertain: state.videoHoldingNotices[index].outcome = "uncertain"
+            }
+            appendEvent(uid: notice.uid, kind: "video-hold-send-result", detail: "notice=\(notice.id) \(result); final reply still required")
+        } catch {
+            state.videoHoldingNotices[index].outcome = "uncertain"
+            appendEvent(uid: notice.uid, kind: "video-hold-send-failed", detail: "\(error.localizedDescription); no courtesy retry; final work continues")
+        }
+        // Do not advance answered cursors or set any original message's reply receipt.
+        try persist(sendCritical: true)
+        return true
+    }
+
+    private func videoHoldCapture(for notice: PDDVideoHoldingNotice) -> AutoReplyCapture? {
+        let captures = state.pendingVideoBatches.filter { $0.uid == notice.uid }.map(\.capture)
+            + state.jobs.filter { $0.uid == notice.uid && [.queued, .generating, .ready].contains($0.state) }.map(\.capture)
+        return captures.filter { notice.messageIDs.isSubset(of: Set($0.fullHistory.map(\.id))) }
+            .max { $0.customerCursor.count < $1.customerCursor.count }
+    }
+
+    private func coalesceQueuedVideoReplies() {
+        let videoIDs = state.jobs.filter { $0.state == .queued && !$0.capture.videoAttachments.isEmpty }.map(\.id)
+        for videoID in videoIDs {
+            guard let video = state.jobs.first(where: { $0.id == videoID && $0.state == .queued }) else { continue }
+            let ids = Set(video.capture.videoAttachments.map(\.messageID))
+            let candidates = state.jobs.filter { job in
+                guard job.uid == video.uid, job.state == .queued, job.capture.batch?.incomingHandoffKey == nil,
+                      job.retries == 0, job.pendingSupplement == nil, !job.supplementCapturePending,
+                      job.customerMissingSince == nil else { return false }
+                if job.id == video.id { return true }
+                guard job.capture.batch?.events.allSatisfy({ $0.kind == .text }) == true else { return false }
+                let historyIDs = job.capture.fullHistory.map(\.id)
+                guard let videoPosition = historyIDs.lastIndex(where: { ids.contains($0) }) else { return false }
+                return job.capture.batch?.events.allSatisfy { event in
+                    historyIDs.firstIndex(of: event.messageID).map { $0 > videoPosition } ?? false
+                } == true
+            }.sorted { $0.sequence < $1.sequence }
+            guard candidates.count > 1, let first = candidates.first,
+                  let joined = PDDVideoReplyBatch.joining(candidates.map(\.capture)),
+                  let index = state.jobs.firstIndex(where: { $0.id == first.id }) else { continue }
+            state.jobs[index] = AutoReplyJob(id: first.id, uid: first.uid, sequence: first.sequence, state: .queued,
+                capture: joined, reply: nil, deliveryOutcome: nil, confirmedServiceMessageID: nil, retries: 0,
+                nextAttemptAt: nil, lastError: nil, imageAttachments: joined.imageAttachments, videoAttachments: joined.videoAttachments)
+            let removed = Set(candidates.dropFirst().map(\.id))
+            state.jobs.removeAll { removed.contains($0.id) }
+            appendEvent(uid: first.uid, kind: "video-text-batch-joined", detail: "queued_batches=\(candidates.count) message_ids=\((joined.batch?.customerMessageIDs ?? []).sorted().joined(separator: ","))")
+        }
+    }
+
     @discardableResult
     private func launchQueuedGenerations() -> Bool {
-        let queued = state.jobs.indices.filter {
-            state.jobs[$0].state == .queued
-                && (state.jobs[$0].customerMissingSince.map { now().timeIntervalSince($0) < 600 } ?? true)
-                && (state.jobs[$0].nextAttemptAt.map { $0 <= now() } ?? true)
-                && isHeadOfLine($0)
+        coalesceQueuedVideoReplies()
+        let queued = state.jobs.indices.filter { index in
+            state.jobs[index].state == .queued
+                && !state.pendingVideoBatches.contains(where: { pending in
+                    pending.uid == state.jobs[index].uid && state.jobs[index].capture.fullHistory.contains {
+                        pending.expectedMessageIDs.contains($0.id)
+                    }
+                })
+                && (state.jobs[index].customerMissingSince.map { now().timeIntervalSince($0) < 600 } ?? true)
+                && (state.jobs[index].nextAttemptAt.map { $0 <= now() } ?? true)
+                && isHeadOfLine(index)
         }
         guard !queued.isEmpty else { return false }
         let dynamic = concurrencyPolicy.limit(
@@ -1162,7 +1291,7 @@ final class AutoReplyScheduler: ObservableObject {
         reason: String,
         error: Error
     ) {
-        state.jobs[index].reply = "抱歉，这个问题需要同事继续协助，我现在为您转接。"
+        state.jobs[index].reply = CustomerFacingFallback.handoff(history: state.jobs[index].capture.fullHistory)
         state.jobs[index].replyAction = .replyThenTransfer
         state.jobs[index].transferReason = .troubleshootingExhausted
         state.jobs[index].state = .ready
@@ -1281,6 +1410,7 @@ final class AutoReplyScheduler: ObservableObject {
             ordinaryCaptureFailureCounts[uid] = nil
         }
         try CustomerMessageReceipts(root: store.rootDirectory).capture(rawCapture, at: now())
+        registerVideoHold(uid: uid, messageIDs: Set(rawCapture.batch?.events.filter { $0.kind == .video }.map(\.messageID) ?? []))
         appendEvent(uid: uid, kind: "customer-messages-captured",
             detail: "message_ids=\((rawCapture.batch?.customerMessageIDs ?? []).sorted().joined(separator: ","))")
         try reconcileVisibleReplies(in: rawCapture, uid: uid)
@@ -1290,7 +1420,8 @@ final class AutoReplyScheduler: ObservableObject {
             let closed = try await CustomerTransferPolicyStore.shared.closedMessageIDs(
                 root: store.rootDirectory, uid: uid)
             let aliasCovered = confirmedAliasMessageIDs(in: normalizedCapture)
-            let covered = coveredMessageIDs(uid: uid).union(closed).union(aliasCovered)
+            let receiptClosed = try CustomerMessageReceipts(root: store.rootDirectory).closedMessageIDs(uid: uid)
+            let covered = coveredMessageIDs(uid: uid).union(closed).union(aliasCovered).union(receiptClosed)
             if !aliasCovered.isEmpty {
                 appendEvent(uid: uid, kind: "masked-name-delivery-reconciled",
                     detail: "Previously sent reply verified after its exact target message in this chat; covered_message_ids=\(aliasCovered.sorted().joined(separator: ","))")
@@ -1316,6 +1447,15 @@ final class AutoReplyScheduler: ObservableObject {
             capture = normalizedCapture
         }
         latestCapture = capture
+        if request.kind != .videoRecovery, let batch = capture.batch, batch.incomingHandoffKey == nil,
+           !batch.events.isEmpty, batch.events.allSatisfy({ $0.kind == .text }),
+           let pendingIndex = state.pendingVideoBatches.firstIndex(where: { $0.uid == uid }),
+           batch.customerMessageIDs.isDisjoint(with: Set(state.pendingVideoBatches[pendingIndex].expectedMessageIDs)),
+           let joined = PDDVideoReplyBatch.joining([state.pendingVideoBatches[pendingIndex].capture, capture]) {
+            state.pendingVideoBatches[pendingIndex].capture = joined
+            appendEvent(uid: uid, kind: "video-text-batch-joined", detail: "message_ids=\(batch.customerMessageIDs.sorted().joined(separator: ","))")
+            syncJobs(); try persist(); return
+        }
         if request.kind == .tail, let batch = capture.batch,
            let index = activeJobIndex(uid: uid) {
             let count = state.jobs[index].pendingSupplement?.customerCursor.count ?? -1
@@ -1795,7 +1935,7 @@ final class AutoReplyScheduler: ObservableObject {
             state: isPureFailedVideo ? .ready : .queued,
             capture: capture,
             reply: isPureFailedVideo
-                ? "亲，视频暂时无法加载，麻烦您先简单描述一下需要我们查看的问题。"
+                ? "视频已收到，您希望我重点帮您查看哪个问题？也可以描述一下具体表现。"
                 : nil,
             deliveryOutcome: nil,
             confirmedServiceMessageID: nil,

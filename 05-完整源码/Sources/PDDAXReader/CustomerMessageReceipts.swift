@@ -14,6 +14,8 @@ struct CustomerMessageReceipts: Sendable {
         var batchKey: String?
         var promptSHA256: String?
         var submissionID: UUID?
+        var closedAt: Date?
+        var closureReason: String?
     }
 
     private struct State: Codable {
@@ -49,9 +51,70 @@ struct CustomerMessageReceipts: Sendable {
         defer { Self.lock.unlock() }
         return try load().customers.mapValues { messages in
             Set(messages.values.filter {
-                $0.requiresSubmission && $0.submittedAt == nil && $0.replySentAt == nil
+                $0.requiresSubmission && $0.submittedAt == nil && $0.replySentAt == nil && $0.closedAt == nil
             }.map(\.messageID))
         }.filter { !$0.value.isEmpty }
+    }
+
+    func closedMessageIDs(uid: String) throws -> Set<String> {
+        Set(try receipts(uid: uid).values.filter { $0.closedAt != nil }.map(\.messageID))
+    }
+
+    /// Closing known skipped work is not a model completion or a send receipt.
+    @discardableResult
+    func closeUnsubmitted(uid: String, messageIDs: Set<String>, reason: String, at date: Date = Date()) throws -> Int {
+        var count = 0
+        try update { state in
+            for id in messageIDs {
+                guard var receipt = state.customers[uid]?[id], receipt.requiresSubmission,
+                      receipt.closedAt == nil, receipt.submittedAt == nil, receipt.replySentAt == nil else { continue }
+                receipt.closedAt = date; receipt.closureReason = reason
+                state.customers[uid, default: [:]][id] = receipt
+                count += 1
+            }
+        }
+        if count > 0 {
+            AutomationStepLog.record(root: root, uid: uid, step: "message-receipt-intentionally-closed",
+                detail: "reason=\(reason) message_ids=\(messageIDs.sorted().joined(separator: ",")) count=\(count); not submitted or sent")
+        }
+        return count
+    }
+
+    /// One startup pass over durable legacy skip events; never infer closure from age or a missing red dot.
+    @discardableResult
+    func reconcileLegacyVideoSkips(excluding activeIDs: [String: Set<String>] = [:], at date: Date = Date()) throws -> Int {
+        let pending = try awaitingSubmission()
+        guard !pending.isEmpty else { return 0 }
+        let logURL = root.appendingPathComponent("logs/automation-steps.jsonl")
+        guard FileManager.default.fileExists(atPath: logURL.path) else { return 0 }
+        let handle = try FileHandle(forReadingFrom: logURL)
+        defer { try? handle.close() }
+        // Stream old logs instead of loading the whole history into memory.
+        var buffer = Data(); var skipped: [String: Set<String>] = [:]
+        func consume(_ data: Data) {
+            guard let text = String(data: data, encoding: .utf8), text.contains("video-content-duplicate"),
+                  let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  object["kind"] as? String == "video-content-duplicate",
+                  let uid = object["uid"] as? String, let wanted = pending[uid],
+                  let detail = object["detail"] as? String else { return }
+            let ids = Set(detail.split(separator: ",").map(String.init)).intersection(wanted)
+                .subtracting(activeIDs[uid] ?? [])
+            skipped[uid, default: []].formUnion(ids)
+        }
+        while let chunk = try handle.read(upToCount: 64 * 1024), !chunk.isEmpty {
+            buffer.append(chunk)
+            while let newline = buffer.firstIndex(of: 10) {
+                consume(Data(buffer[..<newline]))
+                buffer.removeSubrange(...newline)
+            }
+            if buffer.count > 4 * 1024 * 1024 { buffer.removeAll() }
+        }
+        if !buffer.isEmpty { consume(buffer) }
+        var count = 0
+        for (uid, ids) in skipped where !ids.isEmpty {
+            count += try closeUnsubmitted(uid: uid, messageIDs: ids, reason: "legacy-video-content-duplicate", at: date)
+        }
+        return count
     }
 
     func observe(uid: String, messages: [PDDChatMessage], actionableIDs: Set<String> = [], at date: Date = Date()) throws {
@@ -79,7 +142,7 @@ struct CustomerMessageReceipts: Sendable {
     func begin(_ capture: AutoReplyCapture, submissionID: UUID) throws {
         try update { state in
             for id in capture.batch?.customerMessageIDs ?? [] {
-                guard var receipt = state.customers[capture.uid]?[id] else { throw ReceiptError.inputNotConfirmed }
+                guard var receipt = state.customers[capture.uid]?[id], receipt.closedAt == nil else { throw ReceiptError.inputNotConfirmed }
                 receipt.submissionID = submissionID
                 receipt.submittedAt = nil
                 receipt.completedAt = nil

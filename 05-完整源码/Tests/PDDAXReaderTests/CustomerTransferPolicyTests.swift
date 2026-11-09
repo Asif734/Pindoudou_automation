@@ -2,6 +2,28 @@ import XCTest
 @testable import PDDAXReader
 
 final class CustomerTransferPolicyTests: XCTestCase {
+    func testRefundOperationDoesNotRequireTechnicalTroubleshootingFailure() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = CustomerTransferPolicyStore(); let now = Date()
+        let clarify = try await store.decide(root: root, uid: "A", messageIDs: ["request"], kind: .refundReturn,
+            answerFound: true, issueHasNoSolution: false, proposedAction: .reply, proposedReason: .none, now: now)
+        XCTAssertEqual(clarify.action, .reply)
+        for (i, textID) in ["refund-confirmed", "return-product", "please-proceed"].enumerated() {
+            let result = try await store.decide(root: root, uid: "A", messageIDs: [textID], kind: .refundReturn,
+                answerFound: i != 0, issueHasNoSolution: false, proposedAction: .replyThenTransfer,
+                proposedReason: .refundOperation, now: now)
+            XCTAssertEqual(result.action, .replyThenTransfer)
+            XCTAssertEqual(result.reason, .refundOperation)
+            let retry = try await CustomerTransferPolicyStore().decide(root: root, uid: "A", messageIDs: [textID], kind: .refundReturn,
+                answerFound: false, issueHasNoSolution: false, proposedAction: .replyThenTransfer, proposedReason: .refundOperation, now: now)
+            XCTAssertEqual(retry, result)
+        }
+        let policyQuestion = try await store.decide(root: root, uid: "A", messageIDs: ["policy-only"], kind: .other,
+            answerFound: false, issueHasNoSolution: false, proposedAction: .replyThenTransfer,
+            proposedReason: .refundOperation, now: now)
+        XCTAssertEqual(policyQuestion.action, .reply, "An unrelated current intent cannot inherit a refund handoff")
+    }
     func testHumanRequestsArePerCustomerPersistentAndDeduplicated() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: root) }

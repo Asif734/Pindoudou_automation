@@ -516,7 +516,7 @@ final class AutoReplySchedulerTests: XCTestCase {
 
         let callCount = await generator.calls()
         XCTAssertEqual(callCount, 1)
-        XCTAssertEqual(driver.sentTexts, ["抱歉，这个问题需要同事继续协助，我现在为您转接。"])
+        XCTAssertEqual(driver.sentTexts, ["我为您转接同事继续协助。"])
         XCTAssertEqual(driver.transferredUIDs, [uid])
         XCTAssertEqual(try store.load().transferTasks.first?.state, .completed)
     }
@@ -936,7 +936,7 @@ final class AutoReplySchedulerTests: XCTestCase {
         XCTAssertEqual(scheduler.pendingVideoBatchesSnapshot.count, 1)
     }
 
-    func testOrdinaryCaptureDropsMessagesAlreadyOwnedByPendingVideoBatch() async throws {
+    func testOrdinaryCaptureJoinsNewTextWithoutDuplicatingPendingVideoMessage() async throws {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("pdd-pending-video-message-dedup-\(UUID().uuidString)")
         defer { try? FileManager.default.removeItem(at: root) }
@@ -961,8 +961,8 @@ final class AutoReplySchedulerTests: XCTestCase {
         await scheduler.tick()
         await scheduler.tick()
 
-        XCTAssertEqual(scheduler.jobs.count, 1)
-        XCTAssertEqual(scheduler.jobs.first?.capture.batch?.events.map(\.messageID), ["text-2"])
+        XCTAssertTrue(scheduler.jobs.isEmpty)
+        XCTAssertEqual(scheduler.pendingVideoBatchesSnapshot.first?.capture.batch?.events.map(\.messageID), ["video-1", "text-2"])
         XCTAssertEqual(scheduler.pendingVideoBatchesSnapshot.count, 1)
         XCTAssertEqual(scheduler.pendingVideoBatchesSnapshot.first?.expectedMessageIDs, ["video-1"])
     }
@@ -1288,7 +1288,7 @@ final class AutoReplySchedulerTests: XCTestCase {
         await f.runTicks(2)
         let event = PDDVideoTransferEvent(
             uid: uid, messageID: "video-1", phase: .fallbackRequired,
-            diagnostic: "亲，视频暂时无法加载，麻烦您先简单描述一下需要我们查看的问题。"
+            diagnostic: "视频已收到，您希望我重点帮您查看哪个问题？也可以描述一下具体表现。"
         )
 
         await f.scheduler.receiveVideoTransferEvent(event)
@@ -1299,7 +1299,7 @@ final class AutoReplySchedulerTests: XCTestCase {
         XCTAssertEqual(f.scheduler.jobs[0].state, .ready)
         XCTAssertEqual(
             f.scheduler.jobs[0].reply,
-            "亲，视频暂时无法加载，麻烦您先简单描述一下需要我们查看的问题。"
+            "视频已收到，您希望我重点帮您查看哪个问题？也可以描述一下具体表现。"
         )
     }
 

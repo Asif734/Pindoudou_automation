@@ -110,11 +110,14 @@ final class LivePDDAXForcedAccessibilityRestarter: PDDAXForcedAccessibilityResta
 
 @MainActor
 protocol PDDAXBackend: AnyObject {
+    func prepareForeground() async throws
     func readSemanticTree() throws -> PDDAXSemanticTree
     func performPress(_ id: AXElementToken) throws
     func setValue(_ text: String, on id: AXElementToken) throws
     func value(of id: AXElementToken) throws -> String
 }
+
+extension PDDAXBackend { func prepareForeground() async throws {} }
 
 enum PDDAXBackendError: LocalizedError {
     case staleElement
@@ -154,6 +157,10 @@ enum PDDAXActionPolicy {
             || role == "AXButton"
             || value == "发送"
             || title == "发送"
+            || value == "转移" || title == "转移"
+            || value == "无原因直接转移" || title == "无原因直接转移"
+            || value == "转移会话" || title == "转移会话"
+            || domClasses.contains { $0.lowercased().contains("transfer") }
             || domClasses.contains { $0.lowercased().contains("send-btn") }
     }
 
@@ -189,6 +196,9 @@ enum PDDAXRootWindowPreference {
 
 @MainActor
 final class LivePDDAXBackend: PDDAXBackend {
+    func prepareForeground() async throws {
+        try await PDDWindowOCRCapture().activateWorkbenchOnly()
+    }
     private struct ElementIdentity: Hashable {
         let element: AXUIElement
         func hash(into hasher: inout Hasher) { hasher.combine(CFHash(element)) }

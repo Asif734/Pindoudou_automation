@@ -6,6 +6,7 @@ enum AutoReplyCodexGeneratorError: LocalizedError {
     case missingCompletion
     case missingThreadID
     case invalidReply(String)
+    case customerFacingWording(String)
     case freshSessionRetryFailed(String)
     case chatGPTLoginRequired
     case invalidImageAttachment(String)
@@ -17,6 +18,7 @@ enum AutoReplyCodexGeneratorError: LocalizedError {
         case .missingCompletion: return "Codex CLI 没有返回 turn.completed"
         case .missingThreadID: return "Codex CLI 没有返回 thread ID"
         case .invalidReply(let reason): return "Codex 回复无效：\(reason)"
+        case .customerFacingWording(let reason): return "客服回复措辞需修正：\(reason)"
         case .freshSessionRetryFailed(let reason):
             return "Codex 新会话或新进程重试仍失败：\(reason)"
         case .chatGPTLoginRequired: return "Codex CLI 必须使用本机 ChatGPT 账号登录"
@@ -294,11 +296,22 @@ struct AutoReplyCodexGenerator: AutoReplyGenerating, Sendable {
             turn.transferReason = decision.reason
         }
         if let violation = CustomerFacingReplyPolicy.violation(in: turn.reply) {
-            AutomationStepLog.record(root: sessionRegistry.rootDirectory, uid: capture.uid,
-                step: "reply-policy-rejected", detail: violation)
-            throw AutoReplyCodexGeneratorError.invalidReply(
-                "Customer-facing identity or handoff wording is not allowed: \(violation)"
-            )
+            var alternate = turn.action == .replyThenTransfer
+                ? CustomerFacingFallback.handoff(history: capture.fullHistory) : turn.clarificationReply
+            if violation == "video processing status", turn.action == .reply,
+               alternate.map({ $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || CustomerFacingReplyPolicy.violation(in: $0) != nil }) ?? true {
+                alternate = CustomerFacingFallback.videoQuestion(history: capture.fullHistory)
+            }
+            if let alternate, !alternate.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+               CustomerFacingReplyPolicy.violation(in: alternate) == nil {
+                turn.reply = alternate.trimmingCharacters(in: .whitespacesAndNewlines)
+                AutomationStepLog.record(root: sessionRegistry.rootDirectory, uid: capture.uid,
+                    step: "reply-policy-corrected", detail: "\(violation); action preserved; same-turn alternative")
+            } else {
+                AutomationStepLog.record(root: sessionRegistry.rootDirectory, uid: capture.uid,
+                    step: "reply-policy-rejected", detail: violation)
+                throw AutoReplyCodexGeneratorError.customerFacingWording(violation)
+            }
         }
         if turn.action == .reply, !turn.imagePaths.isEmpty {
             turn.outgoingImages = try DatasetReplyImageResolver(

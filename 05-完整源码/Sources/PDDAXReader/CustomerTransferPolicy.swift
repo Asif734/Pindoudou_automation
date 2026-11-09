@@ -124,7 +124,7 @@ actor CustomerTransferPolicyStore {
                   now >= window.firstAt, now.timeIntervalSince(window.firstAt) <= 600 else { return 0 }
             return window.count
         }
-        return "本客户此前10分钟窗口内的已记录明确转接请求：human_request=\(count(.humanRequest))。本轮请求尚未计入；重复执行同一批次不增加计数。退货退款不按次数转接，只在具体问题已明确且本地知识无解决方案时转接。计数与最终动作由应用持久化执行。"
+        return "本客户此前10分钟窗口内的已记录明确转接请求：human_request=\(count(.humanRequest))。本轮请求尚未计入；重复执行同一批次不增加计数。实际退货退款先问一个必要问题；历史已问过且客户已表明意愿时不要反复澄清。具体技术问题无解可转接；需要执行本应用没有能力的退款/退换货操作时使用 refund_operation 转接，不要求技术排障无解。仅询问政策仍为普通咨询。计数与最终动作由应用持久化执行。"
     }
 
     func decide(root: URL, uid: String, messageIDs: [String], kind: CustomerRequestKind,
@@ -156,17 +156,19 @@ actor CustomerTransferPolicyStore {
             decision = .init(count: count, action: count >= 2 ? .replyThenTransfer : .reply,
                              reason: count >= 2 ? .customerExplicitlyRequestedHuman : .none)
         case .refundReturn:
-            // Clarify return/refund requests until the concrete issue is known
-            // and the local knowledge has no supported solution.
-            let transfer = issueHasNoSolution
+            // Clarify the current need, then preserve an operation handoff even
+            // when a technical fault has not been declared unsolvable.
+            let needsRefundOperation = proposedAction == .replyThenTransfer && proposedReason == .refundOperation
+            let transfer = issueHasNoSolution || needsRefundOperation
             decision = .init(count: count, action: transfer ? .replyThenTransfer : .reply,
-                             reason: transfer ? .explicitReturnRefund : .none)
+                             reason: needsRefundOperation ? .refundOperation : transfer ? .explicitReturnRefund : .none)
         case .technical where issueHasNoSolution:
             decision = .init(count: 0, action: .replyThenTransfer, reason: .troubleshootingExhausted)
         default:
             // A historical request cannot create a new handoff in an unrelated batch.
             let staleRequest = proposedReason == .customerExplicitlyRequestedHuman
                 || proposedReason == .explicitReturnRefund
+                || proposedReason == .refundOperation
             decision = .init(count: 0, action: staleRequest ? .reply : proposedAction,
                              reason: staleRequest ? .none : proposedReason)
         }

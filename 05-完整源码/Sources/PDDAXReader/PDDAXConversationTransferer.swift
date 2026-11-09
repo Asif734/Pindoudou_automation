@@ -11,7 +11,6 @@ protocol PDDLiveConversationTransferring: AnyObject {
 @MainActor
 protocol PDDTransferClicking: AnyObject {
     func click(at point: CGPoint) throws
-    func submitNoReasonTransfer(anchorFrame: CGRect) async throws
 }
 
 enum PDDConversationTransferError: LocalizedError {
@@ -33,12 +32,14 @@ final class PDDAXConversationTransferer: PDDLiveConversationTransferring {
     private let clicker: any PDDTransferClicking
     private let sleep: @MainActor (TimeInterval) async throws -> Void
     private let logRoot: URL?
+    private let menuSubmitter: any PDDTransferMenuSubmitting
 
     init(
         backend: any PDDAXBackend,
         opener: any PDDConversationOpening,
         clicker: any PDDTransferClicking,
         logRoot: URL? = nil,
+        menuSubmitter: (any PDDTransferMenuSubmitting)? = nil,
         sleep: @escaping @MainActor (TimeInterval) async throws -> Void = { seconds in
             try await Task.sleep(for: .seconds(seconds))
         }
@@ -48,6 +49,8 @@ final class PDDAXConversationTransferer: PDDLiveConversationTransferring {
         self.clicker = clicker
         self.sleep = sleep
         self.logRoot = logRoot
+        self.menuSubmitter = menuSubmitter ?? PDDTransferMenuSubmitter(
+            backend: backend, clicker: clicker, logRoot: logRoot, sleep: sleep)
     }
 
     func transferToAnyHuman(
@@ -64,28 +67,35 @@ final class PDDAXConversationTransferer: PDDLiveConversationTransferring {
 
     private func transferToAfterSales(uid: String, lease: UIOperationLease) async throws -> AutoReplyTransferResult {
         try lease.validate()
+        try await backend.prepareForeground()
+        try lease.validate()
         var tree = try await opener.openAndResolve(uid: uid)
         try lease.validate()
 
         if !PDDAXControlSelection.isTransferDialogVisible(in: tree.nodes) {
-            let triggerID = try PDDAXControlSelection.transferConversationTrigger(in: tree.nodes)
-            guard let trigger = tree.nodes.first(where: { $0.id == triggerID }),
-                  isUsable(trigger.frame) else {
-                throw PDDConversationTransferError.invalidControlFrame("转移会话")
-            }
-            try clicker.click(at: CGPoint(x: trigger.frame.midX, y: trigger.frame.midY))
-            tree = try await waitForDialog(lease: lease)
+            tree = try await openDialog(uid: uid, initial: tree, lease: lease)
         }
         AutomationStepLog.record(root: logRoot, uid: uid, step: "transfer-dialog-opened")
         defer {
             if (try? lease.validate()) != nil,
                let current = try? backend.readSemanticTree(),
-               let close = PDDAXControlSelection.transferDialogCloseControl(in: current.nodes) {
+               PDDAXControlSelection.isTransferDialogVisible(in: current.nodes) {
                 do {
-                    if close.actionNames.contains("AXPress") { try backend.performPress(close.id) }
-                    else { try clicker.click(at: CGPoint(x: close.frame.midX, y: close.frame.midY)) }
-                    AutomationStepLog.record(root: logRoot, uid: uid, step: "transfer-dialog-dismissed",
-                        detail: "Remaining transfer dialog closed; other conversations continue")
+                    var dismissed = true
+                    if let close = PDDAXControlSelection.transferDialogCloseControl(in: current.nodes) {
+                        try press(close, uid: uid, step: "transfer-dialog-close-clicked")
+                    } else if let point = PDDAXControlSelection.transferDialogDismissPoint(in: current.nodes) {
+                        // Click only the modal backdrop. Escape is also a PDD close-chat shortcut.
+                        try clicker.click(at: point)
+                    } else {
+                        dismissed = false
+                        AutomationStepLog.record(root: logRoot, uid: uid, step: "transfer-dialog-cleanup-unavailable",
+                            detail: "No verified close control or modal backdrop")
+                    }
+                    if dismissed {
+                        AutomationStepLog.record(root: logRoot, uid: uid, step: "transfer-dialog-dismissed",
+                            detail: "Remaining transfer dialog dismissal requested; other conversations continue")
+                    }
                 } catch {
                     AutomationStepLog.record(root: logRoot, uid: uid, step: "transfer-dialog-cleanup-failed", detail: error.localizedDescription)
                 }
@@ -111,11 +121,24 @@ final class PDDAXConversationTransferer: PDDLiveConversationTransferring {
             }
 
             AutomationStepLog.record(root: logRoot, uid: uid, step: "transfer-recipient-selected", detail: action.agentLabel)
-            try clicker.click(at: CGPoint(x: action.frame.midX, y: action.frame.midY))
+            guard let control = tree.nodes.first(where: { $0.id == action.controlID }) else {
+                throw PDDAXSelectionError.missing("售后客服转移控件")
+            }
+            try press(control, uid: uid, step: "transfer-recipient-clicked")
             try await sleep(0.15)
             try lease.validate()
             AutomationStepLog.record(root: logRoot, uid: uid, step: "transfer-submit-started", detail: action.agentLabel)
-            try await clicker.submitNoReasonTransfer(anchorFrame: action.frame)
+            do {
+                try await menuSubmitter.submit(uid: uid, anchor: action.frame, lease: lease)
+            } catch {
+                AutomationStepLog.record(root: logRoot, uid: uid, step: "transfer-menu-control-failed",
+                    detail: "recipient=\(action.agentLabel) \(error.localizedDescription)")
+                // Observe the result before any other recipient is attempted: a menu item may submit directly.
+                let result = try await waitForTransferResult(recipient: action.agentLabel, lease: lease)
+                if result.succeeded { return .transferred(agentLabel: action.agentLabel) }
+                // An unresolved menu must never fall through into another recipient's controls.
+                return .failed("无法定位转移确认控件：\(error.localizedDescription)")
+            }
 
             let confirmation = try await waitForTransferResult(recipient: action.agentLabel, lease: lease)
             if confirmation.succeeded {
@@ -130,14 +153,67 @@ final class PDDAXConversationTransferer: PDDLiveConversationTransferring {
         }
     }
 
-    private func waitForDialog(lease: UIOperationLease) async throws -> PDDAXSemanticTree {
-        for _ in 0..<15 {
+    private func openDialog(uid: String, initial: PDDAXSemanticTree, lease: UIOperationLease) async throws -> PDDAXSemanticTree {
+        var tree = initial
+        for attempt in 1...3 {
+            try lease.validate()
+            if attempt > 1 {
+                try await backend.prepareForeground()
+                try lease.validate()
+                tree = try backend.readSemanticTree()
+                if PDDAXControlSelection.isTransferDialogVisible(in: tree.nodes) { return tree }
+                tree = try await opener.openAndResolve(uid: uid)
+            }
+            try lease.validate()
+            if PDDAXControlSelection.isTransferDialogVisible(in: tree.nodes) { return tree }
+            let id = try PDDAXControlSelection.transferConversationTrigger(in: tree.nodes)
+            guard let trigger = tree.nodes.first(where: { $0.id == id }), isUsable(trigger.frame) else {
+                throw PDDConversationTransferError.invalidControlFrame("转移会话")
+            }
+            AutomationStepLog.record(root: logRoot, uid: uid, step: "transfer-open-attempt", detail: "attempt=\(attempt)/3 foreground prepared")
+            do {
+                try press(trigger, uid: uid, step: "transfer-trigger-clicked", forceCoordinate: attempt > 1)
+            } catch {
+                AutomationStepLog.record(root: logRoot, uid: uid, step: "transfer-trigger-action-failed", detail: error.localizedDescription)
+            }
+            if let opened = try await waitForDialog(lease: lease) { return opened }
+            tree = try backend.readSemanticTree()
+        }
+        saveOpenFailure(uid: uid, tree: tree)
+        throw PDDAXSelectionError.missing("转移会话弹窗（已前置窗口并重新定位重试3次）")
+    }
+
+    private func waitForDialog(lease: UIOperationLease) async throws -> PDDAXSemanticTree? {
+        for _ in 0..<20 {
             try lease.validate()
             let tree = try backend.readSemanticTree()
             if PDDAXControlSelection.isTransferDialogVisible(in: tree.nodes) { return tree }
             try await sleep(0.1)
         }
-        throw PDDAXSelectionError.missing("转移会话弹窗")
+        return nil
+    }
+
+    private func saveOpenFailure(uid: String, tree: PDDAXSemanticTree) {
+        guard let logRoot else { return }
+        do {
+            let directory = logRoot.appendingPathComponent("logs/transfer-diagnostics", isDirectory: true)
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            let url = directory.appendingPathComponent("open-failed-\(UUID().uuidString).json")
+            let nodes: [[String: Any]] = tree.nodes.filter { node in
+                ["AXWindow", "AXWebArea"].contains(node.role)
+                    || [node.value, node.title].compactMap { $0 }.contains { $0.contains("转移") || $0 == "请输入内容" }
+                    || node.domClasses.contains { $0.contains("transfer") || $0.contains("dialog") }
+            }.map { node in
+                ["token": node.id.rawValue, "role": node.role, "value": node.value ?? "", "title": node.title ?? "",
+                 "actions": Array(node.actionNames), "classes": Array(node.domClasses),
+                 "frame": ["x": node.frame.minX, "y": node.frame.minY, "width": node.frame.width, "height": node.frame.height]]
+            }
+            try JSONSerialization.data(withJSONObject: ["uid": uid, "nodes": nodes], options: [.prettyPrinted, .sortedKeys])
+                .write(to: url, options: .atomic)
+            AutomationStepLog.record(root: logRoot, uid: uid, step: "transfer-open-diagnostic-saved", detail: url.path)
+        } catch {
+            AutomationStepLog.record(root: logRoot, uid: uid, step: "transfer-open-diagnostic-failed", detail: error.localizedDescription)
+        }
     }
 
     private func waitForTransferResult(
@@ -158,36 +234,32 @@ final class PDDAXConversationTransferer: PDDLiveConversationTransferring {
     }
 
     private func isUsable(_ frame: CGRect) -> Bool {
-        frame.width > 1 && frame.height > 1
+        PDDTransferMenuControls.valid(frame)
+    }
+
+    private func press(_ node: PDDAXSemanticNode<AXElementToken>, uid: String, step: String, forceCoordinate: Bool = false) throws {
+        let useAX = node.actionNames.contains("AXPress") && !forceCoordinate
+        if useAX { try backend.performPress(node.id) }
+        else { try clicker.click(at: CGPoint(x: node.frame.midX, y: node.frame.midY)) }
+        AutomationStepLog.record(root: logRoot, uid: uid, step: step,
+            detail: "route=\(useAX ? "AXPress" : "AX-frame") x=\(node.frame.midX) y=\(node.frame.midY)")
     }
 }
 
 @MainActor
 final class CGEventPDDTransferClicker: PDDTransferClicking {
     func click(at point: CGPoint) throws {
-        guard let down = CGEvent(
+        guard let moved = CGEvent(mouseEventSource: nil, mouseType: .mouseMoved,
+                                 mouseCursorPosition: point, mouseButton: .left), let down = CGEvent(
             mouseEventSource: nil, mouseType: .leftMouseDown,
             mouseCursorPosition: point, mouseButton: .left
         ), let up = CGEvent(
             mouseEventSource: nil, mouseType: .leftMouseUp,
             mouseCursorPosition: point, mouseButton: .left
         ) else { throw PDDConversationTransferError.clickFailed }
+        moved.post(tap: .cghidEventTap)
         down.post(tap: .cghidEventTap)
         up.post(tap: .cghidEventTap)
     }
 
-    func submitNoReasonTransfer(anchorFrame: CGRect) async throws {
-        // 拼多多的原因菜单没有独立 AX 节点；位置由 AX 中“转移”控件的矩形推导。
-        let reasonPoint = CGPoint(
-            x: anchorFrame.midX,
-            y: anchorFrame.maxY + 175
-        )
-        let sendPoint = CGPoint(
-            x: anchorFrame.midX + 65,
-            y: anchorFrame.maxY + 232
-        )
-        try click(at: reasonPoint)
-        try await Task.sleep(for: .milliseconds(120))
-        try click(at: sendPoint)
-    }
 }

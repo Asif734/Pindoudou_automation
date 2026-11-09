@@ -35,7 +35,7 @@ enum PDDVideoTransferPhase: String, Codable, Equatable, Sendable {
 struct PDDPendingVideoBatch: Codable, Equatable, Sendable, Identifiable {
     let id: UUID
     let uid: String
-    let capture: AutoReplyCapture
+    var capture: AutoReplyCapture
     let expectedMessageIDs: [String]
     var completedAttachmentsByMessageID: [String: AutoReplyVideoAttachment]
     var failedMessageIDs: Set<String>
