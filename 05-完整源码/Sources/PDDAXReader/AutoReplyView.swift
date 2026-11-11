@@ -8,16 +8,18 @@ struct AutoReplyView: View {
     @MainActor
     init() {
         let model = AutoReplyViewModel()
+        let permissions = PDDMediaPermissionController()
         _model = StateObject(wrappedValue: model)
-        _progressPanel = StateObject(wrappedValue: AutoReplyProgressPanelController(model: model))
-        _mediaPermissions = StateObject(wrappedValue: PDDMediaPermissionController())
+        _progressPanel = StateObject(wrappedValue: AutoReplyProgressPanelController(model: model, mediaPermissions: permissions))
+        _mediaPermissions = StateObject(wrappedValue: permissions)
     }
 
     @MainActor
     init(model: AutoReplyViewModel) {
+        let permissions = PDDMediaPermissionController()
         _model = StateObject(wrappedValue: model)
-        _progressPanel = StateObject(wrappedValue: AutoReplyProgressPanelController(model: model))
-        _mediaPermissions = StateObject(wrappedValue: PDDMediaPermissionController())
+        _progressPanel = StateObject(wrappedValue: AutoReplyProgressPanelController(model: model, mediaPermissions: permissions))
+        _mediaPermissions = StateObject(wrappedValue: permissions)
     }
 
     var body: some View {
@@ -28,17 +30,17 @@ struct AutoReplyView: View {
 
             HStack(spacing: 10) {
                 Button {
-                    model.isRunning ? model.stop() : model.start()
+                    model.canStop ? model.stop() : model.start()
                 } label: {
-                    toolbarLabel(model.isRunning ? "停止" : "开始", model.isRunning ? "Stop" : "Start")
+                    toolbarLabel(model.canStop ? "停止" : "开始", model.canStop ? "Stop" : "Start")
                 }
                 .buttonStyle(.borderedProminent)
-                .disabled(!model.isRunning && (!model.canStart || mediaPermissions.isRequesting))
+                .disabled(!model.canStop && (!model.canStart || mediaPermissions.isRequesting))
 
                 Button { Task { await mediaPermissions.requestPermissions() } } label: {
                     toolbarLabel("文件权限", "File permission")
                 }
-                .disabled(model.isRunning || mediaPermissions.isRequesting)
+                .disabled(model.canStop || mediaPermissions.isRequesting)
                 .help(BilingualText.lines("开始前请求下载文件夹与视频语音识别权限", "Request Downloads and video speech-recognition access before Start"))
 
                 Button { progressPanel.toggleCollapsed() } label: {

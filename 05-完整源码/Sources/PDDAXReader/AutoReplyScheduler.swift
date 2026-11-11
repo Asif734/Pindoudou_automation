@@ -20,6 +20,7 @@ enum AutoReplyTransferResult: Equatable, Sendable {
 
 @MainActor
 protocol AutoReplyAutomationDriver: AnyObject {
+    func reconcileVisibleIdentity(in tree: PDDAXSemanticTree) throws
     func visibleConversationsSnapshot() -> [PDDConversationLocator]?
     func send(uid: String, text: String, outgoingImages: [DatasetReplyImage], deliveryID: UUID,
               expectedCustomerCursor: AutoReplyCursor, expectedCustomerMessageIDs: Set<String>,
@@ -84,6 +85,7 @@ protocol AutoReplyAutomationDriver: AnyObject {
 }
 
 extension AutoReplyAutomationDriver {
+    func reconcileVisibleIdentity(in tree: PDDAXSemanticTree) throws {}
     func visibleConversationsSnapshot() -> [PDDConversationLocator]? { nil }
     func send(uid: String, text: String, outgoingImages: [DatasetReplyImage], deliveryID: UUID,
               expectedCustomerCursor: AutoReplyCursor, expectedCustomerMessageIDs: Set<String>,
@@ -253,6 +255,8 @@ final class AutoReplyScheduler: ObservableObject {
     private var ordinaryCaptureAuthorizations = Set<String>()
     private var ordinaryCaptureFailureCounts: [String: Int] = [:]
     private var pumping = false
+    private var identityRecoveryBlockedUIDs = Set<String>()
+    private var identityRecoveryRetryAt: [String: Date] = [:]
     private var activeUIOperationID: UUID?
 
 
@@ -308,7 +312,8 @@ final class AutoReplyScheduler: ObservableObject {
         )
         driver.restoreProvisionalReceipts(state.provisionalReceiptsByUID)
         driver.restoreMessageSourceSelectorStates(state.messageSourceSelectorStatesByUID)
-        var migratedBlockingState = false
+        var migratedBlockingState = PDDConversationIdentityRecovery.retireSupersededHandoffs(
+            in: &state, root: store.rootDirectory, at: now())
         for index in state.jobs.indices {
             guard state.jobs[index].state == .completed,
                   state.jobs[index].deliveryOutcome == .uncertain,
@@ -389,6 +394,10 @@ final class AutoReplyScheduler: ObservableObject {
         if migratedBlockingState { try store.save(state) }
         checkpointToken = try transactionalStore.loadCheckpoint().token
         jobs = state.jobs
+        if releaseTerminalVideoWaits() {
+            syncJobs()
+            try persist()
+        }
         // Recover the narrow crash window between persisting an omission and
         // archiving it. An archive problem stays local to that historical job.
         for job in state.jobs where job.omittedAt != nil && job.reply != nil {
@@ -447,6 +456,17 @@ final class AutoReplyScheduler: ObservableObject {
 
     func setDeliveryEnabled(_ enabled: Bool) { deliveryEnabled = enabled }
 
+    func reconcileVisibleIdentity(in tree: PDDAXSemanticTree) throws {
+        guard !isRunning, !pumping else { return }
+        guard try transactionalStore.loadCheckpoint().token == checkpointToken else {
+            throw AutoReplyTransactionalStoreError.checkpointChanged
+        }
+        try driver.reconcileVisibleIdentity(in: tree)
+        identityRecoveryRetryAt.removeAll()
+        try reconcileConversationIdentities()
+        syncJobs(); try persist()
+    }
+
     func requestAXRefresh() {
         lastAXWakeAt = now()
         if pendingFastDiscoveryAttempts == 0 {
@@ -503,11 +523,13 @@ final class AutoReplyScheduler: ObservableObject {
         appendEvent(
             uid: event.uid,
             kind: "video-\(event.phase.rawValue)",
-            detail: event.messageID
+            detail: [event.messageID, event.diagnostic].compactMap { $0 }.joined(separator: " · ")
         )
-        guard let index = state.pendingVideoBatches.firstIndex(where: {
-            $0.uid == event.uid && $0.expectedMessageIDs.contains(event.messageID)
-        }) else {
+        let matchingIndices = state.pendingVideoBatches.indices.filter {
+            let pending = state.pendingVideoBatches[$0]
+            return pending.uid == event.uid && pending.expectedMessageIDs.contains(event.messageID)
+        }
+        guard !matchingIndices.isEmpty else {
             if event.phase == .readyForGeneration, event.recovered == true,
                let attachment = event.attachment {
                 admitRecoveredVideo(uid: event.uid, attachment: attachment)
@@ -516,7 +538,8 @@ final class AutoReplyScheduler: ObservableObject {
                 return
             }
             if event.phase == .readyForGeneration || event.phase == .duplicate
-                || event.phase == .failed || event.phase == .fallbackRequired {
+                || event.phase == .failed || event.phase == .fallbackRequired
+                || event.phase == .waitingForRetry {
                 state.deferredVideoTransferEvents.removeAll {
                     $0.uid == event.uid && $0.messageID == event.messageID
                 }
@@ -526,54 +549,59 @@ final class AutoReplyScheduler: ObservableObject {
             return
         }
 
-        switch event.phase {
-        case .readyForGeneration:
-            guard let attachment = event.attachment,
-                  state.pendingVideoBatches[index]
+        // One video can appear in multiple durable captures after a cursor changes.
+        // Resolve every reference before promoting/removing any pending batch.
+        for index in matchingIndices {
+            switch event.phase {
+            case .readyForGeneration:
+                guard let attachment = event.attachment,
+                      state.pendingVideoBatches[index]
+                        .completedAttachmentsByMessageID[event.messageID] == nil,
+                      !state.pendingVideoBatches[index].failedMessageIDs.contains(event.messageID),
+                      !state.pendingVideoBatches[index].duplicateMessageIDs.contains(event.messageID)
+                else {
+                    continue
+                }
+                state.pendingVideoBatches[index]
+                    .completedAttachmentsByMessageID[event.messageID] = attachment
+            case .failed, .fallbackRequired, .waitingForRetry:
+                guard state.pendingVideoBatches[index]
                     .completedAttachmentsByMessageID[event.messageID] == nil,
-                  !state.pendingVideoBatches[index].failedMessageIDs.contains(event.messageID),
-                  !state.pendingVideoBatches[index].duplicateMessageIDs.contains(event.messageID)
-            else {
+                      !state.pendingVideoBatches[index].duplicateMessageIDs.contains(event.messageID)
+                else {
+                    continue
+                }
+                state.pendingVideoBatches[index].failedMessageIDs.insert(event.messageID)
+            case .duplicate:
+                guard state.pendingVideoBatches[index]
+                    .completedAttachmentsByMessageID[event.messageID] == nil,
+                      !state.pendingVideoBatches[index].failedMessageIDs.contains(event.messageID)
+                else {
+                    continue
+                }
+                state.pendingVideoBatches[index].duplicateMessageIDs.insert(event.messageID)
+                do {
+                    try CustomerMessageReceipts(root: store.rootDirectory).closeUnsubmitted(uid: event.uid,
+                        messageIDs: [event.messageID], reason: "legacy-video-content-duplicate", at: now())
+                } catch {
+                    appendEvent(uid: event.uid, kind: "message-receipt-closure-failed", detail: error.localizedDescription)
+                }
+            default:
                 try? persist()
                 return
             }
-            state.pendingVideoBatches[index]
-                .completedAttachmentsByMessageID[event.messageID] = attachment
-        case .failed, .fallbackRequired:
-            guard state.pendingVideoBatches[index]
-                .completedAttachmentsByMessageID[event.messageID] == nil,
-                  !state.pendingVideoBatches[index].duplicateMessageIDs.contains(event.messageID)
-            else {
-                try? persist()
-                return
-            }
-            state.pendingVideoBatches[index].failedMessageIDs.insert(event.messageID)
-        case .duplicate:
-            guard state.pendingVideoBatches[index]
-                .completedAttachmentsByMessageID[event.messageID] == nil,
-                  !state.pendingVideoBatches[index].failedMessageIDs.contains(event.messageID)
-            else {
-                try? persist()
-                return
-            }
-            state.pendingVideoBatches[index].duplicateMessageIDs.insert(event.messageID)
-            do {
-                try CustomerMessageReceipts(root: store.rootDirectory).closeUnsubmitted(uid: event.uid,
-                    messageIDs: [event.messageID], reason: "legacy-video-content-duplicate", at: now())
-            } catch {
-                appendEvent(uid: event.uid, kind: "message-receipt-closure-failed", detail: error.localizedDescription)
-            }
-        default:
-            try? persist()
-            return
-        }
 
-        let pending = state.pendingVideoBatches[index]
-        let terminal = Set(pending.completedAttachmentsByMessageID.keys)
-            .union(pending.failedMessageIDs)
-            .union(pending.duplicateMessageIDs)
-        if Set(pending.expectedMessageIDs).isSubset(of: terminal) {
-            promotePendingVideoBatch(at: index)
+        }
+        let completedBatchIDs = matchingIndices.compactMap { index -> UUID? in
+            let pending = state.pendingVideoBatches[index]
+            let terminal = Set(pending.completedAttachmentsByMessageID.keys)
+                .union(pending.failedMessageIDs).union(pending.duplicateMessageIDs)
+            return Set(pending.expectedMessageIDs).isSubset(of: terminal) ? pending.id : nil
+        }
+        for id in completedBatchIDs {
+            if let index = state.pendingVideoBatches.firstIndex(where: { $0.id == id }) {
+                promotePendingVideoBatch(at: index)
+            }
         }
         syncJobs()
         do {
@@ -596,6 +624,11 @@ final class AutoReplyScheduler: ObservableObject {
         }
 
         do {
+            try reconcileConversationIdentities()
+            if releaseTerminalVideoWaits() {
+                syncJobs()
+                try persist()
+            }
             await drainDeferredVideoTransferEvents()
             refreshVideoHoldingNotices()
             _ = launchQueuedGenerations()
@@ -612,7 +645,8 @@ final class AutoReplyScheduler: ObservableObject {
             }
 
             if !lastTurnWasTail, let index = state.pendingCaptureRequests.firstIndex(where: {
-                $0.kind == .tail && ($0.nextAttemptAt.map { $0 <= now() } ?? true)
+                $0.kind == .tail && !PDDConversationIdentityStore.isSharedVisitorUID($0.uid)
+                    && ($0.nextAttemptAt.map { $0 <= now() } ?? true)
             }) {
                 lastTurnWasTail = true
                 workTurnsSinceDiscovery += 1
@@ -668,12 +702,173 @@ final class AutoReplyScheduler: ObservableObject {
         }
     }
 
+    private func reconcileConversationIdentities() throws {
+        let registry = PDDConversationIdentityStore(root: store.rootDirectory)
+        let receipts = CustomerMessageReceipts(root: store.rootDirectory)
+        try recoverVerifiedAliasWork(registry: registry, receipts: receipts)
+        let originals = state.jobs.filter { [.queued, .ready].contains($0.state) && !$0.sendWasInvoked }
+        var reassignments: [(String, Set<String>, String)] = []
+        for source in originals {
+            guard !identityRecoveryBlockedUIDs.contains(source.uid) else { continue }
+            guard let batch = source.capture.batch else { continue }
+            do {
+                guard let canonical = try registry.owner(messageIDs: batch.customerMessageIDs, boundary: batch.incomingHandoffKey),
+                      canonical != source.uid,
+                      let index = state.jobs.firstIndex(where: { $0.id == source.id }) else { continue }
+                // Every target must independently belong to this canonical chat.
+                guard try batch.customerMessageIDs.allSatisfy({ try registry.owner(messageIDs: [$0]) == canonical }) else { continue }
+                let canonicalReceipts = try receipts.receipts(uid: canonical)
+                let alreadyAnswered = !batch.customerMessageIDs.isEmpty
+                    && batch.customerMessageIDs.allSatisfy { canonicalReceipts[$0]?.replySentAt != nil }
+                let alreadyOwned = state.jobs.contains { job in
+                    guard job.uid == canonical, [.queued, .generating, .ready, .sending].contains(job.state), let other = job.capture.batch else { return false }
+                    if let boundary = batch.incomingHandoffKey { return other.incomingHandoffKey == boundary }
+                    return !batch.customerMessageIDs.isEmpty && batch.customerMessageIDs.isSubset(of: other.customerMessageIDs)
+                }
+                // Images already submitted must not be replayed by identity recovery.
+                guard source.outgoingImages.isEmpty || source.stageAttempt == 0 else { continue }
+                if !alreadyAnswered && !alreadyOwned {
+                    guard let capture = try PDDConversationIdentityRecovery.capture(source.capture, canonicalUID: canonical, root: store.rootDirectory) else { continue }
+                    try receipts.capture(capture, at: now())
+                    state.nextSequence += 1
+                    state.jobs.append(AutoReplyJob(id: UUID(), uid: canonical, sequence: state.nextSequence,
+                        state: .queued, capture: capture, reply: nil, deliveryOutcome: nil, confirmedServiceMessageID: nil,
+                        retries: 0, nextAttemptAt: nil, lastError: nil,
+                        imageAttachments: capture.imageAttachments, videoAttachments: capture.videoAttachments))
+                }
+                state.jobs[index].state = .failed
+                state.jobs[index].deliveryOutcome = .notSent
+                state.jobs[index].nextAttemptAt = nil
+                state.jobs[index].lastError = "会话身份已核对到 \(canonical)；原任务保留为未发送，后续由同一客户的规范记录处理"
+                state.jobs[index].durableAttemptOperationID = nil
+                state.jobs[index].supplementCapturePending = false
+                state.pendingCaptureRequests.removeAll { $0.uid == source.uid && ($0.sourceJobID == source.id || $0.baseCursor == batch.endCursor) }
+                for holdIndex in state.videoHoldingNotices.indices where state.videoHoldingNotices[holdIndex].uid == source.uid
+                    && !state.videoHoldingNotices[holdIndex].messageIDs.isDisjoint(with: batch.customerMessageIDs) {
+                    state.videoHoldingNotices[holdIndex].uid = canonical
+                }
+                reassignments.append((source.uid, batch.customerMessageIDs, canonical))
+                appendEvent(uid: source.uid, kind: "identity-work-reassigned",
+                    detail: "source_job=\(source.id) canonical=\(canonical) answered=\(alreadyAnswered) owned=\(alreadyOwned); no history-folder merge")
+            } catch {
+                appendEvent(uid: source.uid, kind: "identity-recovery-deferred", detail: error.localizedDescription)
+            }
+        }
+        if !reassignments.isEmpty {
+            syncJobs(); try persist(sendCritical: true)
+            for (uid, ids, canonical) in reassignments {
+                try receipts.closeSuperseded(uid: uid, messageIDs: ids, canonicalUID: canonical, at: now())
+            }
+        }
+        // A receipt copied into a legacy visitor bucket must not trigger endless capture.
+        for (uid, ids) in try receipts.awaitingSubmission() {
+            for id in ids {
+                guard let canonical = try registry.owner(messageIDs: [id]), canonical != uid else { continue }
+                let answered = try receipts.receipts(uid: canonical)[id]?.replySentAt != nil
+                if answered {
+                    try receipts.closeSuperseded(uid: uid, messageIDs: [id], canonicalUID: canonical, at: now())
+                }
+            }
+        }
+    }
+
+    private func recoverVerifiedAliasWork(registry: PDDConversationIdentityStore, receipts: CustomerMessageReceipts) throws {
+        identityRecoveryBlockedUIDs = []
+        let aliases = try registry.aliases()
+        for canonical in Set(aliases.values) {
+            let aliasUIDs = Set(aliases.filter { $0.value == canonical }.map(\.key))
+            let uids = aliasUIDs.union([canonical])
+            var active = state.jobs.filter { uids.contains($0.uid) && [.queued, .generating, .ready].contains($0.state) && !$0.sendWasInvoked }
+            guard active.contains(where: { aliasUIDs.contains($0.uid) }) else { continue }
+            identityRecoveryBlockedUIDs.formUnion(uids)
+            if identityRecoveryRetryAt[canonical].map({ $0 > now() }) == true { continue }
+            do {
+                let covered = Set(try receipts.receipts(uid: canonical).filter { $0.value.replySentAt != nil }.map(\.key))
+                let answeredAliases = active.filter { source in
+                    let ids = (source.capture.batch?.customerMessageIDs ?? []).union(source.pendingSupplement?.batch?.customerMessageIDs ?? [])
+                    return aliasUIDs.contains(source.uid) && source.state != .generating && !ids.isEmpty && ids.isSubset(of: covered)
+                }
+                if !answeredAliases.isEmpty {
+                    let ids = Set(answeredAliases.map(\.id))
+                    for index in state.jobs.indices where ids.contains(state.jobs[index].id) {
+                        state.jobs[index].state = .failed
+                        state.jobs[index].deliveryOutcome = .notSent
+                        state.jobs[index].nextAttemptAt = nil
+                        state.jobs[index].supplementCapturePending = false
+                        state.jobs[index].lastError = "规范会话已确认回复相同消息；别名回复未发送，已结束重复重试"
+                    }
+                    state.pendingCaptureRequests.removeAll { request in
+                        answeredAliases.contains { $0.uid == request.uid && ($0.id == request.sourceJobID || $0.capture.batch?.endCursor == request.baseCursor) }
+                    }
+                    appendEvent(uid: canonical, kind: "identity-alias-already-answered",
+                        detail: "source_jobs=\(answeredAliases.map { String($0.sequence) }.joined(separator: ",")); existing reply receipts preserved; aliases not sent")
+                    syncJobs(); try persist(sendCritical: true)
+                    for source in answeredAliases {
+                        try receipts.closeSuperseded(uid: source.uid, messageIDs: source.capture.batch?.customerMessageIDs ?? [], canonicalUID: canonical, at: now())
+                    }
+                    active.removeAll { ids.contains($0.id) }
+                    if !active.contains(where: { aliasUIDs.contains($0.uid) }) {
+                        identityRecoveryBlockedUIDs.subtract(uids)
+                        continue
+                    }
+                }
+                guard !active.contains(where: { $0.state == .generating || (!$0.outgoingImages.isEmpty && $0.stageAttempt > 0) }),
+                      let capture = try PDDConversationIdentityRecovery.currentThreadCapture(canonicalUID: canonical,
+                        after: answeredCursor(canonical), jobs: active, root: store.rootDirectory, covered: covered) else {
+                    identityRecoveryRetryAt[canonical] = now().addingTimeInterval(15)
+                    appendEvent(uid: canonical, kind: "identity-recovery-waiting",
+                        detail: "需完整会话依据或等待在途工作结束；15秒后复查；其他客户继续")
+                    continue
+                }
+                try receipts.capture(capture, at: now())
+                let jobIDs = Set(active.map(\.id))
+                for index in state.jobs.indices where jobIDs.contains(state.jobs[index].id) {
+                    state.jobs[index].state = .failed
+                    state.jobs[index].deliveryOutcome = .notSent
+                    state.jobs[index].nextAttemptAt = nil
+                    state.jobs[index].durableAttemptOperationID = nil
+                    state.jobs[index].supplementCapturePending = false
+                    state.jobs[index].lastError = "已通过同一会话的消息依据恢复到 \(canonical)；原回复未发送，使用最新上下文重新生成"
+                }
+                state.pendingCaptureRequests.removeAll { request in
+                    guard request.kind != .videoRecovery, uids.contains(request.uid) else { return false }
+                    return request.sourceJobID.map { jobIDs.contains($0) } == true
+                        || active.contains { $0.uid == request.uid && $0.capture.batch?.endCursor == request.baseCursor }
+                }
+                for index in state.transferTasks.indices where jobIDs.contains(state.transferTasks[index].sourceJobID) && state.transferTasks[index].state == .pending {
+                    state.transferTasks[index].state = .failed
+                }
+                for index in state.videoHoldingNotices.indices where aliasUIDs.contains(state.videoHoldingNotices[index].uid) {
+                    state.videoHoldingNotices[index].uid = canonical
+                }
+                state.nextSequence += 1
+                state.jobs.append(.init(id: UUID(), uid: canonical, sequence: state.nextSequence, state: .queued,
+                    capture: capture, reply: nil, deliveryOutcome: nil, confirmedServiceMessageID: nil,
+                    retries: 0, nextAttemptAt: nil, lastError: nil, imageAttachments: capture.imageAttachments,
+                    videoAttachments: capture.videoAttachments))
+                latestCapture = capture
+                appendEvent(uid: canonical, kind: "identity-split-work-recovered",
+                    detail: "source_jobs=\(active.map { String($0.sequence) }.joined(separator: ",")) new_job=\(state.nextSequence) message_ids=\((capture.batch?.customerMessageIDs ?? []).sorted().joined(separator: ",")); old replies not sent")
+                syncJobs(); try persist(sendCritical: true)
+                for source in active where aliasUIDs.contains(source.uid) {
+                    try receipts.closeSuperseded(uid: source.uid, messageIDs: source.capture.batch?.customerMessageIDs ?? [], canonicalUID: canonical, at: now())
+                }
+                identityRecoveryBlockedUIDs.subtract(uids)
+                identityRecoveryRetryAt[canonical] = nil
+            } catch {
+                identityRecoveryRetryAt[canonical] = now().addingTimeInterval(15)
+                appendEvent(uid: canonical, kind: "identity-recovery-deferred", detail: error.localizedDescription)
+            }
+        }
+    }
+
     private func performDiscovery() async throws {
         lastDiscoveryAt = now()
         let discoveries = try await performUI(stage: "discover", uid: "discovery") {
             driver, lease in
             try await driver.discover(lease: lease)
         }
+        try reconcileConversationIdentities()
         if pendingFastDiscoveryAttempts > 0 { pendingFastDiscoveryAttempts -= 1 }
         try await updateCustomerVisibility(driver.visibleConversationsSnapshot())
         var changed = false
@@ -717,6 +912,8 @@ final class AutoReplyScheduler: ObservableObject {
         guard deliveryEnabled, !realDeliveryPausedForPersistence else { return nil }
         return state.jobs.indices
             .filter { state.jobs[$0].state == .ready }
+            .filter { !identityRecoveryBlockedUIDs.contains(state.jobs[$0].uid) }
+            .filter { !PDDConversationIdentityStore.isSharedVisitorUID(state.jobs[$0].uid) }
             .filter { state.jobs[$0].customerMissingSince.map { now().timeIntervalSince($0) < 600 } ?? true }
             .filter { state.jobs[$0].nextAttemptAt.map { $0 <= now() } ?? true }
             .filter { isHeadOfLine($0) }
@@ -843,6 +1040,7 @@ final class AutoReplyScheduler: ObservableObject {
         guard deliveryEnabled, !realDeliveryPausedForPersistence else { return nil }
         return state.transferTasks.indices
             .filter { state.transferTasks[$0].state == .pending }
+            .filter { !PDDConversationIdentityStore.isSharedVisitorUID(state.transferTasks[$0].uid) }
             .filter { taskIndex in
                 state.jobs.first(where: {
                     $0.id == state.transferTasks[taskIndex].sourceJobID
@@ -1150,11 +1348,9 @@ final class AutoReplyScheduler: ObservableObject {
         coalesceQueuedVideoReplies()
         let queued = state.jobs.indices.filter { index in
             state.jobs[index].state == .queued
-                && !state.pendingVideoBatches.contains(where: { pending in
-                    pending.uid == state.jobs[index].uid && state.jobs[index].capture.fullHistory.contains {
-                        pending.expectedMessageIDs.contains($0.id)
-                    }
-                })
+                && !identityRecoveryBlockedUIDs.contains(state.jobs[index].uid)
+                && !PDDConversationIdentityStore.isSharedVisitorUID(state.jobs[index].uid)
+                && !generationWaitsForVideo(state.jobs[index])
                 && (state.jobs[index].customerMissingSince.map { now().timeIntervalSince($0) < 600 } ?? true)
                 && (state.jobs[index].nextAttemptAt.map { $0 <= now() } ?? true)
                 && isHeadOfLine(index)
@@ -1199,6 +1395,63 @@ final class AutoReplyScheduler: ObservableObject {
             recordPersistenceFailure(error, sendCritical: false)
         }
         return true
+    }
+
+    private func generationWaitsForVideo(_ job: AutoReplyJob) -> Bool {
+        let prepared = Set(job.videoAttachments.map(\.messageID))
+            .union(job.capture.videoAttachments.map(\.messageID))
+        let targets = Set(job.capture.batch?.events.filter { $0.kind == .video }.map(\.messageID) ?? [])
+            .union(job.capture.pendingVideoMessageIDs).subtracting(prepared)
+        return state.pendingVideoBatches.contains {
+            $0.uid == job.uid && !targets.isDisjoint(with: $0.expectedMessageIDs)
+        }
+    }
+
+    /// A background retry may outlive the original video reply. Its UI capture
+    /// must not reopen that answered turn or absorb a later customer message.
+    @discardableResult
+    private func releaseTerminalVideoWaits() -> Bool {
+        guard !state.pendingVideoBatches.isEmpty else { return false }
+        var terminalByUID: [String: Set<String>] = [:]
+        for uid in Set(state.pendingVideoBatches.map(\.uid)) {
+            var ids = Set(state.jobs.filter {
+                $0.uid == uid && $0.state == .completed
+                    && ($0.deliveryOutcome == .sent || $0.deliveryOutcome == .uncertain)
+            }.flatMap { $0.capture.batch?.customerMessageIDs ?? [] })
+            do {
+                let receipts = try CustomerMessageReceipts(root: store.rootDirectory).receipts(uid: uid)
+                ids.formUnion(receipts.values.filter { $0.replySentAt != nil }.map(\.messageID))
+            } catch {
+                appendEvent(uid: uid, kind: "video-terminal-receipts-unavailable", detail: error.localizedDescription)
+            }
+            terminalByUID[uid] = ids
+        }
+        var changed = false
+        for pending in state.pendingVideoBatches {
+            let terminal = terminalByUID[pending.uid] ?? []
+            let released = Set(pending.expectedMessageIDs).intersection(terminal)
+            guard !released.isEmpty,
+                  let index = state.pendingVideoBatches.firstIndex(where: { $0.id == pending.id }) else { continue }
+            state.pendingVideoBatches.remove(at: index)
+            if let capture = captureByRemovingMessages(pending.capture, messageIDs: terminal) {
+                let expected = pending.expectedMessageIDs.filter { !terminal.contains($0) }
+                let retained = PDDPendingVideoBatch(id: pending.id, uid: pending.uid,
+                    capture: capture, expectedMessageIDs: expected,
+                    completedAttachmentsByMessageID: pending.completedAttachmentsByMessageID.filter { !terminal.contains($0.key) },
+                    failedMessageIDs: pending.failedMessageIDs.subtracting(terminal),
+                    duplicateMessageIDs: pending.duplicateMessageIDs.subtracting(terminal), createdAt: pending.createdAt)
+                state.pendingVideoBatches.append(retained)
+                let resolved = Set(retained.completedAttachmentsByMessageID.keys)
+                    .union(retained.failedMessageIDs).union(retained.duplicateMessageIDs)
+                if Set(expected).isSubset(of: resolved) {
+                    promotePendingVideoBatch(at: state.pendingVideoBatches.count - 1)
+                }
+            }
+            appendEvent(uid: pending.uid, kind: "video-terminal-wait-released",
+                detail: "message_ids=\(released.sorted().joined(separator: ",")); background retry remains independent; later unsent messages preserved")
+            changed = true
+        }
+        return changed
     }
 
     private func generationFinished(jobID: UUID, attemptID: UUID, result: Result<CodexReplyResult, Error>) {
@@ -1313,6 +1566,14 @@ final class AutoReplyScheduler: ObservableObject {
                 deferred.append(request)
                 continue
             }
+            if PDDConversationIdentityStore.isSharedVisitorUID(request.uid) {
+                var waiting = request
+                waiting.nextAttemptAt = now().addingTimeInterval(30)
+                deferred.append(waiting)
+                appendEvent(uid: request.uid, kind: "identity-capture-waiting",
+                    detail: "旧共享访客记录需先用平台消息核对身份；保留请求，30秒后复查，不占用聊天窗口")
+                continue
+            }
             if request.kind == .ordinary {
                 guard ordinaryCaptureAuthorizations.contains(request.uid) else { continue }
             }
@@ -1331,6 +1592,7 @@ final class AutoReplyScheduler: ObservableObject {
     private func nextSupplementCaptureRequest() -> AutoReplyCaptureRequest? {
         guard let index = state.pendingCaptureRequests.firstIndex(where: {
             guard $0.kind == .supplement && ($0.tailAttempt ?? 0) == 0 else { return false }
+            guard !PDDConversationIdentityStore.isSharedVisitorUID($0.uid) else { return false }
             guard $0.nextAttemptAt.map({ $0 <= now() }) ?? true else { return false }
             guard let source = supplementSourceIndex(for: $0) else { return false }
             return isHeadOfLine(source)

@@ -6,6 +6,8 @@ final class PerUserAXStoreTests: XCTestCase {
         XCTAssertTrue(PerUserAXStore.validUID("GZC-000001"))
         XCTAssertTrue(PerUserAXStore.validUID("PDD-ID-0123456789abcdef01234567"))
         XCTAssertTrue(PerUserAXStore.validUID("PDD-NAME-0123456789abcdef01234567"))
+        XCTAssertTrue(PerUserAXStore.validUID("PDD-CHAT-0123456789abcdef01234567"))
+        XCTAssertFalse(PerUserAXStore.validUID("PDD-CHAT-../escape"))
     }
 
     func testSaveWritesOneAtomicAXFileInsideUsersOwnDirectory() throws {

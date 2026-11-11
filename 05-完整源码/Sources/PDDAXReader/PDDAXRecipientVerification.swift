@@ -41,6 +41,9 @@ enum PDDAXRecipientVerification {
            snapshotCurrent.normalizedNickname != semanticCurrent.normalizedNickname { return nil }
         let current = snapshotCurrent ?? semanticCurrent
         if let current {
+            // A visitor label can belong to many people and never proves a recipient.
+            guard !PDDConversationIdentityStore.generic(current.nickname),
+                  locator.map({ !PDDConversationIdentityStore.generic($0.nickname) }) ?? true else { return nil }
             if let locator, current.normalizedNickname != locator.normalizedNickname { return nil }
             let nameKey = PDDConversationKey.make(locator: .init(nickname: current.nickname))
             guard locator != nil || nameKey == uid else { return nil }

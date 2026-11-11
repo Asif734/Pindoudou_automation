@@ -328,6 +328,7 @@ final class LivePDDAXBackend: PDDAXBackend {
         let role = values[kAXRoleAttribute as String].map(AXValueFormatter.string(from:)) ?? "AXUnknown"
         let value = values[kAXValueAttribute as String].map(AXValueFormatter.string(from:))
         let title = values[kAXTitleAttribute as String].map(AXValueFormatter.string(from:))
+        let accessibilityDescription = values[kAXDescriptionAttribute as String].map(AXValueFormatter.string(from:))
         let domIdentifier = values["AXDOMIdentifier"].map(AXValueFormatter.string(from:))
         let domClasses = values["AXDOMClassList"].map(AXValueFormatter.string(from:))
             .map(parseDOMClasses) ?? []
@@ -351,7 +352,8 @@ final class LivePDDAXBackend: PDDAXBackend {
         nodes.append(PDDAXSemanticNode(
             id: token, parentID: parent, role: role, value: value, title: title,
             domIdentifier: domIdentifier, domClasses: domClasses,
-            actionNames: actions, isSettable: isSettable, frame: frame
+            actionNames: actions, isSettable: isSettable, frame: frame,
+            accessibilityDescription: accessibilityDescription
         ))
 
         var attributes: [(String, String)] = []

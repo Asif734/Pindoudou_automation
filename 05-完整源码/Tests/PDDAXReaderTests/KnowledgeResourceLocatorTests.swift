@@ -12,7 +12,11 @@ final class KnowledgeResourceLocatorTests: XCTestCase {
         let resources = KnowledgeResourceLocator.resolve(
             resourceRootURL: root,
             environment: ["PDD_KNOWLEDGE_ZIP": legacy.path],
-            fileManager: .default
+            fileManager: .default,
+            pythonResolver: { _, _, _ in
+                PythonRuntimeResolution(executableURL: URL(fileURLWithPath: "/fixture/python3"),
+                                        source: .bundled, version: "3.12.14")
+            }
         )
 
         XCTAssertEqual(resources?.knowledgeBaseURL, root.appendingPathComponent("KnowledgeBase/Grozziie-China-KB-2026-08-24.zip"))
@@ -32,7 +36,11 @@ final class KnowledgeResourceLocatorTests: XCTestCase {
         let resources = KnowledgeResourceLocator.resolve(
             resourceRootURL: root,
             environment: ["PDD_KNOWLEDGE_ZIP": configured.path],
-            fileManager: .default
+            fileManager: .default,
+            pythonResolver: { _, _, _ in
+                PythonRuntimeResolution(executableURL: URL(fileURLWithPath: "/fixture/python3"),
+                                        source: .bundled, version: "3.12.14")
+            }
         )
 
         XCTAssertEqual(resources?.knowledgeBaseURL, configured)

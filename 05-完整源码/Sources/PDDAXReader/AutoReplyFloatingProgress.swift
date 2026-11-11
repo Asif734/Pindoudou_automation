@@ -40,16 +40,20 @@ final class AutoReplyProgressLayout: ObservableObject {
 @MainActor
 final class AutoReplyProgressPanelController: NSObject, ObservableObject, NSWindowDelegate {
     private let model: AutoReplyViewModel
+    private let mediaPermissions: PDDMediaPermissionController
     private let layout = AutoReplyProgressLayout()
     private var panel: AutoReplyFloatingProgressPanel?
 
-    init(model: AutoReplyViewModel) { self.model = model }
+    init(model: AutoReplyViewModel, mediaPermissions: PDDMediaPermissionController) {
+        self.model = model
+        self.mediaPermissions = mediaPermissions
+    }
 
     func show() {
         if panel == nil {
             let window = AutoReplyFloatingProgressPanel()
             window.delegate = self
-            let hosting = NSHostingView(rootView: AutoReplyProgressPanelView(model: model, layout: layout))
+            let hosting = NSHostingView(rootView: AutoReplyProgressPanelView(model: model, layout: layout, mediaPermissions: mediaPermissions))
             hosting.sizingOptions = []
             window.contentView = hosting
             if !window.setFrameUsingName("PDDAutoReplyProgressFloat"),
@@ -88,6 +92,7 @@ final class AutoReplyProgressPanelController: NSObject, ObservableObject, NSWind
 private struct AutoReplyProgressPanelView: View {
     @ObservedObject var model: AutoReplyViewModel
     @ObservedObject var layout: AutoReplyProgressLayout
+    @ObservedObject var mediaPermissions: PDDMediaPermissionController
     @State private var phaseStartedAt = Date()
     @State private var previousHeadline = ""
 
@@ -114,6 +119,35 @@ private struct AutoReplyProgressPanelView: View {
     }
 
     var body: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 10) {
+                Button { model.start() } label: {
+                    VStack(spacing: 2) {
+                        Text("开始")
+                        Text("Start").font(.caption)
+                    }
+                    .frame(minWidth: 72)
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(model.canStop || !model.canStart || mediaPermissions.isRequesting)
+                .accessibilityIdentifier("floating-automation-start")
+
+                Button { model.stop() } label: {
+                    VStack(spacing: 2) {
+                        Text("停止")
+                        Text("Stop").font(.caption)
+                    }
+                    .frame(minWidth: 72)
+                }
+                .buttonStyle(.bordered)
+                .tint(.red)
+                .disabled(!model.canStop)
+                .accessibilityIdentifier("floating-automation-stop")
+                Spacer(minLength: 0)
+            }
+            .padding(.horizontal, 14)
+            .padding(.vertical, 10)
+            Divider()
         TimelineView(.periodic(from: .now, by: 0.25)) { context in
             ScrollView {
             VStack(alignment: .leading, spacing: 10) {
@@ -173,7 +207,7 @@ private struct AutoReplyProgressPanelView: View {
                             }
                         }
                     }
-                    BilingualProgressText(BilingualText.lines("只读显示 · 不会为了进度条额外扫描拼多多", "Read-only display · no extra Pinduoduo scans are performed for this progress view"))
+                    BilingualProgressText(BilingualText.lines("进度显示不会额外扫描拼多多", "Progress updates do not trigger extra Pinduoduo scans"))
                         .font(.system(size: 10)).foregroundStyle(.secondary)
                 }
             }
@@ -181,6 +215,7 @@ private struct AutoReplyProgressPanelView: View {
             .frame(maxWidth: .infinity, alignment: .topLeading)
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        }
         }
         .background(Color(nsColor: .windowBackgroundColor))
         .onAppear {

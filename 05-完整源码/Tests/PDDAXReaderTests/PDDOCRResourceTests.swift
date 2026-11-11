@@ -10,8 +10,11 @@ final class PDDOCRResourceTests: XCTestCase {
         XCTAssertEqual(try resolver.fileURL(for: "/models/a.tar").path, "/tmp/pdd-ocr-root/models/a.tar")
     }
 
-    func testDevelopmentResourcesContainBothVerifiedPaddleModels() {
+    func testDevelopmentResourcesContainBothVerifiedPaddleModels() throws {
         let root = PDDOCRResourceRoot.development(projectRoot: URL(fileURLWithPath: FileManager.default.currentDirectoryPath))
+        guard FileManager.default.fileExists(atPath: root.path) else {
+            throw XCTSkip("Optional WebOCR resources are absent; this build uses native macOS Vision")
+        }
         XCTAssertTrue(FileManager.default.fileExists(atPath: root.appendingPathComponent("models/PP-OCRv5_mobile_det_onnx_infer.tar").path))
         XCTAssertTrue(FileManager.default.fileExists(atPath: root.appendingPathComponent("models/PP-OCRv5_mobile_rec_onnx_infer.tar").path))
     }

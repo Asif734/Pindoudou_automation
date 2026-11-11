@@ -4,10 +4,12 @@ enum PDDAXConversationDriverError: LocalizedError {
     case uidNotFound(String)
     case uidNotAllowed(String)
     case nicknameCandidatesExhausted(String)
+    case identityRedirect(String, String)
 
     var errorDescription: String? {
         switch self {
         case .uidNotFound(let uid): return "无法通过 AX 打开并核对会话：\(uid)"
+        case .identityRedirect(let uid, let canonical): return "会话身份已核对：\(uid) → \(canonical)，待处理消息保留并重新定位"
         case .uidNotAllowed(let uid): return "UID 不在自动回复允许范围：\(uid)"
         case .nicknameCandidatesExhausted(let uid):
             return "当前会话的目标消息暂未核对成功，将重试定位：\(uid)"
@@ -52,7 +54,13 @@ final class PDDAXConversationDriver: PDDConversationOpening {
     private let frozenImageStore: FrozenImageStore?
     private let videoCoordinator: PDDVideoForegroundCoordinator?
     private var unreadUIDs = Set<String>()
-    private var lastDiscoveryCandidate: String?
+    private var nextDiscoveryCandidateIndex = 0
+    private var settlingSince: [String: Date] = [:]
+    private var settlingAttention = Set<String>()
+    private var unresolvedSnapshots: [String: (since: Date, observations: Int)] = [:]
+    private var identityCooldowns: [String: Date] = [:]
+    private let now: @Sendable () -> Date
+    private var identities: PDDConversationIdentityStore { .init(root: chatStore.rootDirectory) }
     private var latestVisibleConversations: [PDDConversationLocator]?
     private var baselinedUIDs = Set<String>()
     private var knownServiceIDsByUID: [String: Set<String>] = [:]
@@ -78,9 +86,11 @@ final class PDDAXConversationDriver: PDDConversationOpening {
         videoArmer: (any PDDVideoTransferArming)? = nil,
         videoPreviewOpener: (any PDDVideoPreviewOpening)? = nil,
         videoOperationTimeout: Duration = .seconds(12),
-        captureOperationTimeout: Duration = .seconds(25)
+        captureOperationTimeout: Duration = .seconds(25),
+        now: @escaping @Sendable () -> Date = { Date() }
     ) {
         self.backend = backend
+        self.now = now
         self.chatStore = chatStore
         self.allowedUIDs = allowedUIDs
         self.ocrSupplement = ocrSupplement
@@ -117,25 +127,29 @@ final class PDDAXConversationDriver: PDDConversationOpening {
         let unreadRows = try await unreadEvidence.unreadRows(in: tree)
         var seenRows = Set<AXElementToken>()
         let candidates = (transferRows + unreadRows).filter { seenRows.insert($0.rowID).inserted }
-        func candidateKey(_ row: PDDConversationRow<AXElementToken>) -> String {
-            PDDConversationKey.make(locator: .init(domIdentifier: row.domIdentifier, nickname: row.visibleLabel))
-        }
-        let previousIndex = candidates.firstIndex { candidateKey($0) == lastDiscoveryCandidate }
-        let nextIndex = previousIndex.map { ($0 + 1) % max(1, candidates.count) } ?? 0
         if !candidates.isEmpty {
-            let row = candidates[nextIndex]
-            // Advance before pressing: even a broken first row must yield to
-            // the other unread/transfer rows on the next discovery pass.
-            lastDiscoveryCandidate = candidateKey(row)
+            let position = (0..<candidates.count).map { (nextDiscoveryCandidateIndex + $0) % candidates.count }.first {
+                let key = "\(candidates[$0].visibleLabel):\($0)"
+                return identityCooldowns[key].map { $0 <= now() } ?? true
+            }
+            guard let position else { return [] }
+            let row = candidates[position]
+            // Labels (especially 游客) are not unique queue keys.
+            nextDiscoveryCandidateIndex = (position + 1) % candidates.count
             try backend.performPress(row.rowID)
             try await Task.sleep(nanoseconds: 80_000_000)
             tree = try backend.readSemanticTree()
             try refreshVisibleConversations(in: tree)
-            let locator = PDDConversationLocator(
-                domIdentifier: row.domIdentifier,
-                nickname: row.visibleLabel
-            )
-            let uid = knownConversationUID(in: tree) ?? PDDConversationKey.make(locator: locator)
+            let locator = try refreshedLocator(in: tree) ?? PDDConversationLocator(
+                domIdentifier: row.domIdentifier, nickname: row.visibleLabel)
+            guard let uid = try resolveForDiscovery(in: tree, locator: locator) else {
+                identityCooldowns["\(row.visibleLabel):\(position)"] = now().addingTimeInterval(2)
+                noteSettling(key: PDDAXIncomingTransfer.incomingRecord(in: tree.rootSnapshot)?.identityBoundaryKey
+                    ?? locator.normalizedIdentifier ?? "row-slot-\(position)", label: locator.nickname)
+                return []
+            }
+            let settlingKey = row.domIdentifier ?? "row-slot-\(position)"
+            settlingSince.removeValue(forKey: settlingKey); settlingAttention.remove(settlingKey)
             let legacyUID = PDDCustomerIdentity.resolve(from: tree.rootSnapshot)
             guard isAllowed(uid) || legacyUID.map(isAllowed) == true,
                   legacyUID != nil || isUsableChatSurface(tree) else { return [] }
@@ -154,7 +168,10 @@ final class PDDAXConversationDriver: PDDConversationOpening {
                 domIdentifier: row.domIdentifier,
                 nickname: row.visibleLabel
             )
-            let currentUID = knownConversationUID(in: tree) ?? PDDConversationKey.make(locator: locator)
+            guard let currentUID = try resolveForDiscovery(in: tree, locator: locator) else {
+                noteSettling(key: locator.normalizedIdentifier ?? "active", label: locator.nickname)
+                return []
+            }
             guard isAllowed(currentUID) else { return [] }
             rememberLocator(locator, uid: currentUID)
             let knownIDs = Set(try chatStore.loadAXFirst(uid: currentUID).map(\.id))
@@ -167,11 +184,6 @@ final class PDDAXConversationDriver: PDDConversationOpening {
                     step: "visible-customer-message-without-red-dot")
             }
             return [.init(uid: currentUID, hasUnreadEvidence: false, hasUncapturedCustomerMessages: newCustomer)]
-        }
-        if isUsableChatSurface(tree),
-           let currentUID = conversationLocatorsByUID.keys.sorted().first,
-           isAllowed(currentUID) {
-            return [.init(uid: currentUID, hasUnreadEvidence: false)]
         }
         return []
     }
@@ -186,6 +198,15 @@ final class PDDAXConversationDriver: PDDConversationOpening {
     ) async throws -> PDDAXSemanticTree {
         guard isAllowed(uid) else { throw PDDAXConversationDriverError.uidNotAllowed(uid) }
         var tree = try backend.readSemanticTree()
+        // Reconcile a proven split before checking expected target ownership.
+        // This never presses a control or relies on a nickname alone.
+        _ = try? knownConversationUID(in: tree)
+        let canonical = try identities.canonicalUID(uid)
+        if canonical != uid { throw PDDAXConversationDriverError.identityRedirect(uid, canonical) }
+        if let owner = try identities.owner(messageIDs: expectedCustomerMessageIDs.filter { !$0.hasPrefix(FrozenCustomerBatch.incomingHandoffPrefix) },
+            boundary: expectedCustomerMessageIDs.first { $0.hasPrefix(FrozenCustomerBatch.incomingHandoffPrefix) }.map { String($0.dropFirst(FrozenCustomerBatch.incomingHandoffPrefix.count)) }), owner != uid {
+            throw PDDAXConversationDriverError.identityRedirect(uid, owner)
+        }
         if PDDCustomerIdentity.resolve(from: tree.rootSnapshot) == uid { return tree }
         if uid.hasPrefix("PDD-"), let locator = conversationLocatorsByUID[uid] {
             if let reason = recipientVerificationReason(uid: uid, expectedCustomerMessageIDs: expectedCustomerMessageIDs, in: tree),
@@ -301,13 +322,22 @@ final class PDDAXConversationDriver: PDDConversationOpening {
         let aliases = (provisionalReceiptsByUID[uid] ?? []).filter {
             expectedCustomerMessageIDs.contains($0.provisionalMessageID)
         }.compactMap(\.absorbedAXMessageID)
+        let actual = customerIDs(in: tree)
+        let record = PDDAXIncomingTransfer.incomingRecord(in: tree.rootSnapshot)
+        do {
+            if let owner = try identities.owner(messageIDs: actual, boundary: record?.identityBoundaryKey), owner != uid { return nil }
+            if let owner = try identities.owner(boundary: record?.identityBoundaryKey), owner == uid,
+               record?.identityBoundaryKey != nil, isUsableChatSurface(tree) { return "ax-incoming-transfer-identity" }
+        } catch { return nil }
+        let known = (try? identities.anchors(uid: uid)) ?? []
         return PDDAXRecipientVerification.reason(uid: uid, locator: conversationLocatorsByUID[uid],
-            expectedAXMessageIDs: expectedCustomerMessageIDs.union(aliases), tree: tree)
+            expectedAXMessageIDs: expectedCustomerMessageIDs.union(aliases).union(known), tree: tree)
     }
 
     private func logRecipientVerification(uid: String, reason: String, tree: PDDAXSemanticTree) {
-        if let current = PDDConversationSnapshotLocator.current(in: tree.rootSnapshot),
-           reason == "ax-customer-message-id" || current.normalizedNickname == conversationLocatorsByUID[uid]?.normalizedNickname {
+        if let current = try? refreshedLocator(in: tree),
+           ["ax-customer-message-id", "ax-incoming-transfer-identity", "ax-conversation-id"].contains(reason)
+                || current.normalizedNickname == conversationLocatorsByUID[uid]?.normalizedNickname {
             rememberLocator(current, uid: uid)
         }
         AutomationStepLog.record(root: chatStore.rootDirectory, uid: uid,
@@ -326,14 +356,115 @@ final class PDDAXConversationDriver: PDDConversationOpening {
             nickname: locator.nickname)
     }
 
-    private func knownConversationUID(in tree: PDDAXSemanticTree) -> String? {
+    private func customerIDs(in tree: PDDAXSemanticTree) -> Set<String> {
+        Set(PDDChatParser.parse(root: tree.rootSnapshot).messages.filter { $0.sender == .customer }.map(\.id))
+    }
+
+    private func refreshedLocator(in tree: PDDAXSemanticTree) throws -> PDDConversationLocator? {
+        if let current = PDDConversationSnapshotLocator.current(in: tree.rootSnapshot) { return current }
+        return try PDDAXControlSelection.currentConversationRow(in: tree.nodes).map {
+            PDDConversationLocator(domIdentifier: $0.domIdentifier, nickname: $0.visibleLabel)
+        }
+    }
+
+    private func resolveDiscoveredUID(in tree: PDDAXSemanticTree, locator: PDDConversationLocator) throws -> String? {
+        let ids = customerIDs(in: tree)
+        let incoming = PDDAXIncomingTransfer.incomingRecord(in: tree.rootSnapshot)
+        let boundary = incoming?.identityBoundaryKey
+        let uid: String
+        if let known = try knownConversationUID(in: tree) { uid = known }
+        else if let stable = locator.normalizedIdentifier { uid = PDDConversationKey.make(locator: .init(domIdentifier: stable, nickname: locator.nickname)) }
+        else if incoming != nil && ids.isEmpty { return nil }
+        else if !ids.isEmpty {
+            let labelKey = PDDConversationKey.make(locator: locator)
+            let previous = try chatStore.loadAXFirst(uid: labelKey)
+            if !PDDConversationIdentityStore.generic(locator.nickname), previous.isEmpty,
+               (try identities.anchors(uid: labelKey)).isEmpty {
+                uid = labelKey
+            } else {
+                // An occupied masked label plus a disjoint one-message AX read
+                // is unresolved, not immediate evidence of a second customer.
+                let key = PDDConversationIdentityStore.anchoredUID(messageIDs: ids, boundary: boundary)
+                if !PDDConversationIdentityStore.generic(locator.nickname), boundary == nil {
+                    let prior = unresolvedSnapshots[key]
+                    unresolvedSnapshots[key] = (prior?.since ?? now(), (prior?.observations ?? 0) + 1)
+                    guard let prior, now().timeIntervalSince(prior.since) >= 30,
+                          prior.observations >= 1 else { return nil }
+                }
+                uid = key
+            }
+        } else if !PDDConversationIdentityStore.generic(locator.nickname),
+                  (try chatStore.loadAXFirst(uid: PDDConversationKey.make(locator: locator))).isEmpty {
+            // Empty named rows may be discovered, but cannot trigger a customer turn.
+            uid = PDDConversationKey.make(locator: locator)
+        } else { return nil }
+        let legacy = PDDCustomerIdentity.resolve(from: tree.rootSnapshot)
+        let emptyHistory = try chatStore.loadAXFirst(uid: uid).isEmpty
+        guard PDDAXRecipientVerification.reason(uid: uid, locator: locator, expectedAXMessageIDs: ids, tree: tree) != nil
+            || (boundary != nil && isUsableChatSurface(tree))
+            || (locator.normalizedIdentifier != nil && isUsableChatSurface(tree))
+            || (legacy != nil && !PDDConversationIdentityStore.generic(locator.nickname))
+            || (ids.isEmpty && boundary == nil && !PDDConversationIdentityStore.generic(locator.nickname)
+                && emptyHistory && isUsableChatSurface(tree)) else { return nil }
+        if isUsableChatSurface(tree), legacy == nil {
+            try identities.remember(uid: uid, messageIDs: ids, stableID: locator.normalizedIdentifier, boundary: boundary,
+                provisional: uid.hasPrefix("PDD-CHAT-") && locator.normalizedIdentifier == nil && boundary == nil, at: now())
+        }
+        return uid
+    }
+
+    private func resolveForDiscovery(in tree: PDDAXSemanticTree, locator: PDDConversationLocator) throws -> String? {
+        do { return try resolveDiscoveredUID(in: tree, locator: locator) }
+        catch PDDConversationIdentityStore.IdentityError.conflictingEvidence {
+            noteSettling(key: "conflict:\(locator.normalizedIdentifier ?? locator.normalizedNickname)", label: locator.nickname)
+            return nil
+        }
+    }
+
+    /// Used by the stopped app's read-only check. Reads the supplied current
+    /// tree only; it never opens a conversation, generates, or sends a message.
+    func reconcileVisibleIdentity(in tree: PDDAXSemanticTree) throws {
+        guard let uid = try knownConversationUID(in: tree),
+              let locator = try refreshedLocator(in: tree) else { return }
+        rememberLocator(locator, uid: uid)
+    }
+
+    private func noteSettling(key: String, label: String) {
+        let date = now()
+        if settlingSince[key] == nil {
+            settlingSince[key] = date
+            conversationDiagnostics.append(.init(uid: "identity-pending", kind: "conversation-identity-settling",
+                detail: "已打开转入/访客会话，等候可核对身份；30秒宽限；其他客户继续 label=\(label)"))
+        }
+        if date.timeIntervalSince(settlingSince[key] ?? date) >= 30, settlingAttention.insert(key).inserted {
+            conversationDiagnostics.append(.init(uid: "identity-pending", kind: "conversation-identity-attention",
+                detail: "会话身份超过30秒仍未核对；保留待处理，继续轮询其他客户，不按游客名称创建客户"))
+        }
+    }
+
+    private func knownConversationUID(in tree: PDDAXSemanticTree) throws -> String? {
         let actual = Set(PDDChatParser.parse(root: tree.rootSnapshot).messages.filter { $0.sender == .customer }.map(\.id))
+        let record = PDDAXIncomingTransfer.incomingRecord(in: tree.rootSnapshot)
+        let stable = try refreshedLocator(in: tree)?.normalizedIdentifier
+        do {
+            if let owner = try identities.owner(messageIDs: actual, stableID: stable, boundary: record?.identityBoundaryKey) {
+                try persistVerifiedRepairHistory(uid: owner, actual: actual, tree: tree)
+                return owner
+            }
+        } catch PDDConversationIdentityStore.IdentityError.conflictingEvidence {
+            guard hasSingleActiveChat(tree),
+                  let repair = try identities.reconcileVerifiedThread(messageIDs: actual, stableID: stable,
+                    boundary: record?.identityBoundaryKey) else { throw PDDConversationIdentityStore.IdentityError.conflictingEvidence }
+            try persistVerifiedRepairHistory(uid: repair.canonicalUID, actual: actual, tree: tree)
+            return repair.canonicalUID
+        }
         guard !actual.isEmpty else { return nil }
         // Older versions could split one chat into several masked-name folders.
         // Prefer the established history when the same exact AX IDs occur in
         // those aliases. No fuzzy text/name match is used to select a recipient.
         let matches = conversationLocatorsByUID.compactMap { uid, locator -> (String, Int, Int)? in
-            guard let history = try? chatStore.loadAXFirst(uid: uid) else { return nil }
+            guard !PDDConversationIdentityStore.isSharedVisitorUID(uid),
+                  let history = try? chatStore.loadAXFirst(uid: uid) else { return nil }
             let known = Set(history.filter { $0.sender == .customer }.map(\.id))
             let overlap = actual.intersection(known).count
             guard overlap > 0,
@@ -346,6 +477,28 @@ final class PDDAXConversationDriver: PDDConversationOpening {
             if $0.1 != $1.1 { return $0.1 > $1.1 }
             return $0.0 < $1.0
         }.first?.0
+    }
+
+    private func hasSingleActiveChat(_ tree: PDDAXSemanticTree) -> Bool {
+        guard isUsableChatSurface(tree) else { return false }
+        let semantic = ((try? PDDAXControlSelection.conversationRows(in: tree.nodes)) ?? []).filter { row in
+            tree.nodes.contains { $0.id == row.rowID && $0.domClasses.contains { $0 == "active" || $0.contains("selected") } }
+        }.count
+        let snapshot = PDDConversationSnapshotLocator.activeCount(in: tree.rootSnapshot)
+        guard let locator = try? refreshedLocator(in: tree) else { return false }
+        return max(semantic, snapshot) == 1
+            && PDDAXRecipientVerification.reason(uid: PDDConversationKey.make(locator: locator),
+                locator: locator, expectedAXMessageIDs: customerIDs(in: tree), tree: tree) != nil
+    }
+
+    private func persistVerifiedRepairHistory(uid: String, actual: Set<String>, tree: PDDAXSemanticTree) throws {
+        let proof = try identities.repairProof(uid: uid)
+        guard !proof.isEmpty, proof.isSubset(of: actual), hasSingleActiveChat(tree) else { return }
+        let history = try chatStore.loadAXFirst(uid: uid)
+        guard !proof.isSubset(of: Set(history.filter { $0.sender == .customer }.map(\.id))) else { return }
+        _ = try chatStore.mergeAXFirst(uid: uid, messages: PDDChatParser.parse(root: tree.rootSnapshot).messages)
+        AutomationStepLog.record(root: chatStore.rootDirectory, uid: uid, step: "identity-recovery-current-thread-captured",
+            detail: "verified_message_ids=\(actual.sorted().joined(separator: ",")); current AX only; no folder merge")
     }
 
     private func refreshVisibleConversations(in tree: PDDAXSemanticTree) throws {
@@ -362,7 +515,7 @@ final class PDDAXConversationDriver: PDDConversationOpening {
             node.domClasses.contains { $0.lowercased().contains("chat-item-box") }
         } && locators.isEmpty
         guard !hasUnparsedRows else { latestVisibleConversations = nil; return }
-        if let uid = knownConversationUID(in: tree), let known = conversationLocatorsByUID[uid], !locators.contains(known) {
+        if let uid = try? knownConversationUID(in: tree), let known = conversationLocatorsByUID[uid], !locators.contains(known) {
             locators.append(known)
         }
         latestVisibleConversations = locators
@@ -420,6 +573,9 @@ final class PDDAXConversationDriver: PDDConversationOpening {
     func observeSendSnapshot(uid: String, root: AXNodeSnapshot) throws {
         let evidence = PDDAXVisibleMessageEvidence.extract(root: root)
         guard evidence.isStructurallyValid else { return }
+        if let owner = try identities.owner(messageIDs: Set(evidence.messages.filter { $0.sender == .customer }.map(\.id))), owner != uid {
+            throw PDDAXConversationDriverError.identityRedirect(uid, owner)
+        }
         let known = Set(try chatStore.loadAXFirst(uid: uid).map(\.id))
         let newIDs = Set(evidence.messages.filter { $0.sender == .customer && !known.contains($0.id) }.map(\.id))
         _ = try chatStore.mergeAXFirst(uid: uid, messages: evidence.messages)
@@ -494,6 +650,11 @@ final class PDDAXConversationDriver: PDDConversationOpening {
     ) async throws -> AutoReplyCapture {
         AutomationStepLog.record(root: chatStore.rootDirectory, uid: uid, step: "capture-started")
         var openedTree = try await openAndResolve(uid: uid)
+        let record = PDDAXIncomingTransfer.incomingRecord(in: openedTree.rootSnapshot)
+        if uid.hasPrefix("PDD-"), isUsableChatSurface(openedTree) {
+            try identities.remember(uid: uid, messageIDs: customerIDs(in: openedTree),
+                stableID: try refreshedLocator(in: openedTree)?.normalizedIdentifier, boundary: record?.identityBoundaryKey)
+        }
         let hasUnreadEvidence = unreadUIDs.contains(uid)
         var capturedAt = Date()
         var evidence = authoritativeEvidence(in: openedTree, capturedAt: capturedAt)

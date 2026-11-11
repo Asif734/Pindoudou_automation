@@ -10,7 +10,7 @@ struct PDDVideoHoldingNotice: Codable, Equatable, Sendable, Identifiable {
         "您的视频已收到，请给我一点时间查看里面的细节。"
     ]
     let id: UUID
-    let uid: String
+    var uid: String
     var messageIDs: Set<String>
     let capturedAt: Date
     let text: String

@@ -60,6 +60,20 @@ struct CustomerMessageReceipts: Sendable {
         Set(try receipts(uid: uid).values.filter { $0.closedAt != nil }.map(\.messageID))
     }
 
+    /// Identity recovery keeps original model evidence, without inventing delivery.
+    func closeSuperseded(uid: String, messageIDs: Set<String>, canonicalUID: String, at date: Date) throws {
+        try update { state in
+            for id in messageIDs {
+                guard var receipt = state.customers[uid]?[id], receipt.closedAt == nil else { continue }
+                receipt.closedAt = date
+                receipt.closureReason = "verified-identity-reassigned:\(canonicalUID)"
+                state.customers[uid]?[id] = receipt
+            }
+        }
+        AutomationStepLog.record(root: root, uid: uid, step: "identity-receipts-reassigned",
+            detail: "canonical=\(canonicalUID) message_ids=\(messageIDs.sorted().joined(separator: ",")); original timestamps preserved")
+    }
+
     /// Closing known skipped work is not a model completion or a send receipt.
     @discardableResult
     func closeUnsubmitted(uid: String, messageIDs: Set<String>, reason: String, at date: Date = Date()) throws -> Int {

@@ -56,6 +56,131 @@ final class PDDTransferMenuControlsTests: XCTestCase {
         XCTAssertEqual(reader.calls, 1)
     }
 
+    func testLiveCombinedAXRowUsesOnlyItsOCRSendEvenWhenOtherReasonsAreNotRecognized() async throws {
+        let backend = MenuBackend(nodes: dialog + combinedMenu())
+        let reader = MenuReader()
+        // The disabled custom-reason footer and chat composer are also visible.
+        reader.results = [[line("发送", x: 1070, y: 600), line("发送", x: 1070, y: 680),
+                           line("发送", x: 1100, y: 850)]]
+        let clicker = MenuClicker()
+        let submitter = PDDTransferMenuSubmitter(backend: backend, clicker: clicker, reader: reader, sleep: { _ in })
+        try await submitter.submit(uid: "customer", anchor: anchor, lease: lease())
+        XCTAssertEqual(clicker.points, [.init(x: 1085, y: 610)])
+        XCTAssertTrue(backend.pressed.isEmpty, "Never press the combined text as if it were Send")
+        XCTAssertEqual(reader.calls, 1)
+    }
+
+    func testCombinedAXDescriptionWithSeparateSendChildUsesAXWithoutOCR() async throws {
+        let backend = MenuBackend(nodes: dialog + combinedMenu(descriptionOnly: true, childSend: true))
+        let reader = MenuReader(); let clicker = MenuClicker()
+        let submitter = PDDTransferMenuSubmitter(backend: backend, clicker: clicker, reader: reader, sleep: { _ in })
+        try await submitter.submit(uid: "customer", anchor: anchor, lease: lease())
+        XCTAssertEqual(backend.pressed.map(\.rawValue), [205])
+        XCTAssertTrue(clicker.points.isEmpty)
+        XCTAssertEqual(reader.calls, 0)
+    }
+
+    func testSeparateReasonCanBecomeCombinedAndMoveBeforeSend() async throws {
+        let reason = node(10, label: "无原因直接转移", frame: .init(x: 850, y: 580, width: 140, height: 20))
+        let backend = MenuBackend(nodes: dialog + [reason])
+        backend.onPress = { _ in backend.nodes = self.dialog + self.combinedMenu(rowY: 620) }
+        let reader = MenuReader(); reader.results = [[line("发送", x: 1070, y: 620)]]
+        let clicker = MenuClicker()
+        let submitter = PDDTransferMenuSubmitter(backend: backend, clicker: clicker, reader: reader, sleep: { _ in })
+        try await submitter.submit(uid: "customer", anchor: anchor, lease: lease())
+        XCTAssertEqual(backend.pressed.map(\.rawValue), [10])
+        XCTAssertEqual(clicker.points, [.init(x: 1085, y: 630)])
+    }
+
+    func testCombinedAXRowRejectsFooterOnlyAndSavesFailureCandidates() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let backend = MenuBackend(nodes: dialog + combinedMenu())
+        let reader = MenuReader(); reader.results = [[line("发送", x: 1070, y: 680)]]
+        let clicker = MenuClicker()
+        let submitter = PDDTransferMenuSubmitter(backend: backend, clicker: clicker, reader: reader,
+            logRoot: root, sleep: { _ in })
+        do { try await submitter.submit(uid: "customer", anchor: anchor, lease: lease()); XCTFail("footer is not the transfer Send") }
+        catch { XCTAssertTrue(error.localizedDescription.contains("发送按钮")) }
+        XCTAssertTrue(clicker.points.isEmpty)
+        XCTAssertTrue(backend.pressed.isEmpty)
+        let files = try FileManager.default.contentsOfDirectory(at: root.appendingPathComponent("logs/transfer-diagnostics"),
+            includingPropertiesForKeys: nil)
+        XCTAssertEqual(files.count, 4)
+        let record = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: files[0])) as? [String: Any])
+        XCTAssertEqual(record["phase"] as? String, "send")
+        XCTAssertFalse(try XCTUnwrap(record["axCandidates"] as? [[String: Any]]).isEmpty)
+        XCTAssertEqual((record["ocrCandidates"] as? [[String: Any]])?.count, 1)
+    }
+
+    func testCombinedLabelInChatOrTooltipDoesNotEstablishASelectedMenuRow() {
+        let combined = node(10, label: "无原因直接转移 发送", frame: .init(x: 850, y: 600, width: 250, height: 20))
+        XCTAssertNil(PDDTransferMenuControls.combinedReasonRow(in: dialog + [combined], anchor: anchor))
+        let tooltip = node(11, label: "催发货 发送 换货问题 发送 无原因直接转移 发送", frame: combined.frame)
+        XCTAssertNil(PDDTransferMenuControls.combinedReasonRow(in: dialog + [tooltip], anchor: anchor))
+    }
+
+    func testCombinedMenuRejectsAmbiguousSendAndLowConfidence() {
+        let row = CGRect(x: 850, y: 600, width: 250, height: 20)
+        XCTAssertNil(PDDTransferMenuControls.combinedRowSend(in: [line("发送", x: 1040, y: 600),
+            line("发送", x: 1070, y: 600)], row: row))
+        XCTAssertNil(PDDTransferMenuControls.combinedRowSend(in: [.init(text: "发送",
+            box: .init(x: 1070, y: 600, width: 30, height: 20), confidence: 0.3)], row: row))
+    }
+
+    func testCombinedRowMovingDuringOCRWaitsForFreshMatchingBounds() async throws {
+        let backend = MenuBackend(nodes: dialog + combinedMenu())
+        let reader = MenuReader()
+        reader.results = [menu(y: 600) + [line("发送", x: 1070, y: 600)],
+                          menu(y: 620) + [line("发送", x: 1070, y: 620)]]
+        reader.onRead = { backend.nodes = self.dialog + self.combinedMenu(rowY: 620) }
+        let clicker = MenuClicker()
+        let submitter = PDDTransferMenuSubmitter(backend: backend, clicker: clicker, reader: reader, sleep: { _ in })
+        try await submitter.submit(uid: "customer", anchor: anchor, lease: lease())
+        XCTAssertEqual(reader.calls, 2)
+        XCTAssertEqual(clicker.points, [.init(x: 1085, y: 630)])
+    }
+
+    func testRevokedLeaseDuringCombinedRowOCRPreventsSend() async throws {
+        let registry = UIOperationLeaseRegistry(); let operation = registry.acquire(uid: "customer")
+        let backend = MenuBackend(nodes: dialog + combinedMenu())
+        let reader = MenuReader(); reader.results = [[line("发送", x: 1070, y: 600)]]
+        reader.onRead = { registry.revoke(operationID: operation.operationID) }
+        let clicker = MenuClicker()
+        let submitter = PDDTransferMenuSubmitter(backend: backend, clicker: clicker, reader: reader, sleep: { _ in })
+        do { try await submitter.submit(uid: "customer", anchor: anchor, lease: operation); XCTFail("revoked operation") } catch {}
+        XCTAssertTrue(clicker.points.isEmpty)
+        XCTAssertTrue(backend.pressed.isEmpty)
+    }
+
+    private func combinedMenu(rowY: CGFloat = 600, descriptionOnly: Bool = false,
+                              childSend: Bool = false) -> [PDDAXSemanticNode<AXElementToken>] {
+        // Real Chromium layout: a portal menu, other reasons, one merged text
+        // row and a different custom-reason footer Send.
+        func item(_ id: Int, parent: Int?, role: String = "AXStaticText", value: String?,
+                  frame: CGRect, description: String? = nil, press: Bool = false) -> PDDAXSemanticNode<AXElementToken> {
+            .init(id: .init(rawValue: id), parentID: parent.map { .init(rawValue: $0) }, role: role,
+                value: value, title: nil, domIdentifier: nil, domClasses: [],
+                actionNames: press ? ["AXPress"] : [], isSettable: false, frame: frame,
+                accessibilityDescription: description)
+        }
+        var nodes = [
+            item(200, parent: nil, role: "AXGroup", value: nil,
+                frame: .init(x: 830, y: 300, width: 300, height: 420)),
+            item(201, parent: 200, value: "催发货", frame: .init(x: 850, y: 400, width: 80, height: 20)),
+            item(202, parent: 200, value: "换货问题", frame: .init(x: 850, y: 500, width: 80, height: 20)),
+            item(203, parent: 200, role: "AXGroup", value: nil,
+                frame: .init(x: 840, y: rowY - 10, width: 270, height: 40)),
+            item(204, parent: 203, value: descriptionOnly ? nil : "无原因直接转移 发送",
+                frame: .init(x: 850, y: rowY, width: 250, height: 20),
+                description: descriptionOnly ? "无原因直接转移 发送" : nil),
+            item(206, parent: 200, value: "发送", frame: .init(x: 1070, y: 680, width: 30, height: 20), press: true)
+        ]
+        if childSend { nodes.append(item(205, parent: 203, value: "发送",
+            frame: .init(x: 1070, y: rowY, width: 30, height: 20), press: true)) }
+        return nodes
+    }
+
     func testRevokedLeaseDuringRecognitionPreventsAnyClick() async throws {
         let registry = UIOperationLeaseRegistry(); let lease = registry.acquire(uid: "customer")
         let backend = MenuBackend(nodes: dialog)

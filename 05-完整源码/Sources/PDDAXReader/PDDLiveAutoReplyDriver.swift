@@ -2,6 +2,7 @@ import Foundation
 
 @MainActor
 protocol PDDLiveConversationDriving: AnyObject {
+    func reconcileVisibleIdentity(in tree: PDDAXSemanticTree) throws
     func visibleConversationsSnapshot() -> [PDDConversationLocator]?
     func discover() async throws -> [AutoReplyDiscovery]
     func capture(uid: String, after cursor: AutoReplyCursor) async throws -> AutoReplyCapture
@@ -30,6 +31,7 @@ protocol PDDLiveConversationDriving: AnyObject {
 }
 
 extension PDDLiveConversationDriving {
+    func reconcileVisibleIdentity(in tree: PDDAXSemanticTree) throws {}
     func visibleConversationsSnapshot() -> [PDDConversationLocator]? { nil }
     func capture(
         uid: String, after cursor: AutoReplyCursor, includeImages: Bool,
@@ -81,6 +83,9 @@ extension PDDAXReplySender: PDDLiveReplySending {}
 
 @MainActor
 final class PDDLiveAutoReplyDriver: AutoReplyAutomationDriver {
+    func reconcileVisibleIdentity(in tree: PDDAXSemanticTree) throws {
+        try conversationDriver.reconcileVisibleIdentity(in: tree)
+    }
     func visibleConversationsSnapshot() -> [PDDConversationLocator]? {
         conversationDriver.visibleConversationsSnapshot()
     }

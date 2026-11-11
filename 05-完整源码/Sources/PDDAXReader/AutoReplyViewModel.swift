@@ -41,6 +41,7 @@ enum AutoReplyRuntimeCreationError: LocalizedError {
 
 @MainActor
 protocol AutoReplyRunning: AnyObject {
+    func reconcileVisibleIdentity(in tree: PDDAXSemanticTree) throws
     var onStateChange: (@MainActor () -> Void)? { get set }
     var jobs: [AutoReplyJob] { get }
     var currentUIOwner: String? { get }
@@ -62,6 +63,7 @@ protocol AutoReplyRunning: AnyObject {
 extension AutoReplyScheduler: AutoReplyRunning {}
 
 extension AutoReplyRunning {
+    func reconcileVisibleIdentity(in tree: PDDAXSemanticTree) throws {}
     var latestVideoStatus: PDDVideoProgressStatus? { nil }
 }
 
@@ -84,6 +86,7 @@ final class AutoReplyViewModel: ObservableObject {
     @Published private(set) var compatibilityReport: PDDCompatibilityReport?
 
     var canStart: Bool { compatibilityReport?.overallStatus != .fail }
+    var canStop: Bool { desiredRunning || isRunning }
 
     private let runtime: any AutoReplyRunning
     private let identity: PDDRuntimeIdentity
@@ -101,7 +104,7 @@ final class AutoReplyViewModel: ObservableObject {
     private var recoveryTask: Task<Void, Never>?
     private var prewarmTask: Task<Void, Never>?
     private var startupPrepared = false
-    private var desiredRunning = false
+    @Published private(set) var desiredRunning = false
 
     init(
         runtime: any AutoReplyRunning,
@@ -175,6 +178,10 @@ final class AutoReplyViewModel: ObservableObject {
             let detector = PDDLiveUnreadEvidenceDetector(requireConversationRows: true)
             let tree = try backend.readSemanticTree()
             let unread = try await detector.unreadRows(in: tree)
+            // Repair only independently proven aliases in the already open
+            // thread. The read-only check still never opens, generates or sends.
+            try runtime.reconcileVisibleIdentity(in: tree)
+            refreshSnapshot()
             if unread.isEmpty {
                 status = BilingualText.lines("会话列表已读取，未匹配到客户未读红点。未发送消息。", "Conversation list read successfully; no customer unread marker matched. No message sent.")
             } else {
@@ -314,6 +321,7 @@ final class AutoReplyViewModel: ObservableObject {
         recoveryTask = nil
         prewarmTask?.cancel()
         prewarmTask = nil
+        status = BilingualText.lines("已停止", "Stopped")
         do {
             try runIntentStore.save(desiredRunning: false)
         } catch {
@@ -327,7 +335,6 @@ final class AutoReplyViewModel: ObservableObject {
         axNotificationListener.stop()
         sessionLock.release()
         refreshSnapshot()
-        status = BilingualText.lines("已停止", "Stopped")
     }
 
     func setDryRun(_ enabled: Bool) {

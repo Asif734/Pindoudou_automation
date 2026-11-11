@@ -19,7 +19,7 @@ enum PDDTransferMenuControls {
                                        label: String, anchor: CGRect,
                                        reasonFrame: CGRect? = nil) -> PDDAXSemanticNode<ID>? {
         let matches = nodes.filter { node in
-            valid(node.frame) && [node.value, node.title].compactMap { $0 }
+            valid(node.frame) && texts(node)
                 .contains { normalized($0) == label }
                 && nearMenu(node.frame, anchor: anchor)
                 && (reasonFrame.map { sameRowSend(node.frame, reason: $0) } ?? true)
@@ -29,6 +29,95 @@ enum PDDTransferMenuControls {
               matches.allSatisfy({ $0.frame.intersects(first.frame) }) else { return nil }
         return matches.first(where: { $0.actionNames.contains("AXPress") })
             ?? matches.min { $0.frame.width * $0.frame.height < $1.frame.width * $1.frame.height }
+    }
+
+    static func texts<ID>(_ node: PDDAXSemanticNode<ID>) -> [String] {
+        [node.value, node.title, node.accessibilityDescription].compactMap { $0 }
+    }
+
+    /// Chromium sometimes exposes the highlighted row as one text element, with
+    /// no independently addressable Send. This is an anchor, never a Send target.
+    static func combinedReasonRow<ID: Hashable>(
+        in nodes: [PDDAXSemanticNode<ID>], anchor: CGRect
+    ) -> PDDAXSemanticNode<ID>? {
+        let index = Dictionary(uniqueKeysWithValues: nodes.map { ($0.id, $0) })
+        let matches = nodes.filter { node in
+            valid(node.frame) && node.frame.height <= 80 && node.frame.width <= 600
+                && nearMenu(node.frame, anchor: anchor)
+                && texts(node).contains { normalized($0) == reason + "发送" }
+                && belongsToReasonMenu(node, index: index, nodes: nodes)
+        }
+        guard let first = matches.first,
+              matches.allSatisfy({ $0.frame.intersects(first.frame) }) else { return nil }
+        return matches.min { $0.frame.width * $0.frame.height < $1.frame.width * $1.frame.height }
+    }
+
+    static func combinedRowSend<ID: Hashable>(
+        in nodes: [PDDAXSemanticNode<ID>], row: PDDAXSemanticNode<ID>
+    ) -> PDDAXSemanticNode<ID>? {
+        let index = Dictionary(uniqueKeysWithValues: nodes.map { ($0.id, $0) })
+        let matches = nodes.filter { node in
+            node.id != row.id && valid(node.frame)
+                && texts(node).contains { normalized($0) == "发送" }
+                && insideSendPortion(node.frame, row: row.frame)
+                && (isDescendant(node, of: row.id, index: index)
+                    || row.parentID.flatMap { index[$0] }.map { parent in
+                        parent.frame.height <= 80 && parent.frame.width <= 600
+                            && parent.frame.contains(row.frame)
+                            && isDescendant(node, of: parent.id, index: index)
+                    } == true)
+        }
+        guard let first = matches.first,
+              matches.allSatisfy({ $0.frame.intersects(first.frame) }) else { return nil }
+        return matches.first { $0.actionNames.contains("AXPress") }
+            ?? matches.min { $0.frame.width * $0.frame.height < $1.frame.width * $1.frame.height }
+    }
+
+    static func combinedRowSend(in lines: [PDDOCRLine], row: CGRect) -> CGRect? {
+        let matches = lines.filter {
+            normalized($0.text) == "发送" && reliable($0) && insideSendPortion($0.box, row: row)
+        }
+        return matches.count == 1 ? matches.first?.box : nil
+    }
+
+    private static func insideSendPortion(_ rect: CGRect, row: CGRect) -> Bool {
+        row.insetBy(dx: -4, dy: -4).contains(rect)
+            && rect.midX > row.midX
+            && abs(rect.midY - row.midY) <= max(8, row.height * 0.65)
+    }
+
+    private static func isDescendant<ID: Hashable>(
+        _ node: PDDAXSemanticNode<ID>, of ancestor: ID,
+        index: [ID: PDDAXSemanticNode<ID>]
+    ) -> Bool {
+        var parent = node.parentID
+        var visited = Set<ID>()
+        while let id = parent, visited.insert(id).inserted {
+            if id == ancestor { return true }
+            parent = index[id]?.parentID
+        }
+        return false
+    }
+
+    private static func belongsToReasonMenu<ID: Hashable>(
+        _ row: PDDAXSemanticNode<ID>, index: [ID: PDDAXSemanticNode<ID>],
+        nodes: [PDDAXSemanticNode<ID>]
+    ) -> Bool {
+        var parent = row.parentID
+        var visited = Set<ID>()
+        while let id = parent, visited.insert(id).inserted, let node = index[id] {
+            // A portal popup may be a sibling of the dialog, so scope to the
+            // bounded menu itself rather than requiring dialog ancestry.
+            if valid(node.frame), node.frame.width <= 600, node.frame.height <= 900,
+               node.frame.insetBy(dx: -4, dy: -4).contains(row.frame) {
+                let otherReasons = Set(nodes.filter {
+                    isDescendant($0, of: id, index: index)
+                }.flatMap(texts).map(normalized)).intersection(Set(labels.dropFirst().dropLast()))
+                if otherReasons.count >= 2 { return true }
+            }
+            parent = node.parentID
+        }
+        return false
     }
 
     static func reasonControl(in lines: [PDDOCRLine], anchor: CGRect) -> CGRect? {
@@ -159,10 +248,15 @@ final class PDDTransferMenuSubmitter: PDDTransferMenuSubmitting {
 
     func submit(uid: String, anchor: CGRect, lease: UIOperationLease) async throws {
         var selectedReason: CGRect?
-        for _ in 0..<4 {
+        for attempt in 1...4 {
             try lease.validate()
             let tree = try backend.readSemanticTree()
             guard PDDAXControlSelection.isTransferDialogVisible(in: tree.nodes) else { return }
+            if let row = PDDTransferMenuControls.combinedReasonRow(in: tree.nodes, anchor: anchor) {
+                selectedReason = row.frame
+                log(uid: uid, step: "transfer-no-reason-row-ready", route: "AX-combined", rect: row.frame)
+                break
+            }
             if let control = PDDTransferMenuControls.axControl(in: tree.nodes,
                 label: PDDTransferMenuControls.reason, anchor: anchor) {
                 try press(control, uid: uid, step: "transfer-no-reason-selected", lease: lease)
@@ -177,31 +271,92 @@ final class PDDTransferMenuSubmitter: PDDTransferMenuSubmitting {
                 selectedReason = rect
                 break
             }
+            saveLookupFailure(uid: uid, phase: "reason", attempt: attempt,
+                anchor: anchor, nodes: tree.nodes, lines: lines)
             try await sleep(0.12)
         }
         guard let selectedReason else { throw PDDAXSelectionError.missing("无原因直接转移菜单项") }
-        for _ in 0..<4 {
+        for attempt in 1...4 {
             try await sleep(0.12)
             try lease.validate()
             let tree = try backend.readSemanticTree()
             // Some versions submit directly when the no-reason item is clicked.
             guard PDDAXControlSelection.isTransferDialogVisible(in: tree.nodes) else { return }
+            if let row = PDDTransferMenuControls.combinedReasonRow(in: tree.nodes, anchor: anchor),
+               let send = PDDTransferMenuControls.combinedRowSend(in: tree.nodes, row: row) {
+                try press(send, uid: uid, step: "transfer-final-send-clicked", lease: lease)
+                return
+            }
+            let reasonFrame = PDDTransferMenuControls.axControl(in: tree.nodes,
+                label: PDDTransferMenuControls.reason, anchor: anchor)?.frame ?? selectedReason
             if let control = PDDTransferMenuControls.axControl(in: tree.nodes,
-                label: "发送", anchor: anchor, reasonFrame: selectedReason) {
+                label: "发送", anchor: anchor, reasonFrame: reasonFrame) {
                 try press(control, uid: uid, step: "transfer-final-send-clicked", lease: lease)
                 return
             }
             let lines = try await reader.controls(anchor: anchor)
             try lease.validate()
-            guard PDDAXControlSelection.isTransferDialogVisible(in: try backend.readSemanticTree().nodes) else { return }
+            let current = try backend.readSemanticTree()
+            guard PDDAXControlSelection.isTransferDialogVisible(in: current.nodes) else { return }
+            let previousRow = PDDTransferMenuControls.combinedReasonRow(in: tree.nodes, anchor: anchor)
+            let currentRow = PDDTransferMenuControls.combinedReasonRow(in: current.nodes, anchor: anchor)
+            if let previousRow, previousRow.frame != currentRow?.frame {
+                saveLookupFailure(uid: uid, phase: "send-row-changed", attempt: attempt,
+                    anchor: anchor, nodes: current.nodes, lines: lines)
+                continue
+            }
+            // Combined AX text establishes the selected row. OCR only needs to
+            // locate Send inside it; it need not recognize every other reason again.
+            if previousRow != nil, let row = currentRow,
+               let send = PDDTransferMenuControls.combinedRowSend(in: lines, row: row.frame) {
+                try click(send, uid: uid, step: "transfer-final-send-clicked", lease: lease,
+                    route: "AX-combined-row-OCR")
+                return
+            }
             // Re-locate the reason on the latest screenshot; menu placement can change.
             if let reason = PDDTransferMenuControls.reasonControl(in: lines, anchor: anchor),
                let send = PDDTransferMenuControls.sendControl(in: lines, reason: reason) {
                 try click(send, uid: uid, step: "transfer-final-send-clicked", lease: lease)
                 return
             }
+            saveLookupFailure(uid: uid, phase: "send", attempt: attempt,
+                anchor: anchor, nodes: current.nodes, lines: lines)
         }
         throw PDDAXSelectionError.missing("无原因直接转移同一行的发送按钮")
+    }
+
+    private func saveLookupFailure(uid: String, phase: String, attempt: Int,
+                                   anchor: CGRect, nodes: [PDDAXSemanticNode<AXElementToken>],
+                                   lines: [PDDOCRLine]) {
+        guard let logRoot else { return }
+        do {
+            func box(_ rect: CGRect) -> [String: Double] {
+                ["x": rect.minX, "y": rect.minY, "width": rect.width, "height": rect.height]
+            }
+            let candidates: [[String: Any]] = nodes.filter { node in
+                abs(node.frame.midX - anchor.midX) < 300 && abs(node.frame.midY - anchor.midY) < 600
+                    && PDDTransferMenuControls.texts(node).contains { text in
+                        PDDTransferMenuControls.labels.contains { text.contains($0) }
+                    }
+            }.prefix(40).map {
+                ["role": $0.role, "texts": PDDTransferMenuControls.texts($0),
+                 "frame": box($0.frame), "actions": Array($0.actionNames), "classes": Array($0.domClasses)]
+            }
+            let recognized: [[String: Any]] = lines.map {
+                ["text": $0.text, "confidence": $0.confidence ?? 0, "frame": box($0.box)]
+            }
+            let directory = logRoot.appendingPathComponent("logs/transfer-diagnostics", isDirectory: true)
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            let file = directory.appendingPathComponent("menu-lookup-\(UUID().uuidString).json")
+            try JSONSerialization.data(withJSONObject: ["uid": uid, "phase": phase,
+                "attempt": attempt, "anchor": box(anchor), "axCandidates": candidates,
+                "ocrCandidates": recognized], options: [.sortedKeys, .prettyPrinted]).write(to: file, options: .atomic)
+            AutomationStepLog.record(root: logRoot, uid: uid, step: "transfer-menu-lookup-missed",
+                detail: "phase=\(phase) attempt=\(attempt)/4 diagnostics=\(file.path)")
+        } catch {
+            AutomationStepLog.record(root: logRoot, uid: uid, step: "transfer-menu-diagnostic-failed",
+                detail: error.localizedDescription)
+        }
     }
 
     private func press(_ node: PDDAXSemanticNode<AXElementToken>, uid: String, step: String,

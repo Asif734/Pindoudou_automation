@@ -47,7 +47,7 @@ struct PerUserAXStore {
 
     static func validUID(_ uid: String) -> Bool {
         let validShape = uid.range(
-            of: #"^(GZC-[0-9]+|PDD-(ID|NAME)-[0-9a-f]{24})$"#,
+            of: #"^(GZC-[0-9]+|PDD-(ID|NAME|CHAT)-[0-9a-f]{24})$"#,
             options: .regularExpression
         ) != nil
         return validShape

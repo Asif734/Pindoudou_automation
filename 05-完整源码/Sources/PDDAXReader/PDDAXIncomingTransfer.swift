@@ -34,6 +34,12 @@ enum PDDAXIncomingTransfer {
         let currentCustomerIDs: [String]
     }
 
+    struct Record {
+        let handoff: Handoff
+        let hasServiceReply: Bool
+        let identityBoundaryKey: String?
+    }
+
     static func recipient(_ text: String) -> String? {
         guard let marker = text.range(of: "将该会话转移给") else { return nil }
         let tail = text[marker.upperBound...]
@@ -77,10 +83,16 @@ enum PDDAXIncomingTransfer {
     /// this special handoff path; an ordinary customer bubble cannot forge it.
     /// Messages before the notice are context only and never become current work.
     static func unansweredHandoff(in root: AXNodeSnapshot) -> Handoff? {
+        guard let record = incomingRecord(in: root), !record.hasServiceReply else { return nil }
+        return record.handoff
+    }
+
+    /// Retains the same identity evidence after a service reply closes a handoff.
+    static func incomingRecord(in root: AXNodeSnapshot) -> Record? {
         guard let agent = currentAgent(in: root), !agent.isEmpty else { return nil }
         enum Entry {
             case message(PDDChatMessage)
-            case transfer(target: String, marker: String)
+            case transfer(target: String, marker: String, stableMarker: Bool)
         }
         var entries: [Entry] = []
         func visit(_ node: AXNodeSnapshot, noticeID: String? = nil) {
@@ -101,7 +113,8 @@ enum PDDAXIncomingTransfer {
                let target = recipient(text) {
                 entries.append(.transfer(
                     target: target,
-                    marker: node.attribute(named: "AXDOMIdentifier") ?? noticeID ?? text
+                    marker: node.attribute(named: "AXDOMIdentifier") ?? noticeID ?? text,
+                    stableMarker: node.attribute(named: "AXDOMIdentifier") != nil || noticeID != nil
                 ))
                 return
             }
@@ -111,13 +124,12 @@ enum PDDAXIncomingTransfer {
         guard let notice = entries.lastIndex(where: {
             if case .transfer = $0 { return true }
             return false
-        }), case .transfer(let target, let marker) = entries[notice], target == agent else {
+        }), case .transfer(let target, let marker, let stableMarker) = entries[notice], target == agent else {
             return nil
         }
         let after = entries.suffix(from: notice + 1).compactMap { entry -> PDDChatMessage? in
             if case .message(let message) = entry { return message }; return nil
         }
-        guard !after.contains(where: { $0.sender == .service }) else { return nil }
         let before = entries.prefix(notice).compactMap { entry -> PDDChatMessage? in
             if case .message(let message) = entry { return message }; return nil
         }
@@ -125,11 +137,12 @@ enum PDDAXIncomingTransfer {
             .joined(separator: "\n")
         let boundaryKey = SHA256.hash(data: Data(boundaryMaterial.utf8))
             .map { String(format: "%02x", $0) }.joined()
-        return Handoff(
+        return Record(handoff: Handoff(
             boundaryKey: boundaryKey,
             priorCustomerIDs: before.filter { $0.sender == .customer }.map(\.id),
             currentCustomerIDs: after.filter { $0.sender == .customer }.map(\.id)
-        )
+        ), hasServiceReply: after.contains { $0.sender == .service },
+           identityBoundaryKey: stableMarker || !before.isEmpty ? boundaryKey : nil)
     }
 
     static func customerIDsForUnansweredHandoff(in root: AXNodeSnapshot) -> [String] {

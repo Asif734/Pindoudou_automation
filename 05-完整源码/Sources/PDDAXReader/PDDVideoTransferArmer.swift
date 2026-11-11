@@ -101,6 +101,8 @@ struct PDDVideoForegroundCoordinator {
             pending.append(candidate.messageID)
             do {
                 try await beginOne(uid: uid, candidate: candidate, lease: lease)
+            } catch is CancellationError {
+                throw CancellationError()
             } catch {
                 await armer.reportFailure(uid: uid, messageID: candidate.messageID, error: error)
             }
@@ -339,25 +341,26 @@ final class PDDVideoTransferArmer: PDDVideoTransferArming {
         uid: String, messageID: String, key: PDDVideoTransferKey, error: Error,
         stateStore: PDDDurableVideoTransferStore, eventHandler: EventHandler
     ) async {
-        let category: PDDVideoTransferFailureCategory = error is PDDCustomerVideoError
-            ? .invalidVideo : .responseTimeout
+        let category = PDDVideoTransferFailureCategory.classify(error)
+        let detail = PDDVideoTransferFailureCategory.diagnostic(error)
         let record = try? await stateStore.record(key)
         if let delay = PDDVideoRetryPolicy.delay(afterFailure: record?.retryIndex ?? 0) {
             try? await stateStore.scheduleRetry(
                 key: key, category: category,
-                nextAttemptAt: Date().addingTimeInterval(delay)
+                nextAttemptAt: Date().addingTimeInterval(delay), failureDetail: detail
             )
             await eventHandler(.init(
                 uid: uid, messageID: messageID, phase: .waitingForRetry,
-                diagnostic: "视频下载将在后台重试"
+                diagnostic: "category=\(category.rawValue) cause=\(detail) retry_in=\(Int(delay))s"
             ))
         } else {
             try? await stateStore.transition(
-                key: key, to: .terminalFailure, failure: .retryBudgetExhausted
+                key: key, to: .terminalFailure, failure: .retryBudgetExhausted,
+                failureDetail: detail
             )
             await eventHandler(.init(
                 uid: uid, messageID: messageID, phase: .failed,
-                diagnostic: "视频下载重试已用完"
+                diagnostic: "视频下载重试已用完 category=\(category.rawValue) cause=\(detail)"
             ))
         }
         if (try? await stateStore.markFallbackEmitted(key: key)) == true {

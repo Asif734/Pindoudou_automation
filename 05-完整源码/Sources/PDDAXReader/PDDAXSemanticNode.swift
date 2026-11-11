@@ -6,6 +6,7 @@ struct PDDAXSemanticNode<ID: Hashable>: Equatable {
     let role: String
     let value: String?
     let title: String?
+    let accessibilityDescription: String?
     let domIdentifier: String?
     let domClasses: Set<String>
     let actionNames: Set<String>
@@ -22,13 +23,15 @@ struct PDDAXSemanticNode<ID: Hashable>: Equatable {
         domClasses: Set<String>,
         actionNames: Set<String>,
         isSettable: Bool,
-        frame: CGRect = .zero
+        frame: CGRect = .zero,
+        accessibilityDescription: String? = nil
     ) {
         self.id = id
         self.parentID = parentID
         self.role = role
         self.value = value
         self.title = title
+        self.accessibilityDescription = accessibilityDescription
         self.domIdentifier = domIdentifier
         self.domClasses = domClasses
         self.actionNames = actionNames

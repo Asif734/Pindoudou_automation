@@ -2,6 +2,43 @@ import XCTest
 @testable import PDDAXReader
 
 final class PDDVideoTransferStateTests: XCTestCase {
+    func testFailureClassificationDistinguishesPreviewAddressAndMediaProblems() {
+        XCTAssertEqual(PDDVideoTransferFailureCategory.classify(PDDCustomerVideoError.clickFailed), .previewUnavailable)
+        XCTAssertEqual(PDDVideoTransferFailureCategory.classify(PDDCustomerVideoError.cacheUnavailable), .localFile)
+        XCTAssertEqual(PDDVideoTransferFailureCategory.classify(PDDCustomerVideoError.timedOutNoCacheChange), .addressUnavailable)
+        XCTAssertEqual(PDDVideoTransferFailureCategory.classify(PDDCustomerVideoError.invalidMedia), .invalidVideo)
+        XCTAssertEqual(PDDVideoTransferFailureCategory.classify(URLError(.timedOut)), .responseTimeout)
+        let signed = URL(string: "https://example.com/video?sign=private")!
+        let error = NSError(domain: NSURLErrorDomain, code: -1001,
+                            userInfo: [NSURLErrorFailingURLErrorKey: signed])
+        XCTAssertFalse(PDDVideoTransferFailureCategory.diagnostic(error).contains("private"))
+        XCTAssertFalse(PDDVideoTransferFailureCategory.diagnostic(error).contains("https://"))
+    }
+
+    func testFailureCauseSurvivesRestartAndLegacyRecordsStillDecode() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let url = root.appendingPathComponent("state.json")
+        let key = PDDVideoTransferKey(uid: "PDD-one", messageID: "video-1")
+        let store = PDDDurableVideoTransferStore(url: url)
+        _ = try await store.begin(key: key, uid: "PDD-one", messageID: "video-1")
+        try await store.scheduleRetry(key: key, category: .previewUnavailable,
+                                      nextAttemptAt: Date(), failureDetail: "无法打开客户视频")
+        let restored = PDDDurableVideoTransferStore(url: url)
+        let record = try await restored.record(key)
+        XCTAssertEqual(record?.failureDetail, "无法打开客户视频")
+        var payload = try JSONSerialization.jsonObject(with: Data(contentsOf: url)) as! [String: Any]
+        var records = payload["records"] as! [[String: Any]]
+        records[0].removeValue(forKey: "failureDetail")
+        records[0]["failure"] = "invalidVideo"
+        payload["records"] = records
+        try JSONSerialization.data(withJSONObject: payload).write(to: url)
+        let legacy = PDDDurableVideoTransferStore(url: url)
+        let oldRecord = try await legacy.record(key)
+        XCTAssertNil(oldRecord?.failureDetail)
+        XCTAssertEqual(oldRecord?.failure, .invalidVideo)
+    }
+
     func testRetryScheduleMatchesCurrentQianniu() {
         XCTAssertEqual(PDDVideoRetryPolicy.delay(afterFailure: 0), 60)
         XCTAssertEqual(PDDVideoRetryPolicy.delay(afterFailure: 1), 180)

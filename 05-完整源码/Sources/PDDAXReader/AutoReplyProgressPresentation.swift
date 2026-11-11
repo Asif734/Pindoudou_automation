@@ -109,7 +109,7 @@ enum AutoReplyProgressPresentation {
         switch state {
         case .discovered: return BilingualText.lines("已发现客户消息", "Customer message discovered")
         case .capturing: return BilingualText.lines("AX 正在读取；失效时才启用尾部 OCR", "Reading with AX; tail OCR is used only if AX fails")
-        case .queued: return BilingualText.lines("等待 Codex 空位", "Waiting for Codex capacity")
+        case .queued: return BilingualText.lines("已排队，等待生成回复", "Queued for reply generation")
         case .generating: return BilingualText.lines("Codex 正在生成回复", "Codex is generating a reply")
         case .ready: return BilingualText.lines("回复就绪，等待发送", "Reply ready; waiting to send")
         case .sending: return BilingualText.lines("正在发送并回读确认", "Sending and reading back for confirmation")

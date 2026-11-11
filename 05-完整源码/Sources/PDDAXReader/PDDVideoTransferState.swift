@@ -16,6 +16,7 @@ enum PDDDurableVideoTransferPhase: String, Codable, Equatable, Sendable {
 }
 
 enum PDDVideoTransferFailureCategory: String, Codable, Equatable, Sendable {
+    case previewUnavailable
     case addressUnavailable
     case dnsResolution
     case connectTimeout
@@ -30,6 +31,38 @@ enum PDDVideoTransferFailureCategory: String, Codable, Equatable, Sendable {
     case localFile
     case retryBudgetExhausted
     case legacyUnknown
+
+    static func classify(_ error: Error) -> Self {
+        if let error = error as? PDDCustomerVideoError {
+            switch error {
+            case .clickFailed: return .previewUnavailable
+            case .cacheUnavailable: return .localFile
+            case .timedOutNoCacheChange, .timedOutWithoutVideoMarker: return .addressUnavailable
+            case .downloadRejected: return .httpRejected
+            case .downloadFailed: return .legacyUnknown
+            case .invalidMedia, .missingVideoTrack: return .invalidVideo
+            }
+        }
+        if let error = error as? URLError {
+            switch error.code {
+            case .cannotFindHost, .dnsLookupFailed: return .dnsResolution
+            case .cannotConnectToHost: return .connectTimeout
+            case .timedOut: return .responseTimeout
+            case .notConnectedToInternet: return .offline
+            case .networkConnectionLost: return .connectionReset
+            case .secureConnectionFailed, .serverCertificateUntrusted: return .tlsFailure
+            default: return .legacyUnknown
+            }
+        }
+        return .legacyUnknown
+    }
+
+    /// Preserve a useful cause without persisting signed video URLs or request headers.
+    static func diagnostic(_ error: Error) -> String {
+        if let error = error as? PDDCustomerVideoError { return error.localizedDescription }
+        let error = error as NSError
+        return "\(error.domain) code=\(error.code)"
+    }
 }
 
 struct PDDDurableVideoTransferRecord: Codable, Equatable, Sendable {
@@ -45,6 +78,7 @@ struct PDDDurableVideoTransferRecord: Codable, Equatable, Sendable {
     var fileName: String?
     var failure: PDDVideoTransferFailureCategory?
     var updatedAt: Date
+    var failureDetail: String? = nil
 }
 
 enum PDDVideoRetryPolicy {
@@ -146,12 +180,15 @@ actor PDDDurableVideoTransferStore {
         key: PDDVideoTransferKey,
         to phase: PDDDurableVideoTransferPhase,
         failure: PDDVideoTransferFailureCategory? = nil,
-        fileName: String? = nil
+        fileName: String? = nil,
+        failureDetail: String? = nil
     ) throws {
         var payload = try load()
         guard let index = payload.records.firstIndex(where: { $0.key == key }) else { return }
         payload.records[index].phase = phase
         payload.records[index].failure = failure
+        if let failureDetail { payload.records[index].failureDetail = failureDetail }
+        if phase == .addressCaptured { payload.records[index].failureDetail = nil }
         if let fileName { payload.records[index].fileName = fileName }
         if phase != .waitingForRetry { payload.records[index].nextAttemptAt = nil }
         if phase == .addressCaptured { payload.records[index].needsFreshAddress = false }
@@ -170,12 +207,14 @@ actor PDDDurableVideoTransferStore {
     func scheduleRetry(
         key: PDDVideoTransferKey,
         category: PDDVideoTransferFailureCategory,
-        nextAttemptAt: Date
+        nextAttemptAt: Date,
+        failureDetail: String? = nil
     ) throws {
         var payload = try load()
         guard let index = payload.records.firstIndex(where: { $0.key == key }) else { return }
         payload.records[index].phase = .waitingForRetry
         payload.records[index].failure = category
+        payload.records[index].failureDetail = failureDetail
         payload.records[index].nextAttemptAt = nextAttemptAt
         payload.records[index].needsFreshAddress = true
         payload.records[index].retryIndex += 1

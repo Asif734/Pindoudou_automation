@@ -3,6 +3,22 @@ import XCTest
 
 @MainActor
 final class PDDVideoTransferArmerTests: XCTestCase {
+    func testCancellationDoesNotCreateVideoFailureOrContinueToAnotherVideo() async throws {
+        let recorder = VideoOrderRecorder()
+        let armer = VideoArmerSpy(recorder: recorder)
+        let coordinator = PDDVideoForegroundCoordinator(armer: armer, opener: CancellingVideoPreviewOpener())
+        let candidates = ["v1", "v2"].map {
+            PDDCustomerVideoCandidate(messageID: $0, frame: CGRect(x: 10, y: 10, width: 30, height: 30))
+        }
+        do {
+            _ = try await coordinator.begin(uid: "PDD-one", candidates: candidates,
+                                           lease: UIOperationLeaseRegistry().acquire(uid: "PDD-one"))
+            XCTFail("Cancellation must propagate to the UI operation")
+        } catch is CancellationError {} catch { XCTFail("Unexpected error: \(error)") }
+        XCTAssertTrue(armer.failedMessageIDs.isEmpty)
+        XCTAssertEqual(recorder.values, ["arm"])
+    }
+
     func testForegroundOrderIsArmOpenStartClose() async throws {
         let recorder = VideoOrderRecorder()
         let armer = VideoArmerSpy(recorder: recorder)
@@ -157,6 +173,14 @@ final class PDDVideoTransferArmerTests: XCTestCase {
         XCTAssertFalse(recorder.values.contains("start"), "link waiting must not start before preview confirmation")
         XCTAssertEqual(armer.failedMessageIDs, ["v1"], "existing fallback path must receive the empty video")
     }
+}
+
+@MainActor
+private final class CancellingVideoPreviewOpener: PDDVideoPreviewOpening {
+    func open(_ candidate: PDDCustomerVideoCandidate, lease: UIOperationLease) async throws {
+        throw CancellationError()
+    }
+    func close() async {}
 }
 
 private final class VideoOrderRecorder: @unchecked Sendable {

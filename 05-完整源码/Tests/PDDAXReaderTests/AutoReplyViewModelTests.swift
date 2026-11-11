@@ -3,6 +3,27 @@ import XCTest
 
 @MainActor
 final class AutoReplyViewModelTests: XCTestCase {
+    func testStopDuringPendingStartupCancelsStartAndUpdatesBothControlStates() async {
+        let runtime = FakeAutoReplyRuntime()
+        let gate = AsyncPrewarmGate()
+        let model = AutoReplyViewModel(runtime: runtime,
+            sessionLock: FakeAutoReplyLock(acquireResult: true), permissionCheck: { true },
+            screenRecordingPermissionCheck: { true }, axNotificationListener: FakeAXNotificationListener(),
+            startupPrewarm: { try await gate.wait() })
+        XCTAssertFalse(model.canStop)
+        model.start()
+        await Task.yield()
+        XCTAssertTrue(model.canStop, "Stop must work before the runtime is running")
+        XCTAssertFalse(model.isRunning)
+        model.stop()
+        XCTAssertFalse(model.canStop)
+        XCTAssertFalse(model.desiredRunning)
+        XCTAssertEqual(model.status, BilingualText.lines("已停止", "Stopped"))
+        await gate.release()
+        for _ in 0..<20 { await Task.yield() }
+        XCTAssertEqual(runtime.startCount, 0, "Cancelled prewarm must not start later")
+    }
+
     func testLiveStartWaitsForStartupPrewarmBeforeRuntimeBegins() async {
         let runtime = FakeAutoReplyRuntime()
         let gate = AsyncPrewarmGate()
@@ -34,7 +55,7 @@ final class AutoReplyViewModelTests: XCTestCase {
         let model = AutoReplyViewModel(
             runtime: runtime,
             sessionLock: FakeAutoReplyLock(acquireResult: true),
-            permissionCheck: { true },
+            permissionCheck: { true }, screenRecordingPermissionCheck: { true },
             compatibilityCheck: { report }
         )
 
@@ -74,7 +95,7 @@ final class AutoReplyViewModelTests: XCTestCase {
         let model = AutoReplyViewModel(
             runtime: runtime,
             sessionLock: FakeAutoReplyLock(acquireResult: true),
-            permissionCheck: { true },
+            permissionCheck: { true }, screenRecordingPermissionCheck: { true },
             compatibilityCheck: { report }
         )
         await model.runCompatibilityCheck()
@@ -145,7 +166,7 @@ final class AutoReplyViewModelTests: XCTestCase {
         let model = AutoReplyViewModel(
             runtime: runtime,
             sessionLock: FakeAutoReplyLock(acquireResult: true),
-            permissionCheck: { true }
+            permissionCheck: { true }, screenRecordingPermissionCheck: { true }
         )
 
         XCTAssertFalse(model.isRunning)
@@ -179,7 +200,7 @@ final class AutoReplyViewModelTests: XCTestCase {
         let model = AutoReplyViewModel(
             runtime: runtime,
             sessionLock: FakeAutoReplyLock(acquireResult: false),
-            permissionCheck: { true }
+            permissionCheck: { true }, screenRecordingPermissionCheck: { true }
         )
 
         model.start()
@@ -193,7 +214,7 @@ final class AutoReplyViewModelTests: XCTestCase {
         let runtime = FakeAutoReplyRuntime()
         let lock = FakeAutoReplyLock(acquireResult: true)
         let model = AutoReplyViewModel(
-            runtime: runtime, sessionLock: lock, permissionCheck: { true }
+            runtime: runtime, sessionLock: lock, permissionCheck: { true }, screenRecordingPermissionCheck: { true }
         )
 
         model.start()
@@ -210,7 +231,7 @@ final class AutoReplyViewModelTests: XCTestCase {
         let model = AutoReplyViewModel(
             runtime: runtime,
             sessionLock: FakeAutoReplyLock(acquireResult: true),
-            permissionCheck: { true }
+            permissionCheck: { true }, screenRecordingPermissionCheck: { true }
         )
 
         model.viewAppeared()
@@ -228,7 +249,7 @@ final class AutoReplyViewModelTests: XCTestCase {
                 homeDirectory: URL(fileURLWithPath: "/tmp/pdd-candidate-home", isDirectory: true)
             ),
             sessionLock: FakeAutoReplyLock(acquireResult: true),
-            permissionCheck: { true }
+            permissionCheck: { true }, screenRecordingPermissionCheck: { true }
         )
 
         model.viewAppeared()
@@ -244,7 +265,7 @@ final class AutoReplyViewModelTests: XCTestCase {
         let model = AutoReplyViewModel(
             runtime: runtime,
             sessionLock: lock,
-            permissionCheck: { true }
+            permissionCheck: { true }, screenRecordingPermissionCheck: { true }
         )
         model.viewAppeared()
 
@@ -261,7 +282,7 @@ final class AutoReplyViewModelTests: XCTestCase {
         let model = AutoReplyViewModel(
             runtime: runtime,
             sessionLock: FakeAutoReplyLock(acquireResult: true),
-            permissionCheck: { true },
+            permissionCheck: { true }, screenRecordingPermissionCheck: { true },
             axNotificationListener: observer
         )
 
@@ -289,7 +310,7 @@ final class AutoReplyViewModelTests: XCTestCase {
         let model = AutoReplyViewModel(
             runtime: runtime,
             sessionLock: FakeAutoReplyLock(acquireResult: true),
-            permissionCheck: { true }
+            permissionCheck: { true }, screenRecordingPermissionCheck: { true }
         )
 
         model.viewAppeared()
@@ -306,7 +327,7 @@ final class AutoReplyViewModelTests: XCTestCase {
         let model = AutoReplyViewModel(
             runtime: runtime,
             sessionLock: FakeAutoReplyLock(acquireResult: true),
-            permissionCheck: { true }
+            permissionCheck: { true }, screenRecordingPermissionCheck: { true }
         )
 
         runtime.currentUIOwner = "capture:GZC-000001"
@@ -324,7 +345,7 @@ final class AutoReplyViewModelTests: XCTestCase {
         let model = AutoReplyViewModel(
             runtime: FakeAutoReplyRuntime(),
             sessionLock: FakeAutoReplyLock(acquireResult: true),
-            permissionCheck: { true },
+            permissionCheck: { true }, screenRecordingPermissionCheck: { true },
             runIntentStore: intent
         )
 
@@ -347,7 +368,7 @@ final class AutoReplyViewModelTests: XCTestCase {
             runtime: runtime,
             identity: identity,
             sessionLock: FakeAutoReplyLock(acquireResult: true),
-            permissionCheck: { true },
+            permissionCheck: { true }, screenRecordingPermissionCheck: { true },
             runIntentStore: intent
         )
 

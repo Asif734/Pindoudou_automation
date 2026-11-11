@@ -26,7 +26,7 @@ for phrase in \
   grep -Fq "$phrase" "$MANUAL"
 done
 
-grep -Fq '拼多多全自动客服-任务隔离候选版.app' "$INSTALLER"
+grep -Fq '02-正式程序/pinduodou_automation.app' "$INSTALLER"
 grep -Fq '/Applications' "$INSTALLER"
 grep -Fq '完整源码' "$BUILD"
 grep -Fq 'SHA-256' "$BUILD"

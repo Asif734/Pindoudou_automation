@@ -15,16 +15,24 @@ test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$APP/Contents/In
 test -x "$APP/Contents/MacOS/PDDTaskIsolationCandidate"
 
 test -f "$RESOURCE_ROOT/CustomerService/customer-reply-prompt.md"
-test -f "$RESOURCE_ROOT/V2Knowledge/retrieve_top12.py"
-test -d "$RESOURCE_ROOT/V2Knowledge/site-packages"
-test -d "$RESOURCE_ROOT/V2Knowledge/cache"
-test -f "$RESOURCE_ROOT/KnowledgeBase/Grozziie-China-KB-2026-08-24.zip"
+test -x "$RESOURCE_ROOT/PythonRuntime/python/bin/python3"
 
 cmp "$PROJECT_ROOT/Resources/CustomerService/customer-reply-prompt.md" \
     "$RESOURCE_ROOT/CustomerService/customer-reply-prompt.md"
-cmp "$PROJECT_ROOT/Resources/V2Knowledge/retrieve_top12.py" \
-    "$RESOURCE_ROOT/V2Knowledge/retrieve_top12.py"
-cmp "$PROJECT_ROOT/Resources/KnowledgeBase/Grozziie-China-KB-2026-08-24.zip" \
-    "$RESOURCE_ROOT/KnowledgeBase/Grozziie-China-KB-2026-08-24.zip"
+if [[ -f "$PROJECT_ROOT/Resources/FolderKnowledge/config.json" ]]; then
+    for resource in config.json serve_folder.py; do
+        cmp "$PROJECT_ROOT/Resources/FolderKnowledge/$resource" \
+            "$RESOURCE_ROOT/FolderKnowledge/$resource"
+    done
+else
+    test -d "$RESOURCE_ROOT/V2Knowledge/site-packages"
+    test -d "$RESOURCE_ROOT/V2Knowledge/cache"
+    for resource in retrieve_top12.py serve_top12.py; do
+        cmp "$PROJECT_ROOT/Resources/V2Knowledge/$resource" \
+            "$RESOURCE_ROOT/V2Knowledge/$resource"
+    done
+    cmp "$PROJECT_ROOT/Resources/KnowledgeBase/Grozziie-China-KB-2026-08-24.zip" \
+        "$RESOURCE_ROOT/KnowledgeBase/Grozziie-China-KB-2026-08-24.zip"
+fi
 
 codesign --verify --deep --strict "$APP"

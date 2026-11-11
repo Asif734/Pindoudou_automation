@@ -3,6 +3,61 @@ import XCTest
 
 @MainActor
 final class AutoReplySchedulerTests: XCTestCase {
+    func testRestartReleasesAnsweredVideoRetryAndQueuesOnlyTheUnsentGreeting() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let uid = "PDD-one"
+        let video = try makeVideoCapture(uid: uid, messageID: "old-video")
+        let history = video.fullHistory + [PDDChatMessage(id: "new-hi", sender: .customer,
+            content: "hi", displayTime: nil, kind: .text, capturedAt: Date(timeIntervalSince1970: 3))]
+        let timeline = try AutoReplyTimeline.make(messages: history)
+        let joined = AutoReplyCapture(uid: uid, fullHistory: history,
+            batch: try timeline.freeze(after: .empty), customerCursor: timeline.cursor,
+            unexpectedServiceMessageIDs: [], pendingVideoMessageIDs: ["old-video"])
+        let receipts = CustomerMessageReceipts(root: root)
+        try receipts.capture(joined)
+        try receipts.replied(video)
+        var state = AutoReplyPersistentState.empty
+        state.answeredCursors[uid] = joined.customerCursor
+        state.pendingVideoBatches = [.init(uid: uid, capture: joined, expectedMessageIDs: ["old-video"])]
+        let store = AutoReplyStore(rootDirectory: root); try store.save(state)
+        let driver = ControlledAutoReplyDriver(capturesByUID: [:])
+        let generator = ControlledReplyGenerator(delayNanoseconds: 1_000_000_000)
+        let scheduler = try AutoReplyScheduler(driver: driver, generator: generator, store: store)
+        XCTAssertTrue(scheduler.pendingVideoBatchesSnapshot.isEmpty)
+        XCTAssertEqual(scheduler.jobs.count, 1)
+        XCTAssertEqual(scheduler.jobs[0].capture.batch?.customerMessageIDs, ["new-hi"])
+        XCTAssertTrue(scheduler.jobs[0].capture.pendingVideoMessageIDs.isEmpty)
+        XCTAssertEqual(driver.sendCallCount, 0, "Stopped startup recovery must not send")
+        XCTAssertNil(try receipts.receipts(uid: uid)["new-hi"]?.replySentAt)
+        // A second restart must preserve the same queued job, without another video turn.
+        let restarted = try AutoReplyScheduler(driver: driver, generator: generator, store: store)
+        XCTAssertEqual(restarted.jobs.map(\.id), scheduler.jobs.map(\.id))
+        restarted.start(); defer { restarted.stop() }
+        await restarted.tick()
+        for _ in 0..<100 where generator.targetIDs.isEmpty { await Task.yield() }
+        XCTAssertEqual(generator.targetIDs, [["new-hi"]])
+    }
+
+    func testRetryEventBeforeCaptureCannotLeaveTheReplyWaitingForTheNextRetry() async throws {
+        let uid = "PDD-one"
+        let f = try SchedulerFixture(capturesByUID: [uid: [["video-1"]]])
+        f.driver.pendingVideoMessageIDsByUID[uid] = ["video-1"]
+        await f.scheduler.receiveVideoTransferEvent(.init(uid: uid, messageID: "video-1",
+            phase: .waitingForRetry, diagnostic: "previewUnavailable retry_in=180s"))
+        f.driver.discoveries = [.init(uid: uid, hasUnreadEvidence: true)]
+        await f.runTicks(2)
+        XCTAssertTrue(f.scheduler.pendingVideoBatchesSnapshot.isEmpty)
+        XCTAssertEqual(f.scheduler.jobs.count, 1)
+        XCTAssertEqual(f.scheduler.jobs[0].state, .ready)
+        XCTAssertNotNil(f.scheduler.jobs[0].reply)
+        XCTAssertTrue(try AutoReplyStore(rootDirectory: f.root).load().deferredVideoTransferEvents.isEmpty)
+        await f.scheduler.receiveVideoTransferEvent(.init(uid: uid, messageID: "video-1",
+            phase: .readyForGeneration, attachment: videoAttachment(messageID: "video-1"), recovered: true))
+        XCTAssertEqual(f.scheduler.jobs.count, 2, "Background analysis must still be admitted when retry succeeds")
+        XCTAssertEqual(f.scheduler.jobs[1].videoAttachments.map(\.messageID), ["video-1"])
+    }
+
     func testConfirmedReplyUnderOldMaskedNameIsNotReplayedForCanonicalCustomer() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: root) }
@@ -862,6 +917,87 @@ final class AutoReplySchedulerTests: XCTestCase {
 
         XCTAssertEqual(driver.captureIncludeImages, [true, false])
         XCTAssertTrue(try store.load().jobs[0].imageCaptureAttempted)
+    }
+
+    func testHistoricalPendingVideoCannotBlockPreparedCurrentVideoGeneration() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let uid = "PDD-one"
+        let old = try makeVideoCapture(uid: uid, messageID: "old-video")
+        let history = old.fullHistory + [PDDChatMessage(id: "new-video", sender: .customer,
+            content: "[视频]", displayTime: nil, kind: .video, capturedAt: Date(timeIntervalSince1970: 3))]
+        let timeline = try AutoReplyTimeline.make(messages: history)
+        let attachment = videoAttachment(messageID: "new-video")
+        let capture = AutoReplyCapture(uid: uid, fullHistory: history,
+            batch: try timeline.freeze(after: old.customerCursor), customerCursor: timeline.cursor,
+            unexpectedServiceMessageIDs: [], videoAttachments: [attachment])
+        var state = AutoReplyPersistentState.empty
+        state.nextSequence = 1
+        state.jobs = [.init(id: UUID(), uid: uid, sequence: 1, state: .queued, capture: capture,
+            reply: nil, deliveryOutcome: nil, confirmedServiceMessageID: nil, retries: 0,
+            nextAttemptAt: nil, lastError: nil, videoAttachments: [attachment])]
+        state.pendingVideoBatches = [.init(uid: uid, capture: old, expectedMessageIDs: ["old-video"])]
+        let store = AutoReplyStore(rootDirectory: root)
+        try store.save(state)
+        let generator = ControlledReplyGenerator(delayNanoseconds: 1_000_000_000)
+        let scheduler = try AutoReplyScheduler(driver: ControlledAutoReplyDriver(capturesByUID: [:]),
+            generator: generator, store: store)
+        scheduler.start(); defer { scheduler.stop() }
+        await scheduler.tick()
+        for _ in 0..<100 where generator.targetIDs.isEmpty { await Task.yield() }
+        XCTAssertEqual(scheduler.jobs.first?.state, .generating)
+        XCTAssertEqual(generator.targetIDs, [["new-video"]])
+        XCTAssertEqual(scheduler.pendingVideoBatchesSnapshot.count, 1)
+    }
+
+    func testCurrentUnpreparedVideoWaitsWhileAnotherCustomerGenerates() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let video = try makeVideoCapture(uid: "PDD-one", messageID: "video-1")
+        let text = try makeFrozenCapture(uid: "PDD-two", ids: ["text-2"], after: .empty)
+        var state = AutoReplyPersistentState.empty
+        state.nextSequence = 2
+        state.jobs = [video, text].enumerated().map { index, capture in
+            AutoReplyJob(id: UUID(), uid: capture.uid, sequence: index + 1, state: .queued,
+                         capture: capture, reply: nil, deliveryOutcome: nil,
+                         confirmedServiceMessageID: nil, retries: 0, nextAttemptAt: nil, lastError: nil)
+        }
+        state.pendingVideoBatches = [.init(uid: video.uid, capture: video, expectedMessageIDs: ["video-1"])]
+        let store = AutoReplyStore(rootDirectory: root); try store.save(state)
+        let generator = ControlledReplyGenerator(delayNanoseconds: 1_000_000_000)
+        let scheduler = try AutoReplyScheduler(driver: ControlledAutoReplyDriver(capturesByUID: [:]),
+            generator: generator, store: store)
+        scheduler.start(); defer { scheduler.stop() }
+        await scheduler.tick()
+        for _ in 0..<100 where generator.targetIDs.isEmpty { await Task.yield() }
+        XCTAssertEqual(scheduler.jobs.first?.state, .queued)
+        XCTAssertEqual(generator.targetIDs, [["text-2"]])
+    }
+
+    func testOneVideoCompletionResolvesEveryPendingCaptureAndKeepsLaterText() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let video = try makeVideoCapture(uid: "PDD-one", messageID: "video-1")
+        let history = video.fullHistory + [PDDChatMessage(id: "later-text", sender: .customer,
+            content: "check this", displayTime: nil, kind: .text, capturedAt: Date(timeIntervalSince1970: 3))]
+        let timeline = try AutoReplyTimeline.make(messages: history)
+        let latest = AutoReplyCapture(uid: video.uid, fullHistory: history,
+            batch: try timeline.freeze(after: .empty), customerCursor: timeline.cursor, unexpectedServiceMessageIDs: [])
+        var state = AutoReplyPersistentState.empty
+        state.pendingVideoBatches = [video, latest].map {
+            .init(uid: video.uid, capture: $0, expectedMessageIDs: ["video-1"])
+        }
+        let store = AutoReplyStore(rootDirectory: root); try store.save(state)
+        let scheduler = try AutoReplyScheduler(driver: ControlledAutoReplyDriver(capturesByUID: [:]),
+            generator: ControlledReplyGenerator(delayNanoseconds: 0), store: store)
+        await scheduler.receiveVideoTransferEvent(.init(uid: video.uid, messageID: "video-1",
+            phase: .readyForGeneration, attachment: videoAttachment(messageID: "video-1"), diagnostic: "prepared_frames=8"))
+        XCTAssertTrue(scheduler.pendingVideoBatchesSnapshot.isEmpty)
+        XCTAssertEqual(scheduler.jobs.count, 1)
+        XCTAssertEqual(scheduler.jobs.first?.capture.batch?.events.map(\.messageID), ["video-1", "later-text"])
+        XCTAssertEqual(scheduler.jobs.first?.videoAttachments.map(\.messageID), ["video-1"])
+        let log = try String(contentsOf: root.appendingPathComponent("logs/automation-steps.jsonl"))
+        XCTAssertTrue(log.contains("prepared_frames=8"))
     }
 
     func testCompletedVideoQueuesBehindExistingJobForSameUID() async throws {
