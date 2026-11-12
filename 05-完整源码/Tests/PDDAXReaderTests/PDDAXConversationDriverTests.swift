@@ -74,7 +74,8 @@ final class PDDAXConversationDriverTests: XCTestCase {
         XCTAssertNil(driver.visibleConversationsSnapshot())
     }
     func testDiscoveryRotatesPastBrokenFirstUnreadConversation() async throws {
-        let tree = usableChatTree()
+        let controls = usableChatTree()
+        let tree = PDDAXSemanticTree(rootSnapshot: .init(role: "AXWindow", children: [customer("healthy-question")]), nodes: controls.nodes)
         let backend = FakePDDAXBackend(trees: [tree, tree, tree])
         backend.failedPressIDs = [.init(rawValue: 2)]
         let unread = FakePDDUnreadEvidence(rows: [
@@ -201,11 +202,11 @@ final class PDDAXConversationDriverTests: XCTestCase {
         let discoveries = try await driver.discover()
 
         let uid = PDDConversationKey.make(locator: locator)
-        XCTAssertEqual(discoveries, [.init(uid: uid, hasUnreadEvidence: true)])
-        XCTAssertEqual(driver.conversationLocatorsSnapshot()?[uid], locator)
+        XCTAssertTrue(discoveries.isEmpty, "A row identifier alone cannot mean message content is loaded")
+        XCTAssertNil(driver.conversationLocatorsSnapshot()?[uid])
     }
 
-    func testDiscoverCurrentMaskedConversationWithoutUnreadCreatesNicknameLocator() async throws {
+    func testEmptyCurrentMaskedConversationDoesNotCreateWorkWithoutUnread() async throws {
         let locator = PDDConversationLocator(domIdentifier: nil, nickname: "山**川")
         let current = PDDAXSemanticTree(rootSnapshot: AXNodeSnapshot(role: "AXWindow"), nodes: [
             semantic(1, role: "AXGroup", classes: ["chat-list-box"]),
@@ -221,8 +222,8 @@ final class PDDAXConversationDriverTests: XCTestCase {
         let discoveries = try await driver.discover()
 
         let uid = PDDConversationKey.make(locator: locator)
-        XCTAssertEqual(discoveries, [.init(uid: uid, hasUnreadEvidence: false)])
-        XCTAssertEqual(driver.conversationLocatorsSnapshot()?[uid], locator)
+        XCTAssertTrue(discoveries.isEmpty)
+        XCTAssertNil(driver.conversationLocatorsSnapshot()?[uid])
     }
 
     func testRestoredBaselineDoesNotDiscardFirstCaptureAfterAppRestart() async throws {
@@ -1673,7 +1674,7 @@ private final class FakePDDAXBackend: PDDAXBackend {
     func readSemanticTree() throws -> PDDAXSemanticTree {
         readCount += 1
         guard !trees.isEmpty else { throw CocoaError(.fileReadUnknown) }
-        return trees.removeFirst()
+        return trees.count > 1 ? trees.removeFirst() : trees[0]
     }
 
     func performPress(_ id: AXElementToken) throws {

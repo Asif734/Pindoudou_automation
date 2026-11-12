@@ -193,7 +193,7 @@ final class AutoReplyProgressPresentationTests: XCTestCase {
         )
         XCTAssertEqual(
             AutoReplyProgressPresentation.jobStageName(uncertain),
-            BilingualText.lines("已完成 · 发送结果不确定（不会自动重发）", "Completed · send result uncertain (will not resend automatically)")
+            BilingualText.lines("发送结果待核对", "Send result requires verification")
         )
     }
 

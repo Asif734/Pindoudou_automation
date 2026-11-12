@@ -110,6 +110,7 @@ final class LivePDDAXForcedAccessibilityRestarter: PDDAXForcedAccessibilityResta
 
 @MainActor
 protocol PDDAXBackend: AnyObject {
+    func requestAccessibilityRefresh() throws
     func prepareForeground() async throws
     func readSemanticTree() throws -> PDDAXSemanticTree
     func performPress(_ id: AXElementToken) throws
@@ -117,10 +118,14 @@ protocol PDDAXBackend: AnyObject {
     func value(of id: AXElementToken) throws -> String
 }
 
-extension PDDAXBackend { func prepareForeground() async throws {} }
+extension PDDAXBackend {
+    func prepareForeground() async throws {}
+    func requestAccessibilityRefresh() throws {}
+}
 
 enum PDDAXBackendError: LocalizedError {
     case staleElement
+    case refreshRequestRejected
     case actionFailed(AXError)
     case valueReadFailed(AXError)
     case valueWriteFailed(AXError)
@@ -130,6 +135,7 @@ enum PDDAXBackendError: LocalizedError {
     var errorDescription: String? {
         switch self {
         case .staleElement: return "AX 元素令牌已失效"
+        case .refreshRequestRejected: return "AX 刷新请求未被接受；继续独立读取并核对现有聊天数据"
         case .actionFailed(let error): return "AXPress 失败：\(error.rawValue)"
         case .valueReadFailed(let error): return "AXValue 读取失败：\(error.rawValue)"
         case .valueWriteFailed(let error): return "AXValue 写入失败：\(error.rawValue)"
@@ -196,6 +202,17 @@ enum PDDAXRootWindowPreference {
 
 @MainActor
 final class LivePDDAXBackend: PDDAXBackend {
+    func requestAccessibilityRefresh() throws {
+        guard AXIsProcessTrusted() else { throw AXTreeReaderError.accessibilityPermissionRequired }
+        guard let application = NSRunningApplication.runningApplications(withBundleIdentifier: targetBundleIdentifier).first else {
+            throw AXTreeReaderError.applicationNotRunning("拼多多商家版")
+        }
+        let element = AXUIElementCreateApplication(application.processIdentifier)
+        AXUIElementSetMessagingTimeout(element, 0.5)
+        guard AXEnhancedUserInterfaceActivation.requestEnable(on: element) else {
+            throw PDDAXBackendError.refreshRequestRejected
+        }
+    }
     func prepareForeground() async throws {
         try await PDDWindowOCRCapture().activateWorkbenchOnly()
     }

@@ -3,6 +3,7 @@ import Foundation
 
 @MainActor
 final class PDDAXReplySender {
+    var supportsTextDeliveryTracking: Bool { logRoot != nil }
     private let backend: any PDDAXBackend
     private let opener: any PDDConversationOpening
     private let confirmationTimeout: TimeInterval
@@ -43,7 +44,7 @@ final class PDDAXReplySender {
               lease: UIOperationLease? = nil) async throws -> AutoReplyDeliveryResult {
         guard !outgoingImages.isEmpty else {
             return try await send(uid: uid, text: text, expectedCustomerCursor: expectedCustomerCursor,
-                expectedCustomerMessageIDs: expectedCustomerMessageIDs)
+                expectedCustomerMessageIDs: expectedCustomerMessageIDs, deliveryID: deliveryID)
         }
         guard let logRoot, outgoingImages.count <= 3, !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             return .failedBeforeSend("图片发送缺少持久化目录或有效回复")
@@ -194,17 +195,24 @@ final class PDDAXReplySender {
         )
     }
 
+    func send(uid: String, text: String, expectedCustomerCursor: AutoReplyCursor,
+              expectedCustomerMessageIDs: Set<String>) async throws -> AutoReplyDeliveryResult {
+        try await send(uid: uid, text: text, expectedCustomerCursor: expectedCustomerCursor,
+            expectedCustomerMessageIDs: expectedCustomerMessageIDs, deliveryID: nil)
+    }
+
     func send(
         uid: String,
         text: String,
         expectedCustomerCursor: AutoReplyCursor,
-        expectedCustomerMessageIDs: Set<String>
+        expectedCustomerMessageIDs: Set<String>,
+        deliveryID: UUID? = nil
     ) async throws -> AutoReplyDeliveryResult {
         AutomationStepLog.record(root: logRoot, uid: uid, step: "reply-send-started")
         do {
             let result = try await sendReply(uid: uid, text: text,
                 expectedCustomerCursor: expectedCustomerCursor,
-                expectedCustomerMessageIDs: expectedCustomerMessageIDs)
+                expectedCustomerMessageIDs: expectedCustomerMessageIDs, deliveryID: deliveryID)
             AutomationStepLog.record(root: logRoot, uid: uid, step: "reply-send-result",
                 detail: String(describing: result))
             return result
@@ -215,9 +223,14 @@ final class PDDAXReplySender {
     }
 
     private func sendReply(uid: String, text: String, expectedCustomerCursor: AutoReplyCursor,
-                           expectedCustomerMessageIDs: Set<String>) async throws -> AutoReplyDeliveryResult {
+                           expectedCustomerMessageIDs: Set<String>, deliveryID: UUID?) async throws -> AutoReplyDeliveryResult {
         let reply = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !reply.isEmpty else { return .failedBeforeSend("回复为空") }
+        let attempts = logRoot.map { PDDTextDeliveryAttemptStore(root: $0) }
+        if let deliveryID, let attempts, let previous = try attempts.load(deliveryID), previous.mayHaveSent {
+            return try await reconcileTextDelivery(uid: uid, text: reply, deliveryID: deliveryID,
+                expectedCustomerMessageIDs: expectedCustomerMessageIDs)
+        }
         let handoffKey = expectedCustomerMessageIDs.first {
             $0.hasPrefix(FrozenCustomerBatch.incomingHandoffPrefix)
         }.map { String($0.dropFirst(FrozenCustomerBatch.incomingHandoffPrefix.count)) }
@@ -298,6 +311,18 @@ final class PDDAXReplySender {
         do { sendControl = try PDDAXControlSelection.sendControl(in: beforePress.nodes) }
         catch { return .failedBeforeSend(error.localizedDescription) }
 
+        try Task.checkCancellation()
+        try PDDUIOperationContext.lease?.validate()
+        if let deliveryID, let attempts {
+            let baseline = Set(PDDChatParser.parse(root: initialTree.rootSnapshot).messages
+                .filter { $0.sender == .service }.map(\.id))
+            var attempt = PDDTextDeliveryAttempt(uid: uid, replySHA256: PDDTextDeliveryAttempt.hash(reply),
+                stage: .composerVerified, baselineServiceIDs: baseline, updatedAt: Date())
+            try attempts.save(attempt, id: deliveryID)
+            // Persist BEFORE the action. Anything after this point is observe-only on retry.
+            attempt.stage = .commitIntent
+            try attempts.save(attempt, id: deliveryID)
+        }
         AutomationStepLog.record(root: logRoot, uid: uid, step: "reply-send-click-started")
         do { try backend.performPress(sendControl) }
         catch { return .uncertain("已执行发送动作，但按钮状态无法确认：\(error.localizedDescription)") }
@@ -313,12 +338,12 @@ final class PDDAXReplySender {
                 if matches(uid: uid, tree: confirmation, expectedIDs: realMessageIDs),
                    let composer = try? PDDAXControlSelection.composer(in: confirmation.nodes),
                    (try? backend.value(of: composer))?.isEmpty == true {
-                    return .sent(serviceMessageID: stableSendID(
-                        uid: uid,
-                        reply: reply,
-                        cursor: expectedCustomerCursor,
-                        handoffKey: handoffKey
-                    ))
+                    let id = stableSendID(uid: uid, reply: reply, cursor: expectedCustomerCursor, handoffKey: handoffKey)
+                    if let deliveryID, let attempts, var attempt = try attempts.load(deliveryID) {
+                        attempt.stage = .confirmed; attempt.confirmedMessageID = id; attempt.updatedAt = Date()
+                        try attempts.save(attempt, id: deliveryID)
+                    }
+                    return .sent(serviceMessageID: id)
                 }
             } catch {
                 // The send click already happened. Continue bounded read-only observation.
@@ -331,6 +356,43 @@ final class PDDAXReplySender {
             }
         } while true
         return .uncertain("发送后输入框未清空，发送结果待后续会话核对")
+    }
+
+    func reconcileTextDelivery(uid: String, text: String, deliveryID: UUID,
+                               expectedCustomerMessageIDs: Set<String>) async throws -> AutoReplyDeliveryResult {
+        guard let logRoot, var attempt = try PDDTextDeliveryAttemptStore(root: logRoot).load(deliveryID),
+              attempt.uid == uid, attempt.replySHA256 == PDDTextDeliveryAttempt.hash(text) else {
+            return .uncertain("缺少匹配的发送凭据；不自动重发")
+        }
+        if attempt.stage == .confirmed, let id = attempt.confirmedMessageID { return .sent(serviceMessageID: id) }
+        guard attempt.mayHaveSent else { return .failedBeforeSend("发送动作尚未执行") }
+        let realIDs = expectedCustomerMessageIDs.filter { !$0.hasPrefix(FrozenCustomerBatch.incomingHandoffPrefix) }
+        let tree = try await opener.openAndResolve(uid: uid, expectedCustomerMessageIDs: realIDs)
+        guard matches(uid: uid, tree: tree, expectedIDs: realIDs) else { return .uncertain("发送核对时客户身份尚未确认") }
+        try observeSnapshot?(uid, tree.rootSnapshot)
+        let messages = PDDChatParser.parse(root: tree.rootSnapshot).messages
+        let lastTarget = messages.lastIndex { realIDs.contains($0.id) && $0.sender == .customer }
+        let handoff = expectedCustomerMessageIDs.first { $0.hasPrefix(FrozenCustomerBatch.incomingHandoffPrefix) }
+            .map { String($0.dropFirst(FrozenCustomerBatch.incomingHandoffPrefix.count)) }
+        let record = PDDAXIncomingTransfer.incomingRecord(in: tree.rootSnapshot)
+        let eligibleServiceIDs: Set<String>
+        if let lastTarget {
+            eligibleServiceIDs = Set(messages.dropFirst(lastTarget + 1).filter { $0.sender == .service }.map(\.id))
+        } else if let handoff, record?.handoff.boundaryKey == handoff {
+            eligibleServiceIDs = record?.serviceReplyIDs ?? []
+        } else {
+            return .uncertain("目标消息尚未出现在核对视图；不根据旧同文回复推断送达")
+        }
+        if let posted = messages.first(where: {
+            $0.sender == .service && $0.kind == .text && $0.id.hasPrefix("middlePanel_list_")
+                && eligibleServiceIDs.contains($0.id) && !attempt.baselineServiceIDs.contains($0.id)
+                && PDDOCRNormalizer.normalize($0.content) == PDDOCRNormalizer.normalize(text)
+        }) {
+            attempt.stage = .confirmed; attempt.confirmedMessageID = posted.id; attempt.updatedAt = Date()
+            try PDDTextDeliveryAttemptStore(root: logRoot).save(attempt, id: deliveryID)
+            return .sent(serviceMessageID: posted.id)
+        }
+        return .uncertain("尚未找到本次回复的发送证据；保留核对，不自动重发")
     }
 
     private func waitForComposerValue(_ expected: String, on composer: AXElementToken) async -> Bool {

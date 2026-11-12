@@ -126,16 +126,32 @@ final class AutoReplyStore: @unchecked Sendable {
         for index in state.jobs.indices {
             switch state.jobs[index].state {
             case .sending:
-                if state.jobs[index].sendWasInvoked {
+                let attempt: PDDTextDeliveryAttempt?
+                do {
+                    let saved = try PDDTextDeliveryAttemptStore(root: rootDirectory).load(state.jobs[index].id)
+                    attempt = saved.flatMap {
+                        $0.uid == state.jobs[index].uid
+                            && $0.replySHA256 == PDDTextDeliveryAttempt.hash(state.jobs[index].reply ?? "") ? $0 : nil
+                    }
+                } catch {
+                    // An unreadable customer's checkpoint is ambiguous, not a
+                    // reason to prevent every other customer's startup recovery.
+                    attempt = nil
+                    AutomationStepLog.record(root: rootDirectory, uid: state.jobs[index].uid,
+                        step: "delivery-checkpoint-unreadable", detail: "job=\(state.jobs[index].id); no automatic resend; \(error.localizedDescription)")
+                }
+                if state.jobs[index].sendWasInvoked && attempt?.mayHaveSent != false {
                     state.jobs[index].state = .completed
                     state.jobs[index].deliveryOutcome = .uncertain
                     state.jobs[index].lastError = "应用在发送调用后中断；为避免重复发送，按结果不确定完成 @ \(now.timeIntervalSince1970)"
                     _ = state.advanceSourceAndPromoteSupplement(at: index)
+                    if attempt != nil { state.jobs[index].nextAttemptAt = now }
                 } else {
                     state.jobs[index].state = .ready
                     state.jobs[index].deliveryOutcome = .notSent
                     state.jobs[index].lastError = "应用在调用发送前中断；已安全重新排队 @ \(now.timeIntervalSince1970)"
                     state.jobs[index].durableAttemptOperationID = nil
+                    state.jobs[index].sendWasInvoked = false
                 }
                 changed = true
             case .generating:

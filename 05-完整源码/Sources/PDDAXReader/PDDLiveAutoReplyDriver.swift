@@ -2,6 +2,7 @@ import Foundation
 
 @MainActor
 protocol PDDLiveConversationDriving: AnyObject {
+    func acknowledgeDiscoveryCapture(_ capture: AutoReplyCapture) throws
     func reconcileVisibleIdentity(in tree: PDDAXSemanticTree) throws
     func visibleConversationsSnapshot() -> [PDDConversationLocator]?
     func discover() async throws -> [AutoReplyDiscovery]
@@ -31,6 +32,7 @@ protocol PDDLiveConversationDriving: AnyObject {
 }
 
 extension PDDLiveConversationDriving {
+    func acknowledgeDiscoveryCapture(_ capture: AutoReplyCapture) throws {}
     func reconcileVisibleIdentity(in tree: PDDAXSemanticTree) throws {}
     func visibleConversationsSnapshot() -> [PDDConversationLocator]? { nil }
     func capture(
@@ -45,6 +47,9 @@ extension PDDAXConversationDriver: PDDLiveConversationDriving {}
 
 @MainActor
 protocol PDDLiveReplySending: AnyObject {
+    var supportsTextDeliveryTracking: Bool { get }
+    func reconcileTextDelivery(uid: String, text: String, deliveryID: UUID,
+        expectedCustomerMessageIDs: Set<String>) async throws -> AutoReplyDeliveryResult
     func send(uid: String, text: String, outgoingImages: [DatasetReplyImage], deliveryID: UUID,
               expectedCustomerCursor: AutoReplyCursor, expectedCustomerMessageIDs: Set<String>, lease: UIOperationLease?) async throws -> AutoReplyDeliveryResult
     func send(
@@ -61,6 +66,11 @@ protocol PDDLiveReplySending: AnyObject {
 }
 
 extension PDDLiveReplySending {
+    var supportsTextDeliveryTracking: Bool { false }
+    func reconcileTextDelivery(uid: String, text: String, deliveryID: UUID,
+        expectedCustomerMessageIDs: Set<String>) async throws -> AutoReplyDeliveryResult {
+        .uncertain("发送器未提供发送凭据核对")
+    }
     func send(uid: String, text: String, outgoingImages: [DatasetReplyImage], deliveryID: UUID,
               expectedCustomerCursor: AutoReplyCursor, expectedCustomerMessageIDs: Set<String>, lease: UIOperationLease?) async throws -> AutoReplyDeliveryResult {
         guard outgoingImages.isEmpty else { return .failedBeforeSend("发送器不支持图片") }
@@ -83,6 +93,17 @@ extension PDDAXReplySender: PDDLiveReplySending {}
 
 @MainActor
 final class PDDLiveAutoReplyDriver: AutoReplyAutomationDriver {
+    var supportsTextDeliveryTracking: Bool { sender.supportsTextDeliveryTracking }
+    func reconcileTextDelivery(uid: String, text: String, deliveryID: UUID,
+        expectedCustomerMessageIDs: Set<String>, lease: UIOperationLease) async throws -> AutoReplyDeliveryResult {
+        try await withLease(lease) {
+            try await sender.reconcileTextDelivery(uid: uid, text: text, deliveryID: deliveryID,
+                expectedCustomerMessageIDs: expectedCustomerMessageIDs)
+        }
+    }
+    func acknowledgeDiscoveryCapture(_ capture: AutoReplyCapture) throws {
+        try conversationDriver.acknowledgeDiscoveryCapture(capture)
+    }
     func reconcileVisibleIdentity(in tree: PDDAXSemanticTree) throws {
         try conversationDriver.reconcileVisibleIdentity(in: tree)
     }

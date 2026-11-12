@@ -32,6 +32,7 @@ final class AutoReplyViewModelTests: XCTestCase {
             sessionLock: FakeAutoReplyLock(acquireResult: true),
             permissionCheck: { true },
             screenRecordingPermissionCheck: { true },
+            axNotificationListener: FakeAXNotificationListener(),
             startupPrewarm: { try await gate.wait() }
         )
 
@@ -56,6 +57,7 @@ final class AutoReplyViewModelTests: XCTestCase {
             runtime: runtime,
             sessionLock: FakeAutoReplyLock(acquireResult: true),
             permissionCheck: { true }, screenRecordingPermissionCheck: { true },
+            axNotificationListener: FakeAXNotificationListener(),
             compatibilityCheck: { report }
         )
 
@@ -76,6 +78,7 @@ final class AutoReplyViewModelTests: XCTestCase {
             sessionLock: FakeAutoReplyLock(acquireResult: true),
             permissionCheck: { true },
             screenRecordingPermissionCheck: { true },
+            axNotificationListener: FakeAXNotificationListener(),
             compatibilityCheck: { report }
         )
 
@@ -96,6 +99,7 @@ final class AutoReplyViewModelTests: XCTestCase {
             runtime: runtime,
             sessionLock: FakeAutoReplyLock(acquireResult: true),
             permissionCheck: { true }, screenRecordingPermissionCheck: { true },
+            axNotificationListener: FakeAXNotificationListener(),
             compatibilityCheck: { report }
         )
         await model.runCompatibilityCheck()
@@ -118,7 +122,8 @@ final class AutoReplyViewModelTests: XCTestCase {
             sessionLock: FakeAutoReplyLock(acquireResult: true),
             permissionCheck: { false },
             screenRecordingPermissionCheck: { false },
-            permissionSettingsOpener: { openedPages.append($0); return true }
+            permissionSettingsOpener: { openedPages.append($0); return true },
+            axNotificationListener: FakeAXNotificationListener()
         )
 
         model.openRequiredPermissionSettings()
@@ -135,7 +140,8 @@ final class AutoReplyViewModelTests: XCTestCase {
             sessionLock: FakeAutoReplyLock(acquireResult: true),
             permissionCheck: { true },
             screenRecordingPermissionCheck: { false },
-            permissionSettingsOpener: { openedPages.append($0); return true }
+            permissionSettingsOpener: { openedPages.append($0); return true },
+            axNotificationListener: FakeAXNotificationListener()
         )
 
         model.openRequiredPermissionSettings()
@@ -152,7 +158,8 @@ final class AutoReplyViewModelTests: XCTestCase {
             sessionLock: FakeAutoReplyLock(acquireResult: true),
             permissionCheck: { true },
             screenRecordingPermissionCheck: { true },
-            permissionSettingsOpener: { openedPages.append($0); return true }
+            permissionSettingsOpener: { openedPages.append($0); return true },
+            axNotificationListener: FakeAXNotificationListener()
         )
 
         model.openRequiredPermissionSettings()
@@ -166,7 +173,8 @@ final class AutoReplyViewModelTests: XCTestCase {
         let model = AutoReplyViewModel(
             runtime: runtime,
             sessionLock: FakeAutoReplyLock(acquireResult: true),
-            permissionCheck: { true }, screenRecordingPermissionCheck: { true }
+            permissionCheck: { true }, screenRecordingPermissionCheck: { true },
+            axNotificationListener: FakeAXNotificationListener()
         )
 
         XCTAssertFalse(model.isRunning)
@@ -183,6 +191,7 @@ final class AutoReplyViewModelTests: XCTestCase {
             runtime: runtime,
             sessionLock: lock,
             permissionCheck: { false },
+            axNotificationListener: FakeAXNotificationListener(),
             permissionPrompt: { promptCount.increment(); return false }
         )
 
@@ -200,7 +209,8 @@ final class AutoReplyViewModelTests: XCTestCase {
         let model = AutoReplyViewModel(
             runtime: runtime,
             sessionLock: FakeAutoReplyLock(acquireResult: false),
-            permissionCheck: { true }, screenRecordingPermissionCheck: { true }
+            permissionCheck: { true }, screenRecordingPermissionCheck: { true },
+            axNotificationListener: FakeAXNotificationListener()
         )
 
         model.start()
@@ -214,7 +224,8 @@ final class AutoReplyViewModelTests: XCTestCase {
         let runtime = FakeAutoReplyRuntime()
         let lock = FakeAutoReplyLock(acquireResult: true)
         let model = AutoReplyViewModel(
-            runtime: runtime, sessionLock: lock, permissionCheck: { true }, screenRecordingPermissionCheck: { true }
+            runtime: runtime, sessionLock: lock, permissionCheck: { true }, screenRecordingPermissionCheck: { true },
+            axNotificationListener: FakeAXNotificationListener()
         )
 
         model.start()
@@ -231,7 +242,8 @@ final class AutoReplyViewModelTests: XCTestCase {
         let model = AutoReplyViewModel(
             runtime: runtime,
             sessionLock: FakeAutoReplyLock(acquireResult: true),
-            permissionCheck: { true }, screenRecordingPermissionCheck: { true }
+            permissionCheck: { true }, screenRecordingPermissionCheck: { true },
+            axNotificationListener: FakeAXNotificationListener()
         )
 
         model.viewAppeared()
@@ -249,7 +261,8 @@ final class AutoReplyViewModelTests: XCTestCase {
                 homeDirectory: URL(fileURLWithPath: "/tmp/pdd-candidate-home", isDirectory: true)
             ),
             sessionLock: FakeAutoReplyLock(acquireResult: true),
-            permissionCheck: { true }, screenRecordingPermissionCheck: { true }
+            permissionCheck: { true }, screenRecordingPermissionCheck: { true },
+            axNotificationListener: FakeAXNotificationListener()
         )
 
         model.viewAppeared()
@@ -265,7 +278,8 @@ final class AutoReplyViewModelTests: XCTestCase {
         let model = AutoReplyViewModel(
             runtime: runtime,
             sessionLock: lock,
-            permissionCheck: { true }, screenRecordingPermissionCheck: { true }
+            permissionCheck: { true }, screenRecordingPermissionCheck: { true },
+            axNotificationListener: FakeAXNotificationListener()
         )
         model.viewAppeared()
 
@@ -310,7 +324,8 @@ final class AutoReplyViewModelTests: XCTestCase {
         let model = AutoReplyViewModel(
             runtime: runtime,
             sessionLock: FakeAutoReplyLock(acquireResult: true),
-            permissionCheck: { true }, screenRecordingPermissionCheck: { true }
+            permissionCheck: { true }, screenRecordingPermissionCheck: { true },
+            axNotificationListener: FakeAXNotificationListener()
         )
 
         model.viewAppeared()
@@ -327,7 +342,8 @@ final class AutoReplyViewModelTests: XCTestCase {
         let model = AutoReplyViewModel(
             runtime: runtime,
             sessionLock: FakeAutoReplyLock(acquireResult: true),
-            permissionCheck: { true }, screenRecordingPermissionCheck: { true }
+            permissionCheck: { true }, screenRecordingPermissionCheck: { true },
+            axNotificationListener: FakeAXNotificationListener()
         )
 
         runtime.currentUIOwner = "capture:GZC-000001"
@@ -346,6 +362,7 @@ final class AutoReplyViewModelTests: XCTestCase {
             runtime: FakeAutoReplyRuntime(),
             sessionLock: FakeAutoReplyLock(acquireResult: true),
             permissionCheck: { true }, screenRecordingPermissionCheck: { true },
+            axNotificationListener: FakeAXNotificationListener(),
             runIntentStore: intent
         )
 
@@ -369,6 +386,7 @@ final class AutoReplyViewModelTests: XCTestCase {
             identity: identity,
             sessionLock: FakeAutoReplyLock(acquireResult: true),
             permissionCheck: { true }, screenRecordingPermissionCheck: { true },
+            axNotificationListener: FakeAXNotificationListener(),
             runIntentStore: intent
         )
 

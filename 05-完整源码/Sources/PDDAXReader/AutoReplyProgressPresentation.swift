@@ -121,14 +121,12 @@ enum AutoReplyProgressPresentation {
     }
 
     static func jobStageName(_ job: AutoReplyJob) -> String {
+        if job.deliveryOutcome == .uncertain { return stageName(.uncertain) }
         if job.omittedAt != nil {
             return BilingualText.lines("已省略 · 客户不可见超过10分钟", "Omitted · customer absent for 10 minutes")
         }
         if job.state == .ready, job.customerMissingSince != nil {
             return BilingualText.lines("客户暂不在会话列表，连续10分钟后省略", "Customer absent; reply expires after 10 continuous minutes")
-        }
-        if job.state == .completed, job.deliveryOutcome == .uncertain {
-            return BilingualText.lines("已完成 · 发送结果不确定（不会自动重发）", "Completed · send result uncertain (will not resend automatically)")
         }
         if job.state == .quarantined {
             return BilingualText.lines("revision \(job.customerRevision) 已停放（第 \(job.stageAttempt) 次失败，不阻塞其他用户）", "Revision \(job.customerRevision) parked (failure \(job.stageAttempt); other users are not blocked)")

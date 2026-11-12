@@ -11,6 +11,17 @@ protocol PDDLiveConversationTransferring: AnyObject {
 @MainActor
 protocol PDDTransferClicking: AnyObject {
     func click(at point: CGPoint) throws
+    func hover(at point: CGPoint) throws
+}
+
+extension PDDTransferClicking {
+    func hover(at point: CGPoint) throws {}
+}
+
+/// Only a failure before any transfer control was invoked permits automatic retry.
+struct PDDTransferPrecommitError: LocalizedError {
+    let detail: String
+    var errorDescription: String? { detail }
 }
 
 enum PDDConversationTransferError: LocalizedError {
@@ -67,9 +78,14 @@ final class PDDAXConversationTransferer: PDDLiveConversationTransferring {
 
     private func transferToAfterSales(uid: String, lease: UIOperationLease) async throws -> AutoReplyTransferResult {
         try lease.validate()
-        try await backend.prepareForeground()
-        try lease.validate()
-        var tree = try await opener.openAndResolve(uid: uid)
+        var tree: PDDAXSemanticTree
+        do {
+            try await backend.prepareForeground()
+            try lease.validate()
+            tree = try await opener.openAndResolve(uid: uid)
+        }
+        catch is CancellationError { throw CancellationError() }
+        catch { throw PDDTransferPrecommitError(detail: error.localizedDescription) }
         try lease.validate()
 
         if !PDDAXControlSelection.isTransferDialogVisible(in: tree.nodes) {
@@ -248,6 +264,11 @@ final class PDDAXConversationTransferer: PDDLiveConversationTransferring {
 
 @MainActor
 final class CGEventPDDTransferClicker: PDDTransferClicking {
+    func hover(at point: CGPoint) throws {
+        guard let event = CGEvent(mouseEventSource: nil, mouseType: .mouseMoved,
+            mouseCursorPosition: point, mouseButton: .left) else { throw PDDConversationTransferError.clickFailed }
+        event.post(tap: .cghidEventTap)
+    }
     func click(at point: CGPoint) throws {
         guard let moved = CGEvent(mouseEventSource: nil, mouseType: .mouseMoved,
                                  mouseCursorPosition: point, mouseButton: .left), let down = CGEvent(

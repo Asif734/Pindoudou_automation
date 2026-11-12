@@ -768,6 +768,39 @@ final class AutoReplySchedulerTests: XCTestCase {
         XCTAssertNotNil(tasks[0]["sourceJobID"] as? String)
     }
 
+    func testProvenPrecommitTransferFailureRetriesAfterCooldownWhileOtherCustomerCompletes() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let clock = SchedulerTestClock(Date(timeIntervalSince1970: 100))
+        let driver = ControlledAutoReplyDriver(capturesByUID: ["PDD-transfer": [["我要人工客服"]], "PDD-other": [["你好"]]])
+        driver.discoveries = [.init(uid: "PDD-transfer", hasUnreadEvidence: true), .init(uid: "PDD-other", hasUnreadEvidence: true)]
+        driver.transferPrecommitFailures = 1
+        let store = AutoReplyStore(rootDirectory: root)
+        let scheduler = try AutoReplyScheduler(driver: driver, generator: TransferAwareReplyGenerator(), store: store,
+            configuredMaximumConcurrentGenerations: 2, availableMemoryBytes: { 64 << 30 }, now: { clock.value })
+        scheduler.start(); defer { scheduler.stop() }
+        for _ in 0..<100 {
+            await scheduler.tick()
+            if try store.load().transferTasks.first?.nextAttemptAt != nil,
+               driver.sentTexts.contains("回复:你好") { break }
+            try await Task.sleep(nanoseconds: 3_000_000)
+        }
+        let pending = try XCTUnwrap(store.load().transferTasks.first)
+        XCTAssertEqual(pending.state, .pending)
+        XCTAssertEqual(pending.nextAttemptAt, clock.value.addingTimeInterval(15))
+        XCTAssertEqual(driver.transferredUIDs, ["PDD-transfer"])
+        XCTAssertTrue(driver.sentTexts.contains("回复:你好"))
+        for _ in 0..<5 { await scheduler.tick() }
+        XCTAssertEqual(driver.transferredUIDs.count, 1)
+        clock.value = clock.value.addingTimeInterval(16)
+        for _ in 0..<20 {
+            await scheduler.tick()
+            if try store.load().transferTasks.first?.state == .completed { break }
+        }
+        XCTAssertEqual(try store.load().transferTasks.first?.state, .completed)
+        XCTAssertEqual(driver.transferredUIDs, ["PDD-transfer", "PDD-transfer"])
+    }
+
     func testFailedTransferIsIsolatedAndDoesNotStopOtherCustomers() async throws {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("pdd-transfer-isolated-failure-\(UUID().uuidString)")
@@ -2494,6 +2527,46 @@ final class AutoReplySchedulerTests: XCTestCase {
         XCTAssertEqual(f.driver.sendCallCount, 1)
     }
 
+    func testTrackedUncertainDeliveryIsReconciledWithoutAnotherSend() async throws {
+        let locator = PDDConversationLocator(nickname: "A***")
+        let uid = PDDConversationKey.make(locator: locator)
+        let clock = SchedulerTestClock(Date(timeIntervalSince1970: 100))
+        let f = try SchedulerFixture(capturesByUID: [uid: [["A"]]], now: { clock.value })
+        defer { f.scheduler.stop() }
+        f.driver.supportsTextDeliveryTracking = true
+        f.driver.visibleLocators = [locator]
+        f.driver.discoveries = [.init(uid: uid, hasUnreadEvidence: true)]
+        f.driver.deliveryResults = [.uncertain("click outcome unknown")]
+        await f.runUntilCompletedJobs(1)
+        XCTAssertEqual(f.scheduler.jobs.first?.deliveryOutcome, .uncertain)
+        f.driver.reconciliationResults = [.sent(serviceMessageID: "middlePanel_list_confirmed")]
+        clock.value += 20
+        await f.runTicks(20)
+        XCTAssertEqual(f.scheduler.jobs.first?.deliveryOutcome, .sent)
+        XCTAssertEqual(f.driver.sendCallCount, 1)
+        XCTAssertEqual(f.driver.reconciliationCalls, 1)
+        XCTAssertNotNil(try CustomerMessageReceipts(root: f.root).receipts(uid: uid)["A"]?.replySentAt)
+    }
+
+    func testTrackedPreSendCancellationRetainsReplyWithoutAdvancingCustomer() async throws {
+        let uid = "GZC-000001"
+        let f = try SchedulerFixture(capturesByUID: [uid: [["A"]]])
+        defer { f.scheduler.stop() }
+        f.driver.supportsTextDeliveryTracking = true
+        f.driver.discoveries = [.init(uid: uid, hasUnreadEvidence: true)]
+        f.driver.sendError = CancellationError()
+        await f.runTicks(12)
+        let work = try XCTUnwrap(f.scheduler.jobs.first)
+        XCTAssertEqual(work.state, .ready)
+        XCTAssertEqual(work.deliveryOutcome, .notSent)
+        XCTAssertFalse(work.sendWasInvoked)
+        XCTAssertEqual(f.scheduler.answeredCursor(uid).count, 0)
+        XCTAssertEqual(f.driver.sendCallCount, 1)
+        XCTAssertNotNil(work.reply)
+        XCTAssertNotNil(work.nextAttemptAt)
+        XCTAssertEqual(try PDDTextDeliveryAttemptStore(root: f.root).load(work.id)?.stage, .prepared)
+    }
+
     func testSendRuntimeErrorAfterInvocationCompletesUncertainAndNeverRetries() async throws {
         let uid = "GZC-000001"
         let f = try SchedulerFixture(capturesByUID: [uid: [["A"]]])
@@ -3070,6 +3143,15 @@ private func makeVideoCapture(
 
 @MainActor
 private final class ControlledAutoReplyDriver: AutoReplyAutomationDriver {
+    var supportsTextDeliveryTracking = false
+    var reconciliationResults: [AutoReplyDeliveryResult] = []
+    var reconciliationCalls = 0
+    func reconcileTextDelivery(uid: String, text: String, deliveryID: UUID,
+        expectedCustomerMessageIDs: Set<String>, lease: UIOperationLease) async throws -> AutoReplyDeliveryResult {
+        try lease.validate()
+        reconciliationCalls += 1
+        return reconciliationResults.isEmpty ? .uncertain("waiting") : reconciliationResults.removeFirst()
+    }
     var visibleLocators: [PDDConversationLocator]?
     func visibleConversationsSnapshot() -> [PDDConversationLocator]? { visibleLocators }
     var sentOutgoingImages: [[DatasetReplyImage]] = []
@@ -3090,6 +3172,7 @@ private final class ControlledAutoReplyDriver: AutoReplyAutomationDriver {
     var deliveryResults: [AutoReplyDeliveryResult] = []
     var sentExpectedCustomerMessageIDs: [Set<String>] = []
     var transferResults: [AutoReplyTransferResult] = []
+    var transferPrecommitFailures = 0
     var unexpectedServiceMessageIDsByUID: [String: [String]] = [:]
     var baselineCustomerCountByUID: [String: Int] = [:]
     var serviceMessageIDsByUID: [String: [String]] = [:]
@@ -3225,6 +3308,10 @@ private final class ControlledAutoReplyDriver: AutoReplyAutomationDriver {
     ) async throws -> AutoReplyTransferResult {
         try lease.validate()
         transferredUIDs.append(uid)
+        if transferPrecommitFailures > 0 {
+            transferPrecommitFailures -= 1
+            throw PDDTransferPrecommitError(detail: "chat history not loaded; no controls invoked")
+        }
         return transferResults.isEmpty
             ? .transferred(agentLabel: "任意客服")
             : transferResults.removeFirst()

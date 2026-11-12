@@ -204,7 +204,7 @@ struct AutoReplyView: View {
                     HStack {
                         Text(job.uid).font(.headline)
                         Text(AutoReplyProgressPresentation.jobStageName(job)).font(.caption).foregroundStyle(
-                            job.state == .uncertain ? .red : .secondary
+                            job.state == .uncertain || job.deliveryOutcome == .uncertain ? .orange : .secondary
                         )
                         Spacer()
                         Text("#\(job.sequence)").font(.caption.monospacedDigit())

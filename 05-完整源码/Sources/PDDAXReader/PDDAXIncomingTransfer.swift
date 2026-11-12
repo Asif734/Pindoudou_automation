@@ -37,6 +37,7 @@ enum PDDAXIncomingTransfer {
     struct Record {
         let handoff: Handoff
         let hasServiceReply: Bool
+        let serviceReplyIDs: Set<String>
         let identityBoundaryKey: String?
     }
 
@@ -142,6 +143,7 @@ enum PDDAXIncomingTransfer {
             priorCustomerIDs: before.filter { $0.sender == .customer }.map(\.id),
             currentCustomerIDs: after.filter { $0.sender == .customer }.map(\.id)
         ), hasServiceReply: after.contains { $0.sender == .service },
+           serviceReplyIDs: Set(after.filter { $0.sender == .service }.map(\.id)),
            identityBoundaryKey: stableMarker || !before.isEmpty ? boundaryKey : nil)
     }
 

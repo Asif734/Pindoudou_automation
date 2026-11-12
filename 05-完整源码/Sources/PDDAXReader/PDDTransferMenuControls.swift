@@ -321,6 +321,15 @@ final class PDDTransferMenuSubmitter: PDDTransferMenuSubmitting {
             }
             saveLookupFailure(uid: uid, phase: "send", attempt: attempt,
                 anchor: anchor, nodes: current.nodes, lines: lines)
+            // A mouse click can occur before Chromium applies its hover state.
+            // Re-arm only the freshly recognized reason, then observe a NEW tree
+            // and screenshot. Never relax alignment to a footer/composer Send.
+            if let reason = PDDTransferMenuControls.reasonControl(in: lines, anchor: anchor) {
+                try lease.validate()
+                try clicker.hover(at: .init(x: reason.midX, y: reason.midY))
+                log(uid: uid, step: "transfer-reason-hover-rearmed", route: "fresh-menu-reason", rect: reason)
+                try await sleep(0.2)
+            }
         }
         throw PDDAXSelectionError.missing("无原因直接转移同一行的发送按钮")
     }

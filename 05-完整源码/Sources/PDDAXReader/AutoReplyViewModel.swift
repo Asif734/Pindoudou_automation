@@ -142,7 +142,7 @@ final class AutoReplyViewModel: ObservableObject {
         self.diskHealthChecker = diskHealthChecker
         self.startupPrewarm = startupPrewarm
         self.compatibilityCheck = compatibilityCheck
-        self.axNotificationListener = axNotificationListener ?? AXNotificationWakeup()
+        self.axNotificationListener = axNotificationListener ?? AXNotificationWakeup(logRoot: identity.dataRoot)
         self.runtime.onStateChange = { [weak self] in self?.refreshSnapshot() }
         self.axNotificationListener.callback = { [weak runtime] in
             runtime?.requestAXRefresh()
@@ -177,10 +177,10 @@ final class AutoReplyViewModel: ObservableObject {
             let backend = LivePDDAXBackend()
             let detector = PDDLiveUnreadEvidenceDetector(requireConversationRows: true)
             let tree = try backend.readSemanticTree()
-            let unread = try await detector.unreadRows(in: tree)
             // Repair only independently proven aliases in the already open
             // thread. The read-only check still never opens, generates or sends.
             try runtime.reconcileVisibleIdentity(in: tree)
+            let unread = try await detector.unreadRows(in: tree)
             refreshSnapshot()
             if unread.isEmpty {
                 status = BilingualText.lines("会话列表已读取，未匹配到客户未读红点。未发送消息。", "Conversation list read successfully; no customer unread marker matched. No message sent.")

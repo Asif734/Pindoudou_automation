@@ -2,6 +2,27 @@ import XCTest
 @testable import PDDAXReader
 
 final class AutoReplyTransactionalStoreTests: XCTestCase {
+    func testPendingDeliveryReconciliationSurvivesTerminalHistoryCompaction() throws {
+        let fixture = try Fixture()
+        defer { fixture.cleanup() }
+        var state = AutoReplyPersistentState.empty
+        var pending = fixture.job(sequence: 1, state: .completed)
+        pending.deliveryOutcome = .uncertain
+        pending.nextAttemptAt = Date()
+        pending.reply = "reply"
+        state.jobs = [pending] + (2...210).map { sequence in
+            var terminal = fixture.job(sequence: 2, state: .completed)
+            terminal.sequence = sequence
+            return terminal
+        }
+        try AutoReplyStore(rootDirectory: fixture.root).save(state)
+        let checkpoint = try fixture.store.loadCheckpoint()
+        _ = try fixture.store.commit(expected: checkpoint.token) { _ in }
+        let saved = try fixture.store.loadCheckpoint().state
+        XCTAssertTrue(saved.jobs.contains { $0.id == pending.id })
+        XCTAssertEqual(saved.jobs.count, 201)
+    }
+
     func testCommitRejectsExternallyModifiedCheckpoint() throws {
         let fixture = try Fixture()
         defer { fixture.cleanup() }

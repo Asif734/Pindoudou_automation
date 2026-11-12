@@ -20,6 +20,10 @@ enum AutoReplyTransferResult: Equatable, Sendable {
 
 @MainActor
 protocol AutoReplyAutomationDriver: AnyObject {
+    var supportsTextDeliveryTracking: Bool { get }
+    func reconcileTextDelivery(uid: String, text: String, deliveryID: UUID,
+        expectedCustomerMessageIDs: Set<String>, lease: UIOperationLease) async throws -> AutoReplyDeliveryResult
+    func acknowledgeDiscoveryCapture(_ capture: AutoReplyCapture) throws
     func reconcileVisibleIdentity(in tree: PDDAXSemanticTree) throws
     func visibleConversationsSnapshot() -> [PDDConversationLocator]?
     func send(uid: String, text: String, outgoingImages: [DatasetReplyImage], deliveryID: UUID,
@@ -85,6 +89,12 @@ protocol AutoReplyAutomationDriver: AnyObject {
 }
 
 extension AutoReplyAutomationDriver {
+    var supportsTextDeliveryTracking: Bool { false }
+    func reconcileTextDelivery(uid: String, text: String, deliveryID: UUID,
+        expectedCustomerMessageIDs: Set<String>, lease: UIOperationLease) async throws -> AutoReplyDeliveryResult {
+        .uncertain("驱动未提供发送凭据核对")
+    }
+    func acknowledgeDiscoveryCapture(_ capture: AutoReplyCapture) throws {}
     func reconcileVisibleIdentity(in tree: PDDAXSemanticTree) throws {}
     func visibleConversationsSnapshot() -> [PDDConversationLocator]? { nil }
     func send(uid: String, text: String, outgoingImages: [DatasetReplyImage], deliveryID: UUID,
@@ -671,6 +681,12 @@ final class AutoReplyScheduler: ObservableObject {
                     }
                     return
                 }
+                if lane == 0, let index = nextDeliveryReconciliationIndex() {
+                    nextWorkLane = 1
+                    workTurnsSinceDiscovery += 1
+                    try await reconcileDelivery(at: index)
+                    return
+                }
                 if lane == 1, let transferIndex = nextPendingTransferTaskIndex() {
                     nextWorkLane = 2
                     workTurnsSinceDiscovery += 1
@@ -908,6 +924,48 @@ final class AutoReplyScheduler: ObservableObject {
         }
     }
 
+    private func nextDeliveryReconciliationIndex() -> Int? {
+        guard driver.supportsTextDeliveryTracking, let visible = driver.visibleConversationsSnapshot() else { return nil }
+        return state.jobs.indices.first {
+            let job = state.jobs[$0]
+            return job.state == .completed && job.deliveryOutcome == .uncertain && job.outgoingImages.isEmpty
+                && (job.nextAttemptAt.map { $0 <= now() } ?? false)
+                && customerIsVisible(job.uid, in: visible) == true
+        }
+    }
+
+    private func reconcileDelivery(at index: Int) async throws {
+        let job = state.jobs[index]
+        guard let reply = job.reply, let batch = job.capture.batch else { return }
+        state.jobs[index].nextAttemptAt = now().addingTimeInterval(60)
+        try persist(sendCritical: true)
+        do {
+            let result = try await performUI(stage: "delivery-reconcile", uid: job.uid) { driver, lease in
+                try await driver.reconcileTextDelivery(uid: job.uid, text: reply, deliveryID: job.id,
+                    expectedCustomerMessageIDs: Set(batch.events.map(\.messageID)), lease: lease)
+            }
+            if case .sent(let id) = result {
+                state.jobs[index].deliveryOutcome = .sent
+                state.jobs[index].confirmedServiceMessageID = id
+                state.jobs[index].nextAttemptAt = nil
+                state.jobs[index].lastError = nil
+                try CustomerMessageReceipts(root: store.rootDirectory).replied(job.capture, at: now())
+                state.confirmedAutoReplyMessageIDsByUID[job.uid, default: []].insert(id)
+                if let boundary = batch.incomingHandoffKey {
+                    try await CustomerTransferPolicyStore.shared.acknowledgeIncomingReply(root: store.rootDirectory,
+                        uid: job.uid, boundaryKey: boundary)
+                }
+                markProvisionalReceiptsAnswered(in: batch, uid: job.uid)
+                try transactionalStore.archiveTerminal(state.jobs[index])
+                appendEvent(uid: job.uid, kind: "reply-delivery-reconciled", detail: "job=\(job.id) message=\(id)")
+            }
+        } catch {
+            appendEvent(uid: job.uid, kind: "reply-delivery-reconciliation-deferred", detail: error.localizedDescription)
+        }
+        syncJobs()
+        try persist(sendCritical: true)
+    }
+
     private func nextReadyJobIndex() -> Int? {
         guard deliveryEnabled, !realDeliveryPausedForPersistence else { return nil }
         return state.jobs.indices
@@ -1040,6 +1098,7 @@ final class AutoReplyScheduler: ObservableObject {
         guard deliveryEnabled, !realDeliveryPausedForPersistence else { return nil }
         return state.transferTasks.indices
             .filter { state.transferTasks[$0].state == .pending }
+            .filter { state.transferTasks[$0].nextAttemptAt.map { $0 <= now() } ?? true }
             .filter { !PDDConversationIdentityStore.isSharedVisitorUID(state.transferTasks[$0].uid) }
             .filter { taskIndex in
                 state.jobs.first(where: {
@@ -1060,6 +1119,12 @@ final class AutoReplyScheduler: ObservableObject {
             result = try await performUI(stage: "transfer", uid: task.uid) { driver, lease in
                 try await driver.transferToAnyHuman(uid: task.uid, lease: lease)
             }
+        } catch let error as PDDTransferPrecommitError {
+            state.transferTasks[index].nextAttemptAt = now().addingTimeInterval(15)
+            appendEvent(uid: task.uid, kind: "transfer-precommit-retry-deferred",
+                detail: "No transfer control invoked; retry_in=15s; other customers continue; \(error.localizedDescription)")
+            try persist()
+            return
         } catch {
             state.transferTasks[index].state = .failed
             appendEvent(
@@ -1132,6 +1197,25 @@ final class AutoReplyScheduler: ObservableObject {
         guard state.jobs.indices.contains(index), state.jobs[index].state == .sending else {
             return
         }
+        do {
+            if driver.supportsTextDeliveryTracking, state.jobs[index].outgoingImages.isEmpty {
+                let attempts = PDDTextDeliveryAttemptStore(root: store.rootDirectory)
+                if try attempts.load(state.jobs[index].id)?.mayHaveSent != true {
+                    try attempts.save(.init(uid: uid, replySHA256: PDDTextDeliveryAttempt.hash(reply),
+                        stage: .prepared, updatedAt: now()), id: state.jobs[index].id)
+                }
+            }
+        } catch {
+            state.jobs[index].state = .ready
+            state.jobs[index].deliveryOutcome = .notSent
+            state.jobs[index].sendWasInvoked = false
+            state.jobs[index].durableAttemptOperationID = nil
+            state.jobs[index].nextAttemptAt = now().addingTimeInterval(15)
+            state.jobs[index].lastError = "发送凭据尚未保存；未执行发送，将重试"
+            syncJobs()
+            try persist(sendCritical: true)
+            return
+        }
         state.jobs[index].sendWasInvoked = true
         // Persist the follow-up scan before the send, so a crash cannot erase it.
         enqueueCapture(uid, kind: .tail, baseCursor: batch.endCursor)
@@ -1167,11 +1251,19 @@ final class AutoReplyScheduler: ObservableObject {
                 )
             }
         } catch {
-            try finalizeUncertainSend(
-                at: index,
-                batch: batch,
-                reason: "发送执行失败：\(error.localizedDescription)"
-            )
+            if outgoingImages.isEmpty, driver.supportsTextDeliveryTracking,
+               let attempt = try? PDDTextDeliveryAttemptStore(root: store.rootDirectory).load(deliveryID),
+               attempt.uid == uid, attempt.replySHA256 == PDDTextDeliveryAttempt.hash(reply), !attempt.mayHaveSent {
+                state.jobs[index].state = .ready
+                state.jobs[index].deliveryOutcome = .notSent
+                state.jobs[index].sendWasInvoked = false
+                state.jobs[index].durableAttemptOperationID = nil
+                state.jobs[index].nextAttemptAt = now().addingTimeInterval(5)
+                state.jobs[index].lastError = "发送前中断；未发送回复已保留"
+                appendEvent(uid: uid, kind: "reply-pre-send-interruption-retained", detail: "job=\(deliveryID)")
+            } else {
+                try finalizeUncertainSend(at: index, batch: batch, reason: "发送执行失败：\(error.localizedDescription)")
+            }
             syncJobs()
             try persist(sendCritical: true)
             return
@@ -1672,6 +1764,10 @@ final class AutoReplyScheduler: ObservableObject {
             ordinaryCaptureFailureCounts[uid] = nil
         }
         try CustomerMessageReceipts(root: store.rootDirectory).capture(rawCapture, at: now())
+        do { try driver.acknowledgeDiscoveryCapture(rawCapture) }
+        catch {
+            appendEvent(uid: uid, kind: "discovery-capture-ack-deferred", detail: error.localizedDescription)
+        }
         registerVideoHold(uid: uid, messageIDs: Set(rawCapture.batch?.events.filter { $0.kind == .video }.map(\.messageID) ?? []))
         appendEvent(uid: uid, kind: "customer-messages-captured",
             detail: "message_ids=\((rawCapture.batch?.customerMessageIDs ?? []).sorted().joined(separator: ","))")
@@ -2054,10 +2150,12 @@ final class AutoReplyScheduler: ObservableObject {
         state.jobs[index].state = .completed
         state.jobs[index].deliveryOutcome = .uncertain
         state.jobs[index].lastError = reason
-        state.jobs[index].nextAttemptAt = nil
-        markProvisionalReceiptsAnswered(in: batch, uid: uid)
+        let tracked = state.jobs[index].outgoingImages.isEmpty
+            && (try? PDDTextDeliveryAttemptStore(root: store.rootDirectory).load(state.jobs[index].id)) != nil
+        state.jobs[index].nextAttemptAt = tracked ? now().addingTimeInterval(15) : nil
         _ = state.advanceSourceAndPromoteSupplement(at: index)
-        try transactionalStore.archiveTerminal(state.jobs[index])
+        if !tracked { try transactionalStore.archiveTerminal(state.jobs[index]) }
+        appendEvent(uid: uid, kind: "reply-delivery-reconciliation-pending", detail: "job=\(state.jobs[index].id); no confirmed delivery receipt")
     }
 
     private func performUI<Value: Sendable>(

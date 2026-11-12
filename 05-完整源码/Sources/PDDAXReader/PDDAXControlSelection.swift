@@ -86,13 +86,16 @@ enum PDDAXControlSelection {
         }
     }
 
-    static func composer<ID: Hashable>(in nodes: [PDDAXSemanticNode<ID>]) throws -> ID {
+    static func composerCandidates<ID: Hashable>(in nodes: [PDDAXSemanticNode<ID>]) -> [PDDAXSemanticNode<ID>] {
         let index = Dictionary(uniqueKeysWithValues: nodes.map { ($0.id, $0) })
-        let candidates = nodes.filter { node in
+        return nodes.filter { node in
             node.role == "AXTextArea" && node.isSettable
                 && hasAncestor(node, in: index, matching: isChatContainer)
         }
-        return try uniqueID(candidates, name: "聊天输入框")
+    }
+
+    static func composer<ID: Hashable>(in nodes: [PDDAXSemanticNode<ID>]) throws -> ID {
+        try uniqueID(composerCandidates(in: nodes), name: "聊天输入框")
     }
 
     static func sendControl<ID: Hashable>(in nodes: [PDDAXSemanticNode<ID>]) throws -> ID {

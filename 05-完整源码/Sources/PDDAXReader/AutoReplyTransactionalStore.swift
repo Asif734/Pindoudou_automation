@@ -68,11 +68,11 @@ final class AutoReplyTransactionalStore: @unchecked Sendable {
                 updated.events = Array(updated.events.suffix(100))
             }
             let active = updated.jobs.filter {
-                [.discovered, .capturing, .queued, .generating, .ready, .sending]
+                $0.requiresDeliveryReconciliation || [.discovered, .capturing, .queued, .generating, .ready, .sending]
                     .contains($0.state)
             }
             let terminal = updated.jobs.filter {
-                ![.discovered, .capturing, .queued, .generating, .ready, .sending]
+                !$0.requiresDeliveryReconciliation && ![.discovered, .capturing, .queued, .generating, .ready, .sending]
                     .contains($0.state)
             }.suffix(200)
             updated.jobs = (active + terminal).sorted { $0.sequence < $1.sequence }

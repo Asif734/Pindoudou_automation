@@ -278,6 +278,7 @@ private struct AutoReplyProgressJobCard: View {
     }
 
     private var color: Color {
+        if job.deliveryOutcome == .uncertain { return .orange }
         switch job.state {
         case .completed: return .green
         case .failed, .uncertain: return .red

@@ -186,6 +186,9 @@ struct AutoReplyJob: Codable, Equatable, Sendable, Identifiable {
     var state: AutoReplyJobState
     let capture: AutoReplyCapture
     var reply: String?
+    var requiresDeliveryReconciliation: Bool {
+        state == .completed && deliveryOutcome == .uncertain && nextAttemptAt != nil && outgoingImages.isEmpty
+    }
     var outgoingImages: [DatasetReplyImage] = []
     var generationDiagnostic: AutoReplyGenerationDiagnostic? = nil
     var deliveryOutcome: AutoReplyDeliveryOutcome?
@@ -346,6 +349,7 @@ struct AutoReplyTransferTask: Codable, Equatable, Sendable, Identifiable {
     let reason: CodexTransferReason
     var state: AutoReplyTransferTaskState
     let createdAt: Date
+    var nextAttemptAt: Date? = nil
 }
 
 struct AutoReplyEvent: Codable, Equatable, Sendable, Identifiable {

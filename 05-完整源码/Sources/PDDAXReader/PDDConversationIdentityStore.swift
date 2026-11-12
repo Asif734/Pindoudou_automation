@@ -55,6 +55,11 @@ struct PDDConversationIdentityStore {
     func canonicalUID(_ uid: String) throws -> String { try canonical(uid, in: load()) }
     func aliases() throws -> [String: String] { try load().aliases }
     func repairProof(uid: String) throws -> Set<String> { try load().repairProofs[uid] ?? [] }
+    func evidenceOwners(messageIDs: Set<String>, stableID: String?, boundary: String?) throws -> Set<String> {
+        let state = try load()
+        return try Set(matches(state, messageIDs: messageIDs, stableID: stableID, boundary: boundary)
+            .map { try canonical($0, in: state) })
+    }
     func owner(messageIDs: Set<String> = [], stableID: String? = nil, boundary: String? = nil) throws -> String? {
         let state = try load()
         let owners = try Set(matches(state, messageIDs: messageIDs, stableID: stableID, boundary: boundary).map { try canonical($0, in: state) })

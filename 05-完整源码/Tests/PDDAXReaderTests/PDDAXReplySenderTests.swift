@@ -269,6 +269,51 @@ final class PDDAXReplySenderTests: XCTestCase {
         XCTAssertEqual(opener.receivedExpectedMessageIDs, [["middlePanel_list_target"]])
     }
 
+    func testTrackedConfirmedDeliveryCannotPressSendTwice() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let tree = controlOnlyTree(uid: uid)
+        let backend = ReplyFakeBackend(trees: [tree], composerReadValues: ["", reply, reply, ""])
+        let sender = PDDAXReplySender(backend: backend, opener: ReplyFakeOpener(backend: backend),
+            pollIntervalNanoseconds: 0, logRoot: root)
+        let id = UUID()
+        let first = try await sender.send(uid: uid, text: reply, outgoingImages: [], deliveryID: id,
+            expectedCustomerCursor: .empty, expectedCustomerMessageIDs: [])
+        let second = try await sender.send(uid: uid, text: reply, outgoingImages: [], deliveryID: id,
+            expectedCustomerCursor: .empty, expectedCustomerMessageIDs: [])
+        guard case .sent = first else { return XCTFail("Expected confirmed send") }
+        XCTAssertEqual(first, second)
+        XCTAssertEqual(backend.pressSendCount, 1)
+        XCTAssertEqual(try PDDTextDeliveryAttemptStore(root: root).load(id)?.stage, .confirmed)
+    }
+
+    func testAmbiguousDeliveryOnlyObservesNewServiceBubbleAndNeverPresses() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        func service(_ id: String) -> AXNodeSnapshot {
+            .init(role: "AXGroup", attributes: [("AXDOMClassList", "[onemsg]"), ("AXDOMIdentifier", id)], children: [
+                .init(role: "AXGroup", attributes: [("AXDOMClassList", "[cs-item]")], children: [
+                    .init(role: "AXGroup", attributes: [("AXDOMClassList", "[msg-content-box]"), ("AXValue", reply)])])])
+        }
+        let old = "middlePanel_list_old", posted = "middlePanel_list_new"
+        let target = AXNodeSnapshot(role: "AXGroup", attributes: [("AXDOMClassList", "[onemsg]"), ("AXDOMIdentifier", "middlePanel_list_question")], children: [
+            .init(role: "AXGroup", attributes: [("AXDOMClassList", "[buyer-item]")], children: [
+                .init(role: "AXGroup", attributes: [("AXDOMClassList", "[msg-content-box]"), ("AXValue", "question")])])])
+        let backend = ReplyFakeBackend(trees: [controlOnlyTree(uid: uid, messages: [service(old), target])])
+        let sender = PDDAXReplySender(backend: backend, opener: ReplyFakeOpener(backend: backend),
+            pollIntervalNanoseconds: 0, logRoot: root)
+        let id = UUID(), store = PDDTextDeliveryAttemptStore(root: root)
+        try store.save(.init(uid: uid, replySHA256: PDDTextDeliveryAttempt.hash(reply), stage: .commitIntent,
+            baselineServiceIDs: [old], updatedAt: Date()), id: id)
+        let unresolved = try await sender.reconcileTextDelivery(uid: uid, text: reply, deliveryID: id, expectedCustomerMessageIDs: ["middlePanel_list_question"])
+        guard case .uncertain = unresolved else { return XCTFail("Old identical bubble is not this delivery") }
+        backend.trees = [controlOnlyTree(uid: uid, messages: [service(old), target, service(posted)])]
+        let resolved = try await sender.reconcileTextDelivery(uid: uid, text: reply, deliveryID: id, expectedCustomerMessageIDs: ["middlePanel_list_question"])
+        XCTAssertEqual(resolved, .sent(serviceMessageID: posted))
+        XCTAssertEqual(backend.pressSendCount, 0)
+        XCTAssertTrue(backend.setValues.isEmpty)
+    }
+
     private let uid = "GZC-000001"
     private let reply = "请重新插拔电源"
 

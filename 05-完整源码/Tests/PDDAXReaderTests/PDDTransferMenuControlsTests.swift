@@ -153,6 +153,35 @@ final class PDDTransferMenuControlsTests: XCTestCase {
         XCTAssertTrue(backend.pressed.isEmpty)
     }
 
+    func testRecordedHiddenMenuRearmsHoverBeforeAcceptingSameRowSend() async throws {
+        // 2026-11-12 live failure: reason at y=645; only footer/composer Send
+        // at y=692.5/864. Neither is authorized by the selected reason.
+        let backend = MenuBackend(nodes: dialog)
+        let reason = PDDOCRLine(text: "无原因直接转移", box: .init(x: 889, y: 645, width: 100, height: 16.3), confidence: 1)
+        let observed = [reason, line("催发货", x: 889, y: 444.5), line("换货问题", x: 889, y: 604.8),
+            line("发送", x: 1039, y: 692.5), line("发送", x: 1031.5, y: 864)]
+        XCTAssertNil(PDDTransferMenuControls.sendControl(in: observed, reason: reason.box))
+        let reader = MenuReader(); reader.results = [observed, observed]
+        let clicker = MenuClicker()
+        clicker.onHover = { reader.results = [observed + [self.line("发送", x: 1039, y: 645)]] }
+        let submitter = PDDTransferMenuSubmitter(backend: backend, clicker: clicker, reader: reader, sleep: { _ in })
+        try await submitter.submit(uid: "customer", anchor: .init(x: 967, y: 401, width: 24, height: 18), lease: lease())
+        XCTAssertEqual(clicker.hovers, [.init(x: 939, y: 653.15)])
+        XCTAssertEqual(clicker.points.count, 2)
+        XCTAssertEqual(clicker.points.last, .init(x: 1054, y: 655))
+        XCTAssertFalse(clicker.points.contains(.init(x: 1054, y: 702.5)))
+    }
+
+    func testRecordedMenuWithOnlyLowerSendNeverCommitsDespiteHoverRetries() async throws {
+        let backend = MenuBackend(nodes: dialog)
+        let reader = MenuReader(); reader.results = [menu(y: 645) + [line("发送", x: 1040, y: 692.5)]]
+        let clicker = MenuClicker()
+        let submitter = PDDTransferMenuSubmitter(backend: backend, clicker: clicker, reader: reader, sleep: { _ in })
+        do { try await submitter.submit(uid: "customer", anchor: anchor, lease: lease()); XCTFail("Lower Send remains unverified") } catch {}
+        XCTAssertEqual(clicker.points.count, 1)
+        XCTAssertEqual(clicker.hovers.count, 4)
+    }
+
     private func combinedMenu(rowY: CGFloat = 600, descriptionOnly: Bool = false,
                               childSend: Bool = false) -> [PDDAXSemanticNode<AXElementToken>] {
         // Real Chromium layout: a portal menu, other reasons, one merged text
@@ -262,6 +291,8 @@ final class PDDTransferMenuControlsTests: XCTestCase {
 }
 @MainActor private final class MenuClicker: PDDTransferClicking {
     var points: [CGPoint] = []; var onClick: (() -> Void)?
+    var hovers: [CGPoint] = []; var onHover: (() -> Void)?
+    func hover(at point: CGPoint) throws { hovers.append(point); onHover?() }
     func click(at point: CGPoint) throws { points.append(point); onClick?() }
 }
 @MainActor private final class MenuReader: PDDTransferMenuReading {

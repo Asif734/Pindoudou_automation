@@ -292,13 +292,17 @@ final class PDDConversationIdentityTests: XCTestCase {
         let root = temporary(); defer { try? FileManager.default.removeItem(at: root) }
         let clock = Clock()
         let visitor = tree("游客", ids: []); let healthy = tree("B***", ids: ["healthy"], activeRow: 4)
-        let backend = Backend([visitor, visitor, healthy, healthy, visitor, visitor])
+        let backend = Backend([visitor])
+        backend.readOverride = { backend.pressed.last?.rawValue == 4 ? healthy : visitor }
         let driver = PDDAXConversationDriver(backend: backend, chatStore: .init(rootDirectory: root), allowedUIDs: nil,
             unreadEvidence: Unread([.init(rowID: .init(rawValue: 2), visibleLabel: "游客"), .init(rowID: .init(rawValue: 4), visibleLabel: "B***")]), now: { clock.date })
         let unresolved = try await driver.discover()
         let resolved = try await driver.discover()
         XCTAssertTrue(unresolved.isEmpty)
-        XCTAssertNotNil(resolved.first)
+        let healthyUID = try XCTUnwrap(resolved.first?.uid)
+        let capture = try await driver.capture(uid: healthyUID, after: .empty)
+        try CustomerMessageReceipts(root: root).capture(capture)
+        try driver.acknowledgeDiscoveryCapture(capture)
         clock.date += 30
         let stillUnresolved = try await driver.discover()
         XCTAssertTrue(stillUnresolved.isEmpty)
@@ -412,8 +416,9 @@ final class PDDConversationIdentityTests: XCTestCase {
     private final class Clock: @unchecked Sendable { var date = Date(timeIntervalSince1970: 100) }
     private final class Backend: PDDAXBackend {
         var trees: [PDDAXSemanticTree]; var pressed: [AXElementToken] = []
+        var readOverride: (() -> PDDAXSemanticTree)?
         init(_ trees: [PDDAXSemanticTree]) { self.trees = trees }
-        func readSemanticTree() throws -> PDDAXSemanticTree { trees.count > 1 ? trees.removeFirst() : trees[0] }
+        func readSemanticTree() throws -> PDDAXSemanticTree { readOverride?() ?? (trees.count > 1 ? trees.removeFirst() : trees[0]) }
         func performPress(_ id: AXElementToken) throws { pressed.append(id) }
         func setValue(_ text: String, on id: AXElementToken) throws {}
         func value(of id: AXElementToken) throws -> String { "" }

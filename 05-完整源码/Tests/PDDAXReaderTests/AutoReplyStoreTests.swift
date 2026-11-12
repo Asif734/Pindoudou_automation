@@ -137,6 +137,55 @@ final class AutoReplyStoreTests: XCTestCase {
         XCTAssertNil(recovered.jobs[0].durableAttemptOperationID)
     }
 
+    func testDurablePreparedCheckpointMakesInterruptedInvocationRetryable() throws {
+        let fixture = try makeFixture()
+        defer { fixture.cleanup() }
+        var state = AutoReplyPersistentState.empty
+        var work = job(state: .sending, reply: "回复", digest: String(repeating: "9", count: 64), uid: fixture.uid)
+        work.sendWasInvoked = true
+        state.jobs = [work]
+        try fixture.store.save(state)
+        try PDDTextDeliveryAttemptStore(root: fixture.root).save(.init(uid: fixture.uid,
+            replySHA256: PDDTextDeliveryAttempt.hash("回复"), stage: .prepared, updatedAt: Date()), id: work.id)
+        let recovered = try fixture.store.loadRecoveringInterruptedWork(now: Date())
+        XCTAssertEqual(recovered.jobs[0].state, .ready)
+        XCTAssertEqual(recovered.jobs[0].deliveryOutcome, .notSent)
+        XCTAssertFalse(recovered.jobs[0].sendWasInvoked)
+        XCTAssertNil(recovered.answeredCursors[fixture.uid])
+    }
+
+    func testCorruptDeliveryCheckpointCannotStopAnotherJobsStartupRecovery() throws {
+        let fixture = try makeFixture()
+        defer { fixture.cleanup() }
+        var state = AutoReplyPersistentState.empty
+        var work = job(state: .sending, reply: "回复", digest: String(repeating: "9", count: 64), uid: fixture.uid)
+        work.sendWasInvoked = true
+        state.jobs = [work, job(state: .generating, reply: nil, digest: String(repeating: "8", count: 64), uid: "GZC-000002")]
+        try fixture.store.save(state)
+        let marker = fixture.root.appendingPathComponent("text-delivery-attempts/\(work.id.uuidString).json")
+        try FileManager.default.createDirectory(at: marker.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try Data("invalid-json".utf8).write(to: marker)
+        let recovered = try fixture.store.loadRecoveringInterruptedWork(now: Date())
+        XCTAssertEqual(recovered.jobs[0].deliveryOutcome, .uncertain)
+        XCTAssertEqual(recovered.jobs[1].state, .queued)
+    }
+
+    func testDurableCommitIntentAfterRestartSchedulesReadOnlyReconciliation() throws {
+        let fixture = try makeFixture()
+        defer { fixture.cleanup() }
+        var state = AutoReplyPersistentState.empty
+        var work = job(state: .sending, reply: "回复", digest: String(repeating: "9", count: 64), uid: fixture.uid)
+        work.sendWasInvoked = true
+        state.jobs = [work]
+        try fixture.store.save(state)
+        try PDDTextDeliveryAttemptStore(root: fixture.root).save(.init(uid: fixture.uid,
+            replySHA256: PDDTextDeliveryAttempt.hash("回复"), stage: .commitIntent, updatedAt: Date()), id: work.id)
+        let date = Date()
+        let recovered = try fixture.store.loadRecoveringInterruptedWork(now: date)
+        XCTAssertEqual(recovered.jobs[0].deliveryOutcome, .uncertain)
+        XCTAssertEqual(recovered.jobs[0].nextAttemptAt, date)
+    }
+
     func testInterruptedSendingAfterDriverInvocationCompletesUncertainAndAdvancesCursor() throws {
         let fixture = try makeFixture()
         defer { fixture.cleanup() }

@@ -43,6 +43,12 @@ final class LeaseValidatedPDDAXBackend: PDDAXBackend {
         self.gate = gate
     }
 
+    func requestAccessibilityRefresh() throws {
+        try gate.validate()
+        try base.requestAccessibilityRefresh()
+        try gate.validate()
+    }
+
     func readSemanticTree() throws -> PDDAXSemanticTree {
         try gate.validate()
         let result = try base.readSemanticTree()
