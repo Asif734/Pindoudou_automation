@@ -2,6 +2,26 @@ import XCTest
 @testable import PDDAXReader
 
 final class AutoReplyPromptBuilderTests: XCTestCase {
+    func testSocialRepliesAreWrittenByLLMWithoutKnowledgeAndActionConfirmationsRemainMeaningful() throws {
+        for text in ["hello", "OK", "thank you", "好的，谢谢", "OK, how do I replace the ribbon?"] {
+            let history = [message("current", .customer, .text, text)]
+            let timeline = try AutoReplyTimeline.make(messages: history)
+            let capture = AutoReplyCapture(uid: "customer", fullHistory: history,
+                batch: try timeline.freeze(after: .empty), customerCursor: timeline.cursor,
+                unexpectedServiceMessageIDs: [])
+            let plan = try HistoryContinuation.plan(capture: capture, after: nil)
+            for prompt in [try AutoReplyPromptBuilder.buildInitial(capture: capture, submission: plan),
+                           try AutoReplyPromptBuilder.buildContinuation(capture: capture, submission: plan)] {
+                XCTAssertTrue(prompt.contains("由 LLM 自行生成一句自然回应"))
+                XCTAssertTrue(prompt.contains("不匹配知识库答案，不调用文件工具"))
+                XCTAssertTrue(prompt.contains("不能误当作普通结束语"))
+                XCTAssertTrue(prompt.contains("含实际问题的消息仍需依照知识库回答"))
+                XCTAssertTrue(prompt.contains("最近50条消息"))
+                XCTAssertTrue(prompt.contains("不得读取本地聊天记录或旧会话"))
+            }
+        }
+    }
+
     func testIncomingHandoffRepliesUsingHistoryWithoutInventingNewCustomerIntent() throws {
         let history = [message("return", .customer, .text, "I want a seven-day no-reason return.")]
         let timeline = try AutoReplyTimeline.make(messages: history)

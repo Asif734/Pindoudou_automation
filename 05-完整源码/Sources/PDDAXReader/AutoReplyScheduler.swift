@@ -260,6 +260,7 @@ final class AutoReplyScheduler: ObservableObject {
     private var workTurnsSinceDiscovery = 0
     private var nextWorkLane = 0
     private var lastTurnWasTail = false
+    private var consecutiveSendTurns = 0
     private var lastDiscoveryAt = Date.distantPast
     private var pendingFastDiscoveryAttempts = 0
     private var ordinaryCaptureAuthorizations = Set<String>()
@@ -649,9 +650,39 @@ final class AutoReplyScheduler: ObservableObject {
                 || (workTurnsSinceDiscovery > 0 && now().timeIntervalSince(lastDiscoveryAt) >= 5) {
                 workTurnsSinceDiscovery = 0
                 state.consecutiveDeliveryCount = 0
+                consecutiveSendTurns = 0
                 try await performDiscovery()
                 try persist()
                 return
+            }
+
+            // Ready answers precede routine tail/reconciliation/capture work.
+            // After two send attempts, yield one maintenance turn when available.
+            if consecutiveSendTurns < 2, let index = nextReadyJobIndex() {
+                try await deliverPriorityReply(at: index)
+                return
+            }
+
+            if consecutiveSendTurns >= 2 {
+                if let index = nextPendingTransferTaskIndex() {
+                    consecutiveSendTurns = 0
+                    workTurnsSinceDiscovery += 1
+                    try await executeTransferTask(at: index)
+                    return
+                }
+                if let index = state.pendingCaptureRequests.firstIndex(where: {
+                    $0.kind == .ordinary && ordinaryCaptureAuthorizations.contains($0.uid)
+                        && !hasActiveJob(uid: $0.uid)
+                        && !PDDConversationIdentityStore.isSharedVisitorUID($0.uid)
+                        && ($0.nextAttemptAt.map { $0 <= now() } ?? true)
+                }) {
+                    let request = state.pendingCaptureRequests.remove(at: index)
+                    ordinaryCaptureAuthorizations.remove(request.uid)
+                    consecutiveSendTurns = 0
+                    workTurnsSinceDiscovery += 1
+                    try await capture(request: request)
+                    return
+                }
             }
 
             if !lastTurnWasTail, let index = state.pendingCaptureRequests.firstIndex(where: {
@@ -659,6 +690,7 @@ final class AutoReplyScheduler: ObservableObject {
                     && ($0.nextAttemptAt.map { $0 <= now() } ?? true)
             }) {
                 lastTurnWasTail = true
+                consecutiveSendTurns = 0
                 workTurnsSinceDiscovery += 1
                 let request = state.pendingCaptureRequests.remove(at: index)
                 try await capture(request: request)
@@ -670,31 +702,26 @@ final class AutoReplyScheduler: ObservableObject {
             for offset in 0..<3 {
                 let lane = (nextWorkLane + offset) % 3
                 if lane == 0, let readyIndex = nextReadyJobIndex() {
-                    nextWorkLane = 1
-                    workTurnsSinceDiscovery += 1
-                    try await deliverJob(at: readyIndex)
-                    if state.jobs.indices.contains(readyIndex),
-                       state.jobs[readyIndex].state == .completed,
-                       state.jobs[readyIndex].deliveryOutcome != nil {
-                        state.consecutiveDeliveryCount += 1
-                        try persist()
-                    }
+                    try await deliverPriorityReply(at: readyIndex)
                     return
                 }
                 if lane == 0, let index = nextDeliveryReconciliationIndex() {
                     nextWorkLane = 1
+                    consecutiveSendTurns = 0
                     workTurnsSinceDiscovery += 1
                     try await reconcileDelivery(at: index)
                     return
                 }
                 if lane == 1, let transferIndex = nextPendingTransferTaskIndex() {
                     nextWorkLane = 2
+                    consecutiveSendTurns = 0
                     workTurnsSinceDiscovery += 1
                     try await executeTransferTask(at: transferIndex)
                     return
                 }
                 if lane == 2, let request = nextSupplementCaptureRequest() ?? nextCaptureRequest() {
                     nextWorkLane = 0
+                    consecutiveSendTurns = 0
                     workTurnsSinceDiscovery += 1
                     try await capture(request: request)
                     return
@@ -966,6 +993,19 @@ final class AutoReplyScheduler: ObservableObject {
         try persist(sendCritical: true)
     }
 
+    private func deliverPriorityReply(at index: Int) async throws {
+        nextWorkLane = 1
+        consecutiveSendTurns += 1
+        workTurnsSinceDiscovery += 1
+        appendEvent(uid: state.jobs[index].uid, kind: "ready-reply-priority-selected", detail: "job=\(state.jobs[index].id)")
+        try await deliverJob(at: index)
+        if state.jobs.indices.contains(index), state.jobs[index].state == .completed,
+           state.jobs[index].deliveryOutcome != nil {
+            state.consecutiveDeliveryCount += 1
+            try persist()
+        }
+    }
+
     private func nextReadyJobIndex() -> Int? {
         guard deliveryEnabled, !realDeliveryPausedForPersistence else { return nil }
         return state.jobs.indices
@@ -974,6 +1014,7 @@ final class AutoReplyScheduler: ObservableObject {
             .filter { !PDDConversationIdentityStore.isSharedVisitorUID(state.jobs[$0].uid) }
             .filter { state.jobs[$0].customerMissingSince.map { now().timeIntervalSince($0) < 600 } ?? true }
             .filter { state.jobs[$0].nextAttemptAt.map { $0 <= now() } ?? true }
+            .filter { state.jobs[$0].deliveryNotBefore.map { $0 <= now() } ?? true }
             .filter { isHeadOfLine($0) }
             .min { state.jobs[$0].sequence < state.jobs[$1].sequence }
     }
@@ -1287,6 +1328,7 @@ final class AutoReplyScheduler: ObservableObject {
             _ = state.advanceSourceAndPromoteSupplement(at: index)
             try transactionalStore.archiveTerminal(state.jobs[index])
         case .failedBeforeSend(let reason):
+            if outgoingImages.isEmpty { removeUnnecessaryPreSendTail(uid: uid, cursor: batch.endCursor, deliveryID: deliveryID) }
             if state.jobs[index].replyAction == .replyThenTransfer {
                 state.jobs[index].state = .completed
                 state.jobs[index].deliveryOutcome = .notSent
@@ -1331,6 +1373,21 @@ final class AutoReplyScheduler: ObservableObject {
         }
         syncJobs()
         try persist(sendCritical: true)
+    }
+
+    private func removeUnnecessaryPreSendTail(uid: String, cursor: AutoReplyCursor, deliveryID: UUID) {
+        do {
+            if let attempt = try PDDTextDeliveryAttemptStore(root: store.rootDirectory).load(deliveryID) {
+                guard attempt.uid == uid, !attempt.mayHaveSent else { return }
+            }
+            let receipts = try CustomerMessageReceipts(root: store.rootDirectory).receipts(uid: uid)
+            guard !receipts.values.contains(where: { $0.requiresSubmission && $0.submittedAt == nil && $0.replySentAt == nil && $0.closedAt == nil }) else { return }
+            let count = state.pendingCaptureRequests.count
+            state.pendingCaptureRequests.removeAll { $0.uid == uid && $0.kind == .tail && $0.baseCursor == cursor }
+            if count != state.pendingCaptureRequests.count {
+                appendEvent(uid: uid, kind: "pre-send-tail-scan-released", detail: "No send executed and no uncaptured submission gap; delivery retry retained")
+            }
+        } catch { appendEvent(uid: uid, kind: "pre-send-tail-check-deferred", detail: error.localizedDescription) }
     }
 
     private func registerVideoHold(uid: String, messageIDs: Set<String>) {
@@ -1437,6 +1494,16 @@ final class AutoReplyScheduler: ObservableObject {
 
     @discardableResult
     private func launchQueuedGenerations() -> Bool {
+        let promoted = promoteCapturedFollowups()
+        // Disabled by request: a ready answer must keep its own delivery turn.
+        // New questions generate independently; never replace an existing reply.
+        // let replaced = coalesceKnownUnsentTextDrafts()
+        if promoted {
+            syncJobs()
+            do { try persist(sendCritical: true) }
+            catch { recordPersistenceFailure(error, sendCritical: true); return false }
+            archiveSupersededDrafts()
+        }
         coalesceQueuedVideoReplies()
         let queued = state.jobs.indices.filter { index in
             state.jobs[index].state == .queued
@@ -1445,7 +1512,7 @@ final class AutoReplyScheduler: ObservableObject {
                 && !generationWaitsForVideo(state.jobs[index])
                 && (state.jobs[index].customerMissingSince.map { now().timeIntervalSince($0) < 600 } ?? true)
                 && (state.jobs[index].nextAttemptAt.map { $0 <= now() } ?? true)
-                && isHeadOfLine(index)
+                && isHeadOfGeneration(index)
         }
         guard !queued.isEmpty else { return false }
         let dynamic = concurrencyPolicy.limit(
@@ -1461,7 +1528,9 @@ final class AutoReplyScheduler: ObservableObject {
 
         for index in queued.prefix(slots) {
             let id = state.jobs[index].id
-            let capture = state.jobs[index].capture
+            var capture = state.jobs[index].capture
+            capture.pendingReplyDrafts = unconfirmedDrafts(before: index)
+            state.jobs[index].capture = capture
             state.jobs[index].state = .generating
             appendEvent(uid: capture.uid, kind: "generation-dispatched", detail: "job=\(id)")
             liveGenerationJobIDs.insert(id)
@@ -1835,8 +1904,7 @@ final class AutoReplyScheduler: ObservableObject {
                 return
             }
             if capture.batch != nil {
-                if [.completed, .failed, .uncertain, .quarantined].contains(state.jobs[index].state),
-                   try reconcileInflightSupplementWithPromotedRevision(capture, from: index) {
+                if try reconcileInflightSupplementWithPromotedRevision(capture, from: index) {
                     state.jobs[index].supplementCapturePending = false
                     syncJobs()
                     try persist()
@@ -2442,9 +2510,14 @@ final class AutoReplyScheduler: ObservableObject {
                     deltaIDs.contains($0)
                 }
             )
-            let currentCount = state.jobs[index].pendingSupplement?.customerCursor.count ?? -1
-            if deltaCapture.customerCursor.count > currentCount {
-                state.jobs[index].pendingSupplement = deltaCapture
+            if state.jobs[index].state == .queued, deltaCapture.pendingVideoMessageIDs.isEmpty,
+               let joined = PDDVideoReplyBatch.joining([state.jobs[index].capture, deltaCapture]) {
+                updateQueuedCapture(at: index, capture: joined)
+            } else {
+                let currentCount = state.jobs[index].pendingSupplement?.customerCursor.count ?? -1
+                if deltaCapture.customerCursor.count > currentCount {
+                    state.jobs[index].pendingSupplement = deltaCapture
+                }
             }
             state.jobs[index].supplementCapturePending = false
             if [.completed, .failed, .uncertain, .quarantined].contains(state.jobs[index].state) {
@@ -2468,6 +2541,127 @@ final class AutoReplyScheduler: ObservableObject {
         }
         for event in deferred {
             await receiveVideoTransferEvent(event)
+        }
+    }
+
+    private func promoteCapturedFollowups() -> Bool {
+        var changed = false
+        for id in state.jobs.map(\.id) {
+            guard let index = state.jobs.firstIndex(where: { $0.id == id }),
+                  [.queued, .generating, .ready, .sending].contains(state.jobs[index].state),
+                  let pending = state.jobs[index].pendingSupplement, pending.batch != nil else { continue }
+            if state.jobs[index].state == .queued, pending.pendingVideoMessageIDs.isEmpty,
+               let joined = PDDVideoReplyBatch.joining([state.jobs[index].capture, pending]) {
+                updateQueuedCapture(at: index, capture: joined)
+                state.jobs[index].pendingSupplement = nil
+            } else {
+                do {
+                    if try reconcileInflightSupplementWithPromotedRevision(pending, from: index) {
+                        state.jobs[index].pendingSupplement = nil
+                    } else {
+                        _ = state.advanceSourceAndPromoteSupplement(at: index, advanceCursor: false, retainCaptureRequests: true)
+                    }
+                } catch {
+                    appendEvent(uid: state.jobs[index].uid, kind: "followup-generation-promotion-deferred", detail: error.localizedDescription)
+                    continue
+                }
+            }
+            changed = true
+            appendEvent(uid: state.jobs[index].uid, kind: "followup-generation-admitted", detail: "source=\(id); delivery completion not required; answered cursor unchanged")
+        }
+        return changed
+    }
+
+    private func updateQueuedCapture(at index: Int, capture: AutoReplyCapture) {
+        guard state.jobs[index].state == .queued else { return }
+        state.jobs[index].capture = capture
+        state.jobs[index].revision = (try? AutoReplyRevision.derived(from: capture, legacyOrdinal: state.jobs[index].customerRevision)) ?? state.jobs[index].revision
+        state.jobs[index].imageAttachments = capture.imageAttachments
+        state.jobs[index].videoAttachments = capture.videoAttachments
+    }
+
+    private func coalesceKnownUnsentTextDrafts() -> Bool {
+        var changed = false
+        for id in state.jobs.filter({ $0.state == .queued }).sorted(by: { $0.sequence < $1.sequence }).map(\.id) {
+            guard let next = state.jobs.firstIndex(where: { $0.id == id }),
+                  state.jobs[next].capture.batch?.incomingHandoffKey == nil else { continue }
+            let older = state.jobs.indices.filter {
+                state.jobs[$0].uid == state.jobs[next].uid && state.jobs[$0].sequence < state.jobs[next].sequence
+                    && state.jobs[$0].state == .ready
+            }
+            for previous in older {
+                let source = state.jobs[previous]
+                guard source.replyAction == .reply, source.reply?.isEmpty == false, source.capture.batch?.incomingHandoffKey == nil,
+                      source.capture.batch?.events.isEmpty == false,
+                      source.capture.batch?.events.allSatisfy({ $0.kind == .text }) == true,
+                      source.imageAttachments.isEmpty, source.videoAttachments.isEmpty,
+                      source.outgoingImages.isEmpty, !source.sendWasInvoked, source.confirmedServiceMessageID == nil,
+                      source.deliveryOutcome != .sent, source.deliveryOutcome != .uncertain,
+                      !state.transferTasks.contains(where: { $0.sourceJobID == source.id }),
+                      let joined = PDDVideoReplyBatch.joining([source.capture, state.jobs[next].capture]) else { continue }
+                do {
+                    let attempt = try PDDTextDeliveryAttemptStore(root: store.rootDirectory).load(source.id)
+                    if let attempt {
+                        guard attempt.uid == source.uid,
+                              attempt.replySHA256 == PDDTextDeliveryAttempt.hash(source.reply ?? ""),
+                              !attempt.mayHaveSent else { continue }
+                    }
+                } catch {
+                    appendEvent(uid: source.uid, kind: "draft-replacement-deferred", detail: "delivery checkpoint unreadable; \(error.localizedDescription)")
+                    continue
+                }
+                changed = true
+                updateQueuedCapture(at: next, capture: joined)
+                let cooldowns = [state.jobs[next].deliveryNotBefore, source.deliveryNotBefore, source.nextAttemptAt].compactMap { $0 }
+                state.jobs[next].deliveryNotBefore = cooldowns.max()
+                state.jobs[next].stageAttempt = max(state.jobs[next].stageAttempt, source.stageAttempt)
+                state.jobs[previous].state = .completed
+                state.jobs[previous].supersededByJobID = id
+                state.jobs[previous].deliveryOutcome = .notSent
+                state.jobs[previous].nextAttemptAt = nil
+                state.jobs[previous].pendingSupplement = nil
+                state.jobs[previous].supplementCapturePending = false
+                state.jobs[previous].lastError = "未发送草稿已并入较新的完整答复；未推进已回复游标"
+                appendEvent(uid: source.uid, kind: "unsent-draft-superseded", detail: "source=\(source.id) replacement=\(id); message coverage retained; sent=false")
+            }
+        }
+        return changed
+    }
+
+    private func archiveSupersededDrafts() {
+        for job in state.jobs where job.supersededByJobID != nil && job.reply != nil {
+            let path = store.rootDirectory.appendingPathComponent("archive/records/\(job.id.uuidString).json")
+            guard !FileManager.default.fileExists(atPath: path.path) else { continue }
+            do { try transactionalStore.archiveTerminal(job) }
+            catch { appendEvent(uid: job.uid, kind: "superseded-draft-archive-deferred", detail: error.localizedDescription) }
+        }
+    }
+
+    private func unconfirmedDrafts(before index: Int) -> [PendingReplyDraft]? {
+        let job = state.jobs[index]
+        let earlier = state.jobs.filter { $0.uid == job.uid && $0.sequence < job.sequence }
+        let immediatePredecessor = earlier.max { $0.sequence < $1.sequence }?.id
+        let prior = earlier.filter {
+            $0.reply?.isEmpty == false && ([.ready, .sending].contains($0.state)
+                || ($0.id == immediatePredecessor && $0.deliveryOutcome == .uncertain)
+                || $0.supersededByJobID == job.id)
+        }.sorted { $0.sequence < $1.sequence }
+        let head = prior.first { [.ready, .sending].contains($0.state) }
+        let selected = head.map { [$0] } ?? []
+        let rest = prior.filter { $0.id != head?.id }.suffix(head == nil ? 4 : 3)
+        let drafts = (selected + rest).map { PendingReplyDraft(jobID: $0.id,
+            messageIDs: Array($0.capture.batch?.customerMessageIDs ?? []).sorted(), text: $0.reply ?? "") }
+        return drafts.isEmpty ? nil : drafts
+    }
+
+    private func isHeadOfGeneration(_ index: Int) -> Bool {
+        let job = state.jobs[index]
+        guard !liveGenerationJobIDs.contains(where: { id in state.jobs.contains { $0.id == id && $0.uid == job.uid } }) else { return false }
+        return !state.jobs.indices.contains { other in
+            guard other != index, state.jobs[other].uid == job.uid else { return false }
+            let prior = state.jobs[other]
+            if prior.state == .generating { return true }
+            return prior.sequence < job.sequence && [.discovered, .capturing, .queued].contains(prior.state)
         }
     }
 

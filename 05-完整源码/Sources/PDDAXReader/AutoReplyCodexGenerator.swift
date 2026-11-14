@@ -70,7 +70,32 @@ struct AutoReplyCodexGenerator: AutoReplyGenerating, Sendable {
                 throw AutoReplyCodexGeneratorError.chatGPTLoginRequired
             }
         }
-        var enrichedCapture = capture
+        let activeBinding = try sessionRegistry.activeBinding(uid: capture.uid, now: now())
+        var enrichedCapture = HistoryContinuation.retainingRecentMedia(in: capture,
+            images: activeBinding?.historyCheckpoint?.contextImages ?? [],
+            videos: activeBinding?.historyCheckpoint?.contextVideos ?? [])
+        if let activeBinding, activeBinding.historyCheckpoint?.historyMessageLimit == nil {
+            // Upgrade only attachment metadata, never old chat text. Reading this
+            // snapshot is optional and cannot block an otherwise valid reply.
+            struct MediaSnapshot: Decodable {
+                struct Job: Decodable {
+                    struct Capture: Decodable {
+                        let imageAttachments: [AutoReplyImageAttachment]?
+                        let videoAttachments: [AutoReplyVideoAttachment]?
+                    }
+                    let uid: String
+                    let capture: Capture
+                }
+                let jobs: [Job]
+            }
+            if let data = try? Data(contentsOf: sessionRegistry.rootDirectory.appendingPathComponent("state.json")),
+               let snapshot = try? JSONDecoder().decode(MediaSnapshot.self, from: data) {
+                let ownJobs = snapshot.jobs.filter { $0.uid == capture.uid }
+                enrichedCapture = HistoryContinuation.retainingRecentMedia(in: enrichedCapture,
+                    images: ownJobs.flatMap { $0.capture.imageAttachments ?? [] },
+                    videos: ownJobs.flatMap { $0.capture.videoAttachments ?? [] })
+            }
+        }
         let evidence = await evidencePreparer.prepare(capture: capture)
         enrichedCapture.knowledgeEvidence = evidence
         AutomationStepLog.record(root: sessionRegistry.rootDirectory, uid: capture.uid,
@@ -79,7 +104,7 @@ struct AutoReplyCodexGenerator: AutoReplyGenerating, Sendable {
         let knowledgeSHA256 = evidence.diagnostic.knowledgeBaseSHA256
 
         var retriedAfterContinuationFailure = false
-        if let binding = try sessionRegistry.activeBinding(uid: capture.uid, now: now()) {
+        if let binding = activeBinding {
             let legacyCheckpoint = binding.historyCheckpoint?.requiresFullHistoryContinuation == true
             let directKnowledgeCompatible = evidence.mode != .directLocal
                 || (binding.knowledgeSHA256 == knowledgeSHA256 && binding.promptSHA256 == promptSHA256)
@@ -135,6 +160,8 @@ struct AutoReplyCodexGenerator: AutoReplyGenerating, Sendable {
                         retriedAfterContinuationFailure = true
                     }
                 } else {
+                    AutomationStepLog.record(root: sessionRegistry.rootDirectory, uid: capture.uid,
+                        step: "codex-session-history-window-reset", detail: "history_limit=\(HistoryContinuation.maximumHistoryMessages); previous context is unbounded or the history window changed; durable history retained")
                     try sessionRegistry.invalidate(uid: capture.uid)
                 }
             } else {
@@ -409,7 +436,7 @@ struct AutoReplyCodexGenerator: AutoReplyGenerating, Sendable {
             : try AutoReplyPromptBuilder.buildInitial(capture: capture, submission: submission)
         let prompt = basePrompt + "\n<application_transfer_state>\n" + policyContext + "\n</application_transfer_state>"
         AutomationStepLog.record(root: sessionRegistry.rootDirectory, uid: capture.uid,
-            step: "codex-invocation-started", detail: "model=\(CodexInvocation.model) reasoning=\(CodexInvocation.reasoningEffort) session=\(continuation ? "resume" : "new") prompt_bytes=\(prompt.utf8.count) images=\(imageURLs.count) video_frames=\(videoFrameURLs.count)")
+            step: "codex-invocation-started", detail: "model=\(CodexInvocation.model) reasoning=\(CodexInvocation.reasoningEffort) session=\(continuation ? "resume" : "new") history_limit=\(HistoryContinuation.maximumHistoryMessages) submitted_history_messages=\(submission.historyJSONL.split(separator: "\n").count) prompt_bytes=\(prompt.utf8.count) images=\(imageURLs.count) video_frames=\(videoFrameURLs.count)")
         let submissionID = UUID()
         try CustomerMessageReceipts(root: sessionRegistry.rootDirectory).begin(capture, submissionID: submissionID)
         let stream = AutoReplyCLIStream()

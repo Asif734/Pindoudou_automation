@@ -2,6 +2,77 @@ import XCTest
 @testable import PDDAXReader
 
 final class AutoReplyCodexGeneratorTests: XCTestCase {
+    func testLegacyWindowMigrationRestoresOnlyThisCustomersRecentCachedImages() async throws {
+        let root = temporaryRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let recentURL = root.appendingPathComponent("recent.jpg")
+        let foreignURL = root.appendingPathComponent("foreign.jpg")
+        try Data([1]).write(to: recentURL); try Data([2]).write(to: foreignURL)
+        let mediaMessage = PDDChatMessage(id: "recent-image", sender: .customer, content: "[图片]",
+            displayTime: nil, kind: .image, capturedAt: Date())
+        let followup = PDDChatMessage(id: "followup", sender: .customer, content: "Tell me about this picture",
+            displayTime: nil, kind: .text, capturedAt: Date())
+        let history = [mediaMessage, followup]
+        let timeline = try AutoReplyTimeline.make(messages: history)
+        let input = AutoReplyCapture(uid: "GZC-000001", fullHistory: history,
+            batch: try timeline.freeze(after: AutoReplyTimeline.make(messages: [mediaMessage]).cursor),
+            customerCursor: timeline.cursor, unexpectedServiceMessageIDs: [])
+        let ownImage = attachment(messageID: "recent-image", localURL: recentURL)
+        let foreignImage = attachment(messageID: "recent-image", localURL: foreignURL)
+        let snapshot: [String: Any] = ["jobs": [
+            ["uid": input.uid, "capture": ["imageAttachments": try JSONSerialization.jsonObject(with: JSONEncoder().encode([ownImage]))]],
+            ["uid": "GZC-000002", "capture": ["imageAttachments": try JSONSerialization.jsonObject(with: JSONEncoder().encode([foreignImage]))]]]]
+        try JSONSerialization.data(withJSONObject: snapshot).write(to: root.appendingPathComponent("state.json"))
+        let registry = CodexSessionRegistry(rootDirectory: root)
+        try registry.save(.init(uid: input.uid, threadID: "old-unbounded", lastUsedAt: Date()))
+        let runner = AutoReplyFakeCodexRunner(responses: [.init(exitCode: 0,
+            stdout: "{\"type\":\"thread.started\",\"thread_id\":\"bounded\"}\n{\"type\":\"turn.completed\"}\n", reply: "Picture answer")])
+        let generator = AutoReplyCodexGenerator(executableURL: URL(fileURLWithPath: "/bin/echo"),
+            runner: runner, sessionRegistry: registry, evidencePreparer: FallbackKnowledgeEvidencePreparer())
+        _ = try await generator.generate(input)
+        let invocation = await runner.recorded[0]
+        XCTAssertFalse(invocation.arguments.contains("resume"))
+        XCTAssertTrue(invocation.arguments.contains(recentURL.path))
+        XCTAssertFalse(invocation.arguments.contains(foreignURL.path))
+        XCTAssertEqual(try registry.activeBinding(uid: input.uid)?.historyCheckpoint?.contextImages?.map(\.messageID), ["recent-image"])
+    }
+
+    func testSlidingHistoryWindowStartsFreshAndLLMReceivesOnlyLatestFiftyMessages() async throws {
+        let root = temporaryRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        func input(_ count: Int) throws -> AutoReplyCapture {
+            let history = (1...count).map { index in
+                PDDChatMessage(id: "message-\(index)", sender: index == count ? .customer : .service,
+                    content: "HISTORY_SENTINEL_\(index)_END", displayTime: nil, kind: .text, capturedAt: Date())
+            }
+            let timeline = try AutoReplyTimeline.make(messages: history)
+            return AutoReplyCapture(uid: "GZC-000001", fullHistory: history,
+                batch: try timeline.freeze(after: .empty), customerCursor: timeline.cursor, unexpectedServiceMessageIDs: [])
+        }
+        let runner = AutoReplyFakeCodexRunner(responses: ["first-window", "second-window"].map { thread in
+            .init(exitCode: 0, stdout: "{\"type\":\"thread.started\",\"thread_id\":\"\(thread)\"}\n{\"type\":\"turn.completed\"}\n", reply: "A model-written answer")
+        })
+        let registry = CodexSessionRegistry(rootDirectory: root)
+        let generator = AutoReplyCodexGenerator(executableURL: URL(fileURLWithPath: "/bin/echo"),
+            runner: runner, sessionRegistry: registry, evidencePreparer: FallbackKnowledgeEvidencePreparer())
+        _ = try await generator.generate(input(80))
+        _ = try await generator.generate(input(81))
+        let invocations = await runner.recorded
+        XCTAssertEqual(invocations.count, 2)
+        for (offset, invocation) in invocations.enumerated() {
+            XCTAssertFalse(invocation.arguments.contains("resume"), "A fresh thread must shed out-of-window history")
+            let history = try XCTUnwrap(invocation.stdin.components(separatedBy: "<full_history.jsonl>").last?
+                .components(separatedBy: "</full_history.jsonl>").first)
+            XCTAssertEqual(history.split(separator: "\n").count, 50)
+            XCTAssertTrue(history.contains("HISTORY_SENTINEL_\(31 + offset)_END"))
+            XCTAssertFalse(invocation.stdin.contains("HISTORY_SENTINEL_\(30 + offset)_END"))
+            XCTAssertTrue(invocation.stdin.contains("HISTORY_SENTINEL_\(80 + offset)_END"))
+        }
+        XCTAssertEqual(try registry.activeBinding(uid: "GZC-000001")?.threadID, "second-window")
+        XCTAssertEqual(try registry.activeBinding(uid: "GZC-000001")?.historyCheckpoint?.historyMessageLimit, 50)
+    }
+
     func testResumedUsageReportsOnlyCurrentTurnAndPersistsThreadCounter() async throws {
         let root = temporaryRoot()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -336,7 +407,7 @@ final class AutoReplyCodexGeneratorTests: XCTestCase {
         XCTAssertFalse(invocations[1].contains("resume"))
     }
 
-    func testCurrentModelContinuesLegacyHistoryCheckpointAndRewritesModernCheckpoint() async throws {
+    func testCurrentModelRotatesUnboundedLegacyThreadAndWritesBoundedCheckpoint() async throws {
         let root = temporaryRoot()
         defer { try? FileManager.default.removeItem(at: root) }
         let directory = root.appendingPathComponent("用户/GZC-000001", isDirectory: true)
@@ -363,7 +434,7 @@ final class AutoReplyCodexGeneratorTests: XCTestCase {
         try Data(legacy.utf8).write(to: bindingURL)
         let now = Date(timeIntervalSince1970: 1_777_000_000)
         let runner = AutoReplyFakeCodexRunner(responses: [
-            .init(exitCode: 0, stdout: "{\"type\":\"turn.completed\"}\n", reply: "兼容成功")
+            .init(exitCode: 0, stdout: "{\"type\":\"thread.started\",\"thread_id\":\"bounded-thread-A\"}\n{\"type\":\"turn.completed\"}\n", reply: "兼容成功")
         ])
         let generator = AutoReplyCodexGenerator(
             executableURL: URL(fileURLWithPath: "/bin/echo"),
@@ -375,12 +446,12 @@ final class AutoReplyCodexGeneratorTests: XCTestCase {
 
         let result = try await generator.generate(try capture(uid: "GZC-000001"))
 
-        XCTAssertEqual(result.threadID, "legacy-thread-A")
+        XCTAssertEqual(result.threadID, "bounded-thread-A")
         let invocation = await runner.recorded[0]
-        XCTAssertTrue(invocation.arguments.contains("resume"))
-        XCTAssertTrue(invocation.arguments.contains("legacy-thread-A"))
-        XCTAssertTrue(invocation.stdin.contains("appended_history.jsonl"))
-        XCTAssertTrue(invocation.stdin.contains("怎么安装"), "旧 checkpoint 首次续传必须补交完整历史")
+        XCTAssertFalse(invocation.arguments.contains("resume"))
+        XCTAssertFalse(invocation.arguments.contains("legacy-thread-A"))
+        XCTAssertTrue(invocation.stdin.contains("full_history.jsonl"))
+        XCTAssertTrue(invocation.stdin.contains("怎么安装"))
         let rewritten = try XCTUnwrap(
             try JSONSerialization.jsonObject(with: Data(contentsOf: bindingURL)) as? [String: Any]
         )
@@ -388,6 +459,7 @@ final class AutoReplyCodexGeneratorTests: XCTestCase {
         XCTAssertNotNil(checkpoint["historyByteCount"])
         XCTAssertNotNil(checkpoint["prefixSHA256"])
         XCTAssertNotNil(checkpoint["attachmentSHA256"])
+        XCTAssertEqual(checkpoint["historyMessageLimit"] as? Int, 50)
         XCTAssertNil(checkpoint["messageDigests"])
         XCTAssertNil(checkpoint["submittedImageSHA256"])
     }

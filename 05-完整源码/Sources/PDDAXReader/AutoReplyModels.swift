@@ -19,6 +19,12 @@ enum AutoReplyDeliveryOutcome: String, Codable, Equatable, Sendable {
     case uncertain
 }
 
+struct PendingReplyDraft: Codable, Equatable, Sendable {
+    let jobID: UUID
+    let messageIDs: [String]
+    let text: String
+}
+
 struct AutoReplyCapture: Codable, Equatable, Sendable {
     let uid: String
     let fullHistory: [PDDChatMessage]
@@ -30,6 +36,7 @@ struct AutoReplyCapture: Codable, Equatable, Sendable {
     var imageAttachments: [AutoReplyImageAttachment] = []
     var videoAttachments: [AutoReplyVideoAttachment] = []
     var pendingVideoMessageIDs: [String] = []
+    var pendingReplyDrafts: [PendingReplyDraft]? = nil
 
     init(
         uid: String,
@@ -41,7 +48,8 @@ struct AutoReplyCapture: Codable, Equatable, Sendable {
         ocrDiagnostic: String? = nil,
         imageAttachments: [AutoReplyImageAttachment] = [],
         videoAttachments: [AutoReplyVideoAttachment] = [],
-        pendingVideoMessageIDs: [String] = []
+        pendingVideoMessageIDs: [String] = [],
+        pendingReplyDrafts: [PendingReplyDraft]? = nil
     ) {
         self.uid = uid
         self.fullHistory = fullHistory
@@ -53,12 +61,13 @@ struct AutoReplyCapture: Codable, Equatable, Sendable {
         self.imageAttachments = imageAttachments
         self.videoAttachments = videoAttachments
         self.pendingVideoMessageIDs = pendingVideoMessageIDs
+        self.pendingReplyDrafts = pendingReplyDrafts
     }
 
     private enum CodingKeys: String, CodingKey {
         case uid, fullHistory, batch, customerCursor, unexpectedServiceMessageIDs
         case knowledgeEvidence, ocrDiagnostic, imageAttachments, videoAttachments
-        case pendingVideoMessageIDs
+        case pendingVideoMessageIDs, pendingReplyDrafts
     }
 
     init(from decoder: Decoder) throws {
@@ -83,6 +92,7 @@ struct AutoReplyCapture: Codable, Equatable, Sendable {
         pendingVideoMessageIDs = try container.decodeIfPresent(
             [String].self, forKey: .pendingVideoMessageIDs
         ) ?? []
+        pendingReplyDrafts = try container.decodeIfPresent([PendingReplyDraft].self, forKey: .pendingReplyDrafts)
     }
 }
 
@@ -184,7 +194,9 @@ struct AutoReplyJob: Codable, Equatable, Sendable, Identifiable {
     let uid: String
     var sequence: Int
     var state: AutoReplyJobState
-    let capture: AutoReplyCapture
+    var capture: AutoReplyCapture
+    var deliveryNotBefore: Date? = nil
+    var supersededByJobID: UUID? = nil
     var reply: String?
     var requiresDeliveryReconciliation: Bool {
         state == .completed && deliveryOutcome == .uncertain && nextAttemptAt != nil && outgoingImages.isEmpty
@@ -273,7 +285,7 @@ struct AutoReplyJob: Codable, Equatable, Sendable, Identifiable {
         case id, uid, sequence, state, capture, reply, generationDiagnostic, outgoingImages
         case deliveryOutcome, confirmedServiceMessageID, retries, nextAttemptAt, lastError
         case customerRevision, stageAttempt, imageAttachments, videoAttachments, durableAttemptOperationID
-        case sendWasInvoked, revision, pendingSupplement, supplementCapturePending
+        case sendWasInvoked, revision, pendingSupplement, supplementCapturePending, deliveryNotBefore, supersededByJobID
         case imageCaptureAttempted
         case replyAction, transferReason
         case customerMissingSince, omittedAt
@@ -316,6 +328,8 @@ struct AutoReplyJob: Codable, Equatable, Sendable, Identifiable {
             UUID.self, forKey: .durableAttemptOperationID
         )
         sendWasInvoked = try container.decodeIfPresent(Bool.self, forKey: .sendWasInvoked) ?? false
+        deliveryNotBefore = try container.decodeIfPresent(Date.self, forKey: .deliveryNotBefore)
+        supersededByJobID = try container.decodeIfPresent(UUID.self, forKey: .supersededByJobID)
         pendingSupplement = try container.decodeIfPresent(
             AutoReplyCapture.self, forKey: .pendingSupplement
         )
@@ -505,6 +519,13 @@ extension AutoReplyPersistentState {
                 jobs[$0].uid == uid && executing.contains(jobs[$0].state)
             }
             guard indexes.count > 1 else { continue }
+            if indexes.count == 2,
+               let generating = indexes.first(where: { jobs[$0].state == .generating }),
+               let sending = indexes.first(where: { jobs[$0].state == .sending }),
+               jobs[generating].sequence > jobs[sending].sequence,
+               jobs[generating].capture.pendingReplyDrafts?.contains(where: { $0.jobID == jobs[sending].id }) == true {
+                continue // One Codex turn and one leased UI operation; no shared-thread concurrency.
+            }
 
             for index in indexes where jobs[index].state == .sending && jobs[index].sendWasInvoked {
                 jobs[index].state = .completed
@@ -629,7 +650,7 @@ extension AutoReplyPersistentState {
     /// durable supplement into the next queued revision. An in-flight supplement
     /// request remains bound to the terminal source job and is promoted when it lands.
     @discardableResult
-    mutating func advanceSourceAndPromoteSupplement(at index: Int, advanceCursor: Bool = true) -> Bool {
+    mutating func advanceSourceAndPromoteSupplement(at index: Int, advanceCursor: Bool = true, retainCaptureRequests: Bool = false) -> Bool {
         guard jobs.indices.contains(index) else { return false }
         let source = jobs[index]
         if advanceCursor, let end = source.capture.batch?.endCursor,
@@ -639,11 +660,13 @@ extension AutoReplyPersistentState {
         guard let pending = source.pendingSupplement, pending.batch != nil else { return false }
         jobs[index].pendingSupplement = nil
         jobs[index].supplementCapturePending = false
-        pendingCaptureRequests.removeAll { request in
-            guard request.kind == .supplement, request.uid == source.uid else { return false }
-            if request.sourceJobID == source.id { return true }
-            return request.sourceJobID == nil
-                && request.baseCursor == source.capture.batch?.endCursor
+        if !retainCaptureRequests {
+            pendingCaptureRequests.removeAll { request in
+                guard request.kind == .supplement, request.uid == source.uid else { return false }
+                if request.sourceJobID == source.id { return true }
+                return request.sourceJobID == nil
+                    && request.baseCursor == source.capture.batch?.endCursor
+            }
         }
         guard let capture = removingCoveredVideoMarkers(from: pending, uid: source.uid) else {
             return false

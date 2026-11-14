@@ -3,6 +3,362 @@ import XCTest
 
 @MainActor
 final class AutoReplySchedulerTests: XCTestCase {
+    func testReadyReplyPrecedesAnotherCustomersTailScan() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let ready = AutoReplyJob(id: UUID(), uid: "ready", sequence: 1, state: .ready,
+            capture: try makeFrozenCapture(uid: "ready", ids: ["question"], after: .empty), reply: "ready answer",
+            deliveryOutcome: nil, confirmedServiceMessageID: nil, retries: 0, nextAttemptAt: nil, lastError: nil)
+        var state = AutoReplyPersistentState.empty; state.jobs = [ready]; state.nextSequence = 1
+        state.pendingCaptureRequests = [.init(uid: "another", kind: .tail, baseCursor: .empty)]
+        let store = AutoReplyStore(rootDirectory: root); try store.save(state)
+        let driver = ControlledAutoReplyDriver(capturesByUID: ["another": [["new message"]]])
+        let scheduler = try AutoReplyScheduler(driver: driver, generator: ControlledReplyGenerator(delayNanoseconds: 0), store: store)
+        scheduler.start(); defer { scheduler.stop() }
+        await scheduler.tick()
+        XCTAssertEqual(driver.sentTexts, ["ready answer"])
+        XCTAssertEqual(driver.captureCallCount, 0)
+    }
+
+    func testNewQuestionsNeverReplaceReadyTextAndKeepItsRetryCooldown() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let uid = "customer"; let first = try schedulingCapture(uid: uid, ids: ["A"], after: 0)
+        let followup = try schedulingCapture(uid: uid, ids: ["A", "B"], after: 1)
+        var source = AutoReplyJob(id: UUID(), uid: uid, sequence: 1, state: .ready, capture: first,
+            reply: "old draft", deliveryOutcome: .notSent, confirmedServiceMessageID: nil,
+            retries: 0, nextAttemptAt: Date(timeIntervalSince1970: 130), lastError: "temporary location failure")
+        source.pendingSupplement = followup
+        try CustomerMessageReceipts(root: root).capture(first)
+        try CustomerMessageReceipts(root: root).capture(followup)
+        var state = AutoReplyPersistentState.empty; state.jobs = [source]; state.nextSequence = 1
+        let store = AutoReplyStore(rootDirectory: root); try store.save(state)
+        let driver = ControlledAutoReplyDriver(capturesByUID: [:]); let generator = SchedulingGenerator()
+        let scheduler = try AutoReplyScheduler(driver: driver, generator: generator, store: store,
+            now: { Date(timeIntervalSince1970: 100) })
+        scheduler.start(); defer { scheduler.stop() }
+        await scheduler.tick()
+        for _ in 0..<100 where generator.captures.isEmpty { await Task.yield() }
+        let capture = try XCTUnwrap(generator.captures.first)
+        XCTAssertEqual(capture.batch?.customerMessageIDs, ["B"])
+        XCTAssertEqual(capture.pendingReplyDrafts?.first?.text, "old draft")
+        XCTAssertEqual(scheduler.jobs.first?.deliveryOutcome, .notSent)
+        XCTAssertEqual(scheduler.jobs.first?.state, .ready)
+        XCTAssertEqual(scheduler.jobs.first?.reply, "old draft")
+        XCTAssertNil(scheduler.jobs.first?.supersededByJobID)
+        XCTAssertEqual(scheduler.jobs.first?.nextAttemptAt, Date(timeIntervalSince1970: 130))
+        XCTAssertEqual(scheduler.answeredCursor(uid), .empty)
+        XCTAssertEqual(driver.sendCallCount, 0)
+        XCTAssertNil(scheduler.jobs.last?.deliveryNotBefore)
+        XCTAssertTrue(try CustomerMessageReceipts(root: root).receipts(uid: uid).values.allSatisfy { $0.replySentAt == nil })
+        XCTAssertFalse(FileManager.default.fileExists(atPath: root.appendingPathComponent("archive/records/\(source.id.uuidString).json").path))
+    }
+
+    func testReadyTextSendsImmediatelyWithoutWaitingForNewQuestionGeneration() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let uid = "customer"
+        var source = AutoReplyJob(id: UUID(), uid: uid, sequence: 1, state: .ready,
+            capture: try schedulingCapture(uid: uid, ids: ["A"], after: 0), reply: "original ready answer",
+            deliveryOutcome: nil, confirmedServiceMessageID: nil, retries: 0, nextAttemptAt: nil, lastError: nil)
+        source.pendingSupplement = try schedulingCapture(uid: uid, ids: ["A", "B"], after: 1)
+        var state = AutoReplyPersistentState.empty; state.jobs = [source]; state.nextSequence = 1
+        let store = AutoReplyStore(rootDirectory: root); try store.save(state)
+        let driver = ControlledAutoReplyDriver(capturesByUID: [:])
+        let generator = ControlledReplyGenerator(delayNanoseconds: 1_000_000_000)
+        let scheduler = try AutoReplyScheduler(driver: driver, generator: generator, store: store)
+        scheduler.start(); defer { scheduler.stop() }
+        await scheduler.tick()
+        XCTAssertEqual(driver.sentTexts, ["original ready answer"])
+        XCTAssertEqual(scheduler.jobs.first?.deliveryOutcome, .sent)
+        XCTAssertEqual(scheduler.jobs.last?.capture.batch?.customerMessageIDs, ["B"])
+        XCTAssertNil(scheduler.jobs.first?.supersededByJobID)
+        XCTAssertFalse(try store.load().events.contains { $0.kind == "unsent-draft-superseded" })
+    }
+
+    func testGenerationRunsAheadOfMediaDeliveryButSendsRemainOrdered() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let uid = "customer"
+        var source = AutoReplyJob(id: UUID(), uid: uid, sequence: 1, state: .ready,
+            capture: try makeVideoCapture(uid: uid, messageID: "video"), reply: "video answer",
+            deliveryOutcome: nil, confirmedServiceMessageID: nil, retries: 0,
+            nextAttemptAt: Date(timeIntervalSince1970: 130), lastError: nil)
+        source.pendingSupplement = try schedulingCapture(uid: uid, ids: ["video", "B"], after: 1)
+        var state = AutoReplyPersistentState.empty; state.jobs = [source]; state.nextSequence = 1
+        let store = AutoReplyStore(rootDirectory: root); try store.save(state)
+        let clock = SchedulerTestClock(Date(timeIntervalSince1970: 100))
+        let driver = ControlledAutoReplyDriver(capturesByUID: [:]); let generator = SchedulingGenerator()
+        let scheduler = try AutoReplyScheduler(driver: driver, generator: generator, store: store, now: { clock.value })
+        scheduler.start(); defer { scheduler.stop() }
+        for _ in 0..<20 {
+            await scheduler.tick(); await Task.yield()
+            if scheduler.jobs.last?.state == .ready { break }
+        }
+        XCTAssertEqual(generator.captures.first?.batch?.customerMessageIDs, ["B"])
+        XCTAssertEqual(scheduler.jobs.first?.state, .ready, "Media delivery must not be replaced")
+        XCTAssertEqual(driver.sendCallCount, 0)
+        clock.value = Date(timeIntervalSince1970: 131)
+        for _ in 0..<12 {
+            await scheduler.tick(); await Task.yield()
+            if driver.sentTexts.count == 2 { break }
+        }
+        XCTAssertEqual(driver.sentTexts, ["video answer", "new answer"])
+        XCTAssertEqual(driver.maximumConcurrentUICalls, 1)
+    }
+
+    func testCommittedAttemptCannotBeSupersededByNewDraft() async throws {
+        for mayHaveSent in [true, false] {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let uid = "customer"
+        var source = AutoReplyJob(id: UUID(), uid: uid, sequence: 1, state: .ready,
+            capture: try schedulingCapture(uid: uid, ids: ["A"], after: 0), reply: "possibly sent",
+            deliveryOutcome: nil, confirmedServiceMessageID: nil, retries: 0,
+            nextAttemptAt: Date(timeIntervalSince1970: 130), lastError: nil)
+        source.pendingSupplement = try schedulingCapture(uid: uid, ids: ["A", "B"], after: 1)
+        try PDDTextDeliveryAttemptStore(root: root).save(.init(uid: uid, replySHA256: PDDTextDeliveryAttempt.hash(mayHaveSent ? "possibly sent" : "mismatched checkpoint"), stage: mayHaveSent ? .commitIntent : .prepared, updatedAt: Date()), id: source.id)
+        var state = AutoReplyPersistentState.empty; state.jobs = [source]; state.nextSequence = 1
+        let store = AutoReplyStore(rootDirectory: root); try store.save(state)
+        let generator = SchedulingGenerator(); let driver = ControlledAutoReplyDriver(capturesByUID: [:])
+        let scheduler = try AutoReplyScheduler(driver: driver, generator: generator, store: store, now: { Date(timeIntervalSince1970: 100) })
+        scheduler.start(); defer { scheduler.stop() }; await scheduler.tick()
+        for _ in 0..<100 where generator.captures.isEmpty { await Task.yield() }
+        XCTAssertEqual(generator.captures.first?.batch?.customerMessageIDs, ["B"])
+        XCTAssertEqual(scheduler.jobs.first?.state, .ready)
+        XCTAssertNil(scheduler.jobs.first?.deliveryOutcome)
+        XCTAssertEqual(driver.sendCallCount, 0)
+        }
+    }
+
+    func testDeclaredGenerationAndSingleUIWriteAreNotExecutionConflict() throws {
+        let uid = "customer"
+        var source = AutoReplyJob(id: UUID(), uid: uid, sequence: 1, state: .sending,
+            capture: try schedulingCapture(uid: uid, ids: ["A"], after: 0), reply: "A answer",
+            deliveryOutcome: nil, confirmedServiceMessageID: nil, retries: 0, nextAttemptAt: nil, lastError: nil)
+        source.sendWasInvoked = true
+        var capture = try schedulingCapture(uid: uid, ids: ["A", "B"], after: 1)
+        capture.pendingReplyDrafts = [.init(jobID: source.id, messageIDs: ["A"], text: "A answer")]
+        let next = AutoReplyJob(id: UUID(), uid: uid, sequence: 2, state: .generating, capture: capture, reply: nil,
+            deliveryOutcome: nil, confirmedServiceMessageID: nil, retries: 0, nextAttemptAt: nil, lastError: nil)
+        var state = AutoReplyPersistentState.empty; state.jobs = [source, next]
+        state.repairOverlappingExecutions(at: Date())
+        XCTAssertEqual(state.jobs.map(\.state), [.sending, .generating])
+        XCTAssertFalse(state.events.contains { $0.kind == "execution-conflict-repaired" })
+    }
+
+    func testPendingDraftContextIsPresentInBothInitialAndContinuedPrompts() throws {
+        var capture = try schedulingCapture(uid: "customer", ids: ["B"], after: 0)
+        capture.pendingReplyDrafts = [.init(jobID: UUID(), messageIDs: ["A"], text: "I have sent the instructions")]
+        let plan = try HistoryContinuation.plan(capture: capture, after: nil)
+        for prompt in [try AutoReplyPromptBuilder.build(capture: capture), try AutoReplyPromptBuilder.buildContinuation(capture: capture, submission: plan)] {
+            XCTAssertTrue(prompt.contains("<unconfirmed_reply_drafts>"))
+            XCTAssertTrue(prompt.contains("不能当作客户已收到"))
+            XCTAssertTrue(prompt.contains("I have sent the instructions"))
+        }
+        let decoded = try JSONDecoder().decode(AutoReplyCapture.self, from: JSONEncoder().encode(capture))
+        XCTAssertEqual(decoded.pendingReplyDrafts, capture.pendingReplyDrafts)
+    }
+
+    func testFailedPreSendAvoidsTailScanUnlessNewMessagesNeedSubmission() async throws {
+        for hasNewMessage in [false, true] {
+            let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+            defer { try? FileManager.default.removeItem(at: root) }
+            let uid = "customer"
+            let source = AutoReplyJob(id: UUID(), uid: uid, sequence: 1, state: .ready,
+                capture: try schedulingCapture(uid: uid, ids: ["A"], after: 0), reply: "answer",
+                deliveryOutcome: nil, confirmedServiceMessageID: nil, retries: 0, nextAttemptAt: nil, lastError: nil)
+            if hasNewMessage {
+                try CustomerMessageReceipts(root: root).observe(uid: uid, messages: [
+                    .init(id: "B", sender: .customer, content: "new question", displayTime: nil, kind: .text, capturedAt: Date())
+                ], actionableIDs: ["B"])
+            }
+            var state = AutoReplyPersistentState.empty; state.jobs = [source]; state.nextSequence = 1
+            let store = AutoReplyStore(rootDirectory: root); try store.save(state)
+            let driver = ControlledAutoReplyDriver(capturesByUID: [:]); driver.deliveryResults = [.failedBeforeSend("recipient not yet verified")]
+            let scheduler = try AutoReplyScheduler(driver: driver, generator: SchedulingGenerator(), store: store)
+            scheduler.start(); await scheduler.tick(); scheduler.stop()
+            XCTAssertEqual(try store.load().pendingCaptureRequests.contains { $0.kind == .tail }, hasNewMessage)
+            XCTAssertEqual(scheduler.jobs.first?.state, .ready)
+            XCTAssertEqual(scheduler.jobs.first?.deliveryOutcome, .notSent)
+        }
+    }
+
+    func testOneGenerationPerCustomerWhileEarlierDeliveryIsBlocked() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let uid = "customer"
+        let source = AutoReplyJob(id: UUID(), uid: uid, sequence: 1, state: .ready,
+            capture: try makeVideoCapture(uid: uid, messageID: "video"), reply: "old media answer",
+            deliveryOutcome: nil, confirmedServiceMessageID: nil, retries: 0, nextAttemptAt: .distantFuture, lastError: nil)
+        let b = AutoReplyJob(id: UUID(), uid: uid, sequence: 2, state: .queued,
+            capture: try schedulingCapture(uid: uid, ids: ["video", "B"], after: 1), reply: nil,
+            deliveryOutcome: nil, confirmedServiceMessageID: nil, retries: 0, nextAttemptAt: nil, lastError: nil)
+        let c = AutoReplyJob(id: UUID(), uid: uid, sequence: 3, state: .queued,
+            capture: try schedulingCapture(uid: uid, ids: ["video", "B", "C"], after: 2), reply: nil,
+            deliveryOutcome: nil, confirmedServiceMessageID: nil, retries: 0, nextAttemptAt: nil, lastError: nil)
+        var state = AutoReplyPersistentState.empty; state.jobs = [source, b, c]; state.nextSequence = 3
+        let store = AutoReplyStore(rootDirectory: root); try store.save(state)
+        let generator = ControlledReplyGenerator(delayNanoseconds: 30_000_000)
+        let driver = ControlledAutoReplyDriver(capturesByUID: [:])
+        let scheduler = try AutoReplyScheduler(driver: driver, generator: generator, store: store,
+            configuredMaximumConcurrentGenerations: 4, availableMemoryBytes: { 64 << 30 })
+        scheduler.start(); defer { scheduler.stop() }
+        for _ in 0..<100 {
+            await scheduler.tick()
+            if generator.targetIDs.count >= 2 { break }
+            try await Task.sleep(nanoseconds: 2_000_000)
+        }
+        XCTAssertEqual(generator.targetIDs, [["B"], ["C"]])
+        XCTAssertEqual(generator.maximumConcurrentCalls, 1)
+        XCTAssertEqual(driver.sendCallCount, 0)
+    }
+
+    func testGenerationAheadAndRealSendCheckpointRemainIndependentUntilStop() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let uid = "customer"
+        let source = AutoReplyJob(id: UUID(), uid: uid, sequence: 1, state: .ready,
+            capture: try makeVideoCapture(uid: uid, messageID: "video"), reply: "media answer",
+            deliveryOutcome: nil, confirmedServiceMessageID: nil, retries: 0, nextAttemptAt: nil, lastError: nil)
+        let next = AutoReplyJob(id: UUID(), uid: uid, sequence: 2, state: .queued,
+            capture: try schedulingCapture(uid: uid, ids: ["video", "B"], after: 1), reply: nil,
+            deliveryOutcome: nil, confirmedServiceMessageID: nil, retries: 0, nextAttemptAt: nil, lastError: nil)
+        var state = AutoReplyPersistentState.empty; state.jobs = [source, next]; state.nextSequence = 2
+        let store = AutoReplyStore(rootDirectory: root); try store.save(state)
+        let driver = ControlledAutoReplyDriver(capturesByUID: [:])
+        driver.beforeSend = {
+            XCTAssertEqual(try? store.load().jobs.map(\.state), [.sending, .generating])
+        }
+        let scheduler = try AutoReplyScheduler(driver: driver, generator: ControlledReplyGenerator(delayNanoseconds: 1_000_000_000), store: store)
+        scheduler.start(); await scheduler.tick()
+        XCTAssertEqual(scheduler.jobs.first?.deliveryOutcome, .sent)
+        XCTAssertEqual(scheduler.jobs.last?.state, .generating)
+        XCTAssertFalse(try store.load().events.contains { $0.kind == "execution-conflict-repaired" })
+        scheduler.stop(); await scheduler.tick()
+        XCTAssertEqual(driver.sendCallCount, 1)
+        XCTAssertEqual(driver.maximumConcurrentUICalls, 1)
+        XCTAssertEqual(scheduler.jobs.last?.state, .queued)
+    }
+
+    func testRestartPreservesReadyAnswerAndIndependentNewQuestion() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let uid = "customer"
+        var source = AutoReplyJob(id: UUID(), uid: uid, sequence: 1, state: .ready,
+            capture: try schedulingCapture(uid: uid, ids: ["A"], after: 0), reply: "old unsent answer",
+            deliveryOutcome: nil, confirmedServiceMessageID: nil, retries: 0, nextAttemptAt: nil, lastError: nil)
+        source.pendingSupplement = try schedulingCapture(uid: uid, ids: ["A", "B"], after: 1)
+        var state = AutoReplyPersistentState.empty; state.jobs = [source]; state.nextSequence = 1
+        let store = AutoReplyStore(rootDirectory: root); try store.save(state)
+        let driver = ControlledAutoReplyDriver(capturesByUID: [:])
+        let scheduler = try AutoReplyScheduler(driver: driver, generator: ControlledReplyGenerator(delayNanoseconds: 1_000_000_000), store: store)
+        scheduler.setDeliveryEnabled(false); scheduler.start(); await scheduler.tick(); scheduler.stop()
+        let restarted = try AutoReplyScheduler(driver: driver, generator: SchedulingGenerator(), store: store)
+        XCTAssertEqual(restarted.jobs.first?.state, .ready)
+        XCTAssertEqual(restarted.jobs.first?.reply, "old unsent answer")
+        XCTAssertNil(restarted.jobs.first?.deliveryOutcome)
+        XCTAssertNil(restarted.jobs.first?.supersededByJobID)
+        XCTAssertEqual(restarted.jobs.last?.capture.batch?.customerMessageIDs, ["B"])
+        XCTAssertEqual(restarted.answeredCursor(uid), .empty)
+        XCTAssertEqual(driver.sendCallCount, 0)
+    }
+
+    func testIncomingHandoffIsNeverReplacedByAnOrdinaryDraft() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let uid = "customer"
+        let handoff = AutoReplyCapture(uid: uid, fullHistory: [], batch: .incomingHandoff(key: "boundary", cursor: .empty), customerCursor: .empty, unexpectedServiceMessageIDs: [])
+        var source = AutoReplyJob(id: UUID(), uid: uid, sequence: 1, state: .ready, capture: handoff, reply: "handoff acknowledgement",
+            deliveryOutcome: nil, confirmedServiceMessageID: nil, retries: 0, nextAttemptAt: .distantFuture, lastError: nil)
+        source.pendingSupplement = try schedulingCapture(uid: uid, ids: ["B"], after: 0)
+        var state = AutoReplyPersistentState.empty; state.jobs = [source]; state.nextSequence = 1
+        let store = AutoReplyStore(rootDirectory: root); try store.save(state)
+        let generator = SchedulingGenerator()
+        let scheduler = try AutoReplyScheduler(driver: ControlledAutoReplyDriver(capturesByUID: [:]), generator: generator, store: store)
+        scheduler.start(); defer { scheduler.stop() }; await scheduler.tick()
+        for _ in 0..<100 where generator.captures.isEmpty { await Task.yield() }
+        XCTAssertEqual(generator.captures.first?.batch?.customerMessageIDs, ["B"])
+        XCTAssertEqual(scheduler.jobs.first?.state, .ready)
+        XCTAssertEqual(scheduler.jobs.first?.capture.batch?.incomingHandoffKey, "boundary")
+    }
+
+    func testQueuedTextFollowupVideoKeepsExistingEvidenceGate() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let uid = "customer"
+        var source = AutoReplyJob(id: UUID(), uid: uid, sequence: 1, state: .queued,
+            capture: try schedulingCapture(uid: uid, ids: ["A"], after: 0), reply: nil,
+            deliveryOutcome: nil, confirmedServiceMessageID: nil, retries: 0, nextAttemptAt: nil, lastError: nil)
+        var followup = try schedulingCapture(uid: uid, ids: ["A", "video"], after: 1)
+        followup.pendingVideoMessageIDs = ["video"]
+        source.pendingSupplement = followup
+        var state = AutoReplyPersistentState.empty; state.jobs = [source]; state.nextSequence = 1
+        let store = AutoReplyStore(rootDirectory: root); try store.save(state)
+        let generator = SchedulingGenerator()
+        let scheduler = try AutoReplyScheduler(driver: ControlledAutoReplyDriver(capturesByUID: [:]), generator: generator, store: store)
+        scheduler.start(); defer { scheduler.stop() }; await scheduler.tick()
+        for _ in 0..<100 where generator.captures.isEmpty { await Task.yield() }
+        XCTAssertEqual(generator.captures.first?.batch?.customerMessageIDs, ["A"])
+        XCTAssertEqual(scheduler.pendingVideoBatchesSnapshot.first?.expectedMessageIDs, ["video"])
+        XCTAssertFalse(generator.captures.contains { $0.batch?.customerMessageIDs.contains("video") == true })
+    }
+
+    func testLegacySchedulingCheckpointDecodesWithoutNewDraftFields() throws {
+        let job = AutoReplyJob(id: UUID(), uid: "customer", sequence: 1, state: .ready,
+            capture: try schedulingCapture(uid: "customer", ids: ["A"], after: 0), reply: "answer",
+            deliveryOutcome: nil, confirmedServiceMessageID: nil, retries: 0, nextAttemptAt: nil, lastError: nil)
+        var json = try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(job)) as? [String: Any])
+        json.removeValue(forKey: "deliveryNotBefore"); json.removeValue(forKey: "supersededByJobID")
+        var capture = try XCTUnwrap(json["capture"] as? [String: Any]); capture.removeValue(forKey: "pendingReplyDrafts"); json["capture"] = capture
+        let decoded = try JSONDecoder().decode(AutoReplyJob.self, from: JSONSerialization.data(withJSONObject: json))
+        XCTAssertEqual(decoded, job)
+    }
+
+    func testOldUncertainHistoryIsNotInjectedAfterANewerConfirmedReply() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let uid = "customer"
+        let old = AutoReplyJob(id: UUID(), uid: uid, sequence: 1, state: .completed,
+            capture: try schedulingCapture(uid: uid, ids: ["A"], after: 0), reply: "old ambiguous draft",
+            deliveryOutcome: .uncertain, confirmedServiceMessageID: nil, retries: 0, nextAttemptAt: nil, lastError: nil)
+        let sent = AutoReplyJob(id: UUID(), uid: uid, sequence: 2, state: .completed,
+            capture: try schedulingCapture(uid: uid, ids: ["A", "B"], after: 1), reply: "confirmed later answer",
+            deliveryOutcome: .sent, confirmedServiceMessageID: "service-B", retries: 0, nextAttemptAt: nil, lastError: nil)
+        let next = AutoReplyJob(id: UUID(), uid: uid, sequence: 3, state: .queued,
+            capture: try schedulingCapture(uid: uid, ids: ["A", "B", "C"], after: 2), reply: nil,
+            deliveryOutcome: nil, confirmedServiceMessageID: nil, retries: 0, nextAttemptAt: nil, lastError: nil)
+        var state = AutoReplyPersistentState.empty; state.jobs = [old, sent, next]; state.nextSequence = 3
+        let store = AutoReplyStore(rootDirectory: root); try store.save(state)
+        let generator = SchedulingGenerator()
+        let scheduler = try AutoReplyScheduler(driver: ControlledAutoReplyDriver(capturesByUID: [:]), generator: generator, store: store)
+        scheduler.start(); defer { scheduler.stop() }; await scheduler.tick()
+        for _ in 0..<100 where generator.captures.isEmpty { await Task.yield() }
+        XCTAssertNil(generator.captures.first?.pendingReplyDrafts)
+        XCTAssertEqual(generator.captures.first?.batch?.customerMessageIDs, ["C"])
+    }
+
+    func testTransferDraftRemainsIntactWhileNewQuestionGenerates() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let uid = "customer"
+        var source = AutoReplyJob(id: UUID(), uid: uid, sequence: 1, state: .ready,
+            capture: try schedulingCapture(uid: uid, ids: ["A"], after: 0), reply: "transfer acknowledgement",
+            deliveryOutcome: nil, confirmedServiceMessageID: nil, retries: 0, nextAttemptAt: .distantFuture, lastError: nil)
+        source.replyAction = .replyThenTransfer; source.transferReason = .customerExplicitlyRequestedHuman
+        source.pendingSupplement = try schedulingCapture(uid: uid, ids: ["A", "B"], after: 1)
+        var state = AutoReplyPersistentState.empty; state.jobs = [source]; state.nextSequence = 1
+        let store = AutoReplyStore(rootDirectory: root); try store.save(state)
+        let generator = SchedulingGenerator()
+        let scheduler = try AutoReplyScheduler(driver: ControlledAutoReplyDriver(capturesByUID: [:]), generator: generator, store: store)
+        scheduler.start(); defer { scheduler.stop() }; await scheduler.tick()
+        for _ in 0..<100 where generator.captures.isEmpty { await Task.yield() }
+        XCTAssertEqual(generator.captures.first?.batch?.customerMessageIDs, ["B"])
+        XCTAssertEqual(scheduler.jobs.first?.replyAction, .replyThenTransfer)
+        XCTAssertNil(scheduler.jobs.first?.supersededByJobID)
+        XCTAssertEqual(scheduler.jobs.first?.state, .ready)
+    }
+
     func testRestartReleasesAnsweredVideoRetryAndQueuesOnlyTheUnsentGreeting() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: root) }
@@ -1685,12 +2041,11 @@ final class AutoReplySchedulerTests: XCTestCase {
             f.scheduler.latestCapture?.batch?.events.map(\.messageID),
             ["B"]
         )
-        XCTAssertEqual(
-            f.scheduler.jobs.first?.pendingSupplement?.batch?.events.map(\.messageID),
-            ["B"],
-            "红点消失后，补充批次仍必须持久附着在原冻结任务上"
-        )
-        XCTAssertEqual(f.scheduler.jobs.count, 1, "补充消息应先附着到冻结任务，不能抢在 A 前发送")
+        XCTAssertEqual(f.scheduler.jobs.last?.capture.batch?.events.map(\.messageID), ["B"])
+        XCTAssertEqual(f.scheduler.jobs.count, 2, "New content is durable and queued without waiting for A delivery")
+        XCTAssertEqual(f.scheduler.jobs.last?.state, .queued)
+        XCTAssertTrue(f.driver.sentTexts.isEmpty)
+        XCTAssertEqual(f.generator.maximumConcurrentCalls, 1)
     }
 
     func testCapturedSupplementIsPromotedAfterFrozenReplyCompletes() async throws {
@@ -1708,10 +2063,8 @@ final class AutoReplySchedulerTests: XCTestCase {
         clock.value = Date(timeIntervalSince1970: 102)
         f.driver.discoveries = [.init(uid: uid, hasUnreadEvidence: true)]
         await f.runTicks(4)
-        XCTAssertEqual(
-            f.scheduler.jobs.first?.pendingSupplement?.batch?.events.map(\.messageID),
-            ["B"]
-        )
+        XCTAssertTrue(f.scheduler.jobs.contains { $0.capture.batch?.customerMessageIDs.contains("B") == true
+            || $0.pendingSupplement?.batch?.customerMessageIDs.contains("B") == true })
 
         await f.runUntilCompletedJobs(2)
 
@@ -1849,9 +2202,8 @@ final class AutoReplySchedulerTests: XCTestCase {
         await f.runTicks(4)
 
         XCTAssertEqual(f.driver.captureCallCount, 3)
-        XCTAssertEqual(
-            f.scheduler.jobs.first?.pendingSupplement?.batch?.events.map(\.messageID), ["B"]
-        )
+        XCTAssertTrue(f.scheduler.jobs.contains { $0.capture.batch?.customerMessageIDs.contains("B") == true
+            || $0.pendingSupplement?.batch?.customerMessageIDs.contains("B") == true })
     }
 
     func testReadyReplyPromotesDurableSupplementWithoutRecapturingIt() async throws {
@@ -2063,7 +2415,8 @@ final class AutoReplySchedulerTests: XCTestCase {
 
         XCTAssertEqual(scheduler.jobs.count, 2)
         XCTAssertEqual(scheduler.jobs[0].state, .completed)
-        XCTAssertEqual(scheduler.jobs[1].capture.batch?.events.map(\.messageID), ["B"])
+        XCTAssertEqual(scheduler.jobs[1].capture.batch?.events.filter { $0.messageID == "B" }.count, 1)
+        XCTAssertEqual(driver.sentTexts, ["回复:A"], "A ready answer must send without being combined into a new reply")
     }
 
     func testReadyReplyPromotesFrozenSupplementBeforeObsoleteCaptureRequest() async throws {
@@ -2100,9 +2453,9 @@ final class AutoReplySchedulerTests: XCTestCase {
 
         for _ in 0..<6 where driver.captureCallCount == 0 { await scheduler.tick() }
 
-        XCTAssertEqual(scheduler.jobs.count, 2)
-        XCTAssertEqual(scheduler.jobs[1].capture.batch?.events.map(\.messageID), ["B"])
-        XCTAssertEqual(scheduler.jobs[1].pendingSupplement?.batch?.events.map(\.messageID), ["C"])
+        XCTAssertTrue(scheduler.jobs.contains { $0.capture.batch?.customerMessageIDs.contains("B") == true })
+        XCTAssertTrue(scheduler.jobs.contains { $0.capture.batch?.customerMessageIDs.contains("C") == true
+            || $0.pendingSupplement?.batch?.customerMessageIDs.contains("C") == true })
         XCTAssertEqual(driver.captureCallCount, 1)
     }
 
@@ -3183,6 +3536,7 @@ private final class ControlledAutoReplyDriver: AutoReplyAutomationDriver {
     var preflightMessagesByUID: [String: [PDDChatMessage]] = [:]
     var preflightError: Error?
     var sendError: Error?
+    var beforeSend: (() async -> Void)?
     var discoverError: Error?
     var discoverNeverReturns = false
     var cleanupNeverReturns = false
@@ -3282,6 +3636,7 @@ private final class ControlledAutoReplyDriver: AutoReplyAutomationDriver {
     ) async throws -> AutoReplyDeliveryResult {
         beginUI(); defer { endUI() }
         sendCallCount += 1
+        await beforeSend?()
         if let sendError { throw sendError }
         sentTexts.append(text)
         return deliveryResults.isEmpty
@@ -3538,4 +3893,22 @@ private struct AbsenceHangingGenerator: AutoReplyGenerating {
         }
         return .init(reply: "healthy reply", threadID: "healthy")
     }
+}
+
+private func schedulingCapture(uid: String, ids: [String], after count: Int) throws -> AutoReplyCapture {
+    let history = ids.map { PDDChatMessage(id: $0, sender: .customer, content: $0, displayTime: nil, kind: .text, capturedAt: Date(timeIntervalSince1970: 100)) }
+    let timeline = try AutoReplyTimeline.make(messages: history)
+    let prefix = try AutoReplyTimeline.make(messages: Array(history.prefix(count))).cursor
+    return .init(uid: uid, fullHistory: history, batch: try timeline.freeze(after: prefix), customerCursor: timeline.cursor, unexpectedServiceMessageIDs: [])
+}
+
+private final class SchedulingGenerator: AutoReplyGenerating, @unchecked Sendable {
+    private let lock = NSLock()
+    private var stored: [AutoReplyCapture] = []
+    var captures: [AutoReplyCapture] { lock.lock(); defer { lock.unlock() }; return stored }
+    func generate(_ capture: AutoReplyCapture) async throws -> CodexReplyResult {
+        record(capture)
+        return .init(reply: "new answer", threadID: "test")
+    }
+    private func record(_ capture: AutoReplyCapture) { lock.lock(); defer { lock.unlock() }; stored.append(capture) }
 }

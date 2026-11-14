@@ -12,29 +12,42 @@ struct CodexHistoryCheckpoint: Codable, Equatable, Sendable {
     let attachmentSHA256: [String: String]
     let requiresFullHistoryContinuation: Bool
     let videoSHA256ByMessageID: [String: String]?
+    let historyMessageLimit: Int?
+    let contextImages: [AutoReplyImageAttachment]?
+    let contextVideos: [AutoReplyVideoAttachment]?
 
     init(
         historyByteCount: Int,
         prefixSHA256: String,
         attachmentSHA256: [String: String],
         requiresFullHistoryContinuation: Bool = false,
-        videoSHA256ByMessageID: [String: String]? = nil
+        videoSHA256ByMessageID: [String: String]? = nil,
+        historyMessageLimit: Int? = nil,
+        contextImages: [AutoReplyImageAttachment]? = nil,
+        contextVideos: [AutoReplyVideoAttachment]? = nil
     ) {
         self.historyByteCount = historyByteCount
         self.prefixSHA256 = prefixSHA256
         self.attachmentSHA256 = attachmentSHA256
         self.requiresFullHistoryContinuation = requiresFullHistoryContinuation
         self.videoSHA256ByMessageID = videoSHA256ByMessageID
+        self.historyMessageLimit = historyMessageLimit
+        self.contextImages = contextImages
+        self.contextVideos = contextVideos
     }
 
     private enum CodingKeys: String, CodingKey {
         case historyByteCount, prefixSHA256, attachmentSHA256
-        case messageDigests, submittedImageSHA256, videoSHA256ByMessageID
+        case messageDigests, submittedImageSHA256, videoSHA256ByMessageID, historyMessageLimit
+        case contextImages, contextVideos
     }
 
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         videoSHA256ByMessageID = try container.decodeIfPresent([String: String].self, forKey: .videoSHA256ByMessageID)
+        historyMessageLimit = try container.decodeIfPresent(Int.self, forKey: .historyMessageLimit)
+        contextImages = try container.decodeIfPresent([AutoReplyImageAttachment].self, forKey: .contextImages)
+        contextVideos = try container.decodeIfPresent([AutoReplyVideoAttachment].self, forKey: .contextVideos)
         if container.contains(.historyByteCount) {
             historyByteCount = try container.decode(Int.self, forKey: .historyByteCount)
             prefixSHA256 = try container.decode(String.self, forKey: .prefixSHA256)
@@ -63,6 +76,9 @@ struct CodexHistoryCheckpoint: Codable, Equatable, Sendable {
         try container.encode(prefixSHA256, forKey: .prefixSHA256)
         try container.encode(attachmentSHA256, forKey: .attachmentSHA256)
         try container.encodeIfPresent(videoSHA256ByMessageID, forKey: .videoSHA256ByMessageID)
+        try container.encodeIfPresent(historyMessageLimit, forKey: .historyMessageLimit)
+        try container.encodeIfPresent(contextImages, forKey: .contextImages)
+        try container.encodeIfPresent(contextVideos, forKey: .contextVideos)
     }
 }
 
@@ -76,30 +92,72 @@ struct HistorySubmission: Equatable, Sendable {
 }
 
 enum HistoryContinuation {
+    static let maximumHistoryMessages = 50
+
+    static func retainingRecentMedia(
+        in capture: AutoReplyCapture,
+        images: [AutoReplyImageAttachment],
+        videos: [AutoReplyVideoAttachment]
+    ) -> AutoReplyCapture {
+        let contextIDs = Set(capture.fullHistory.suffix(maximumHistoryMessages).map(\.id))
+        let imageIDs = Set(capture.imageAttachments.map(\.messageID))
+        let videoIDs = Set(capture.videoAttachments.map(\.messageID))
+        func available(_ url: URL) -> Bool {
+            var directory: ObjCBool = false
+            return url.isFileURL && FileManager.default.fileExists(atPath: url.path, isDirectory: &directory) && !directory.boolValue
+        }
+        var restored = capture
+        var restoredImages = imageIDs
+        for image in images where contextIDs.contains(image.messageID) && !restoredImages.contains(image.messageID) {
+            guard available(image.localURL) else { continue }
+            restored.imageAttachments.append(image)
+            restoredImages.insert(image.messageID)
+        }
+        var restoredVideos = videoIDs
+        for video in videos where contextIDs.contains(video.messageID) && !restoredVideos.contains(video.messageID) {
+            guard available(video.localURL), video.frames.allSatisfy({ available($0.localURL) }),
+                  video.audioLocalURL.map(available) ?? true,
+                  video.manifestLocalURL.map(available) ?? true else { continue }
+            restored.videoAttachments.append(video)
+            restoredVideos.insert(video.messageID)
+        }
+        return restored
+    }
+
     static func plan(
-        capture: AutoReplyCapture,
+        capture original: AutoReplyCapture,
         after previous: CodexHistoryCheckpoint?
     ) throws -> HistorySubmission {
-        let historyJSONL = AutoReplyPromptBuilder.historyJSONL(capture.fullHistory)
+        let capture = retainingRecentMedia(in: original, images: previous?.contextImages ?? [], videos: previous?.contextVideos ?? [])
+        // Only model context is bounded. Durable history, cursors and the frozen
+        // target batch remain intact, including batches larger than this window.
+        let historyJSONL = AutoReplyPromptBuilder.historyJSONL(Array(capture.fullHistory.suffix(maximumHistoryMessages)))
         let historyData = Data(historyJSONL.utf8)
-        let attachmentDigests = Dictionary(uniqueKeysWithValues:
+        // An older thread may already contain unlimited history. Never resume it.
+        let prior = previous?.historyMessageLimit == maximumHistoryMessages ? previous : nil
+        let attachmentDigests = Dictionary(
             capture.imageAttachments.map { ($0.localURL.path, $0.sha256) }
-            + capture.videoAttachments.map { ($0.localURL.path, $0.sha256) }
+            + capture.videoAttachments.map { ($0.localURL.path, $0.sha256) },
+            uniquingKeysWith: { _, current in current }
         )
-        let continuesHistory = previous.map {
+        let continuesHistory = prior.map {
             $0.requiresFullHistoryContinuation || ($0.historyByteCount <= historyData.count
                 && sha256(historyData.prefix($0.historyByteCount)) == $0.prefixSHA256)
         } ?? false
-        let knownVideos = continuesHistory ? previous?.videoSHA256ByMessageID ?? [:] : [:]
-        let currentVideos = Dictionary(uniqueKeysWithValues: capture.videoAttachments.map { ($0.messageID, $0.sha256) })
+        let knownVideos = continuesHistory ? prior?.videoSHA256ByMessageID ?? [:] : [:]
+        let currentVideos = Dictionary(capture.videoAttachments.map { ($0.messageID, $0.sha256) },
+            uniquingKeysWith: { _, current in current })
         let submittedVideos = capture.videoAttachments.filter { knownVideos[$0.messageID] != $0.sha256 }
         let checkpoint = CodexHistoryCheckpoint(
             historyByteCount: historyData.count,
             prefixSHA256: sha256(historyData),
             attachmentSHA256: attachmentDigests,
-            videoSHA256ByMessageID: knownVideos.merging(currentVideos) { _, current in current }
+            videoSHA256ByMessageID: knownVideos.merging(currentVideos) { _, current in current },
+            historyMessageLimit: maximumHistoryMessages,
+            contextImages: capture.imageAttachments.filter { image in capture.fullHistory.suffix(maximumHistoryMessages).contains { $0.id == image.messageID } },
+            contextVideos: capture.videoAttachments.filter { video in capture.fullHistory.suffix(maximumHistoryMessages).contains { $0.id == video.messageID } }
         )
-        if let previous, previous.requiresFullHistoryContinuation {
+        if let previous = prior, previous.requiresFullHistoryContinuation {
             let knownDigests = Set(previous.attachmentSHA256.values)
             return HistorySubmission(
                 mode: .incremental,
@@ -111,7 +169,7 @@ enum HistoryContinuation {
                 checkpoint: checkpoint
             )
         }
-        guard let previous,
+        guard let previous = prior,
               previous.historyByteCount <= historyData.count,
               sha256(historyData.prefix(previous.historyByteCount)) == previous.prefixSHA256 else {
             return HistorySubmission(
